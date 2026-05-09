@@ -11,6 +11,22 @@ static constexpr size_t DEFAULT_BACKTRACE_FRAMES = 128;
 static constexpr const char DEFAULT_BACKTRACE_DUMP_PREFIX[] =
         "/data/local/tmp/trace/backtrace_heap";
 
+static bool DefaultBacktraceDumpOnExit() {
+#if defined(__BIONIC__)
+    return false;
+#else
+    return true;
+#endif
+}
+
+static const char* ResolveBacktraceDumpPrefix() {
+    const char* dump_prefix = getenv("BACKTRACE_DUMP_PREFIX");
+    if (dump_prefix != nullptr && dump_prefix[0] != '\0') {
+        return dump_prefix;
+    }
+    return DEFAULT_BACKTRACE_DUMP_PREFIX;
+}
+
 static bool ParseValue(const char* value, size_t* parsed_value) {
     *parsed_value = 0;
     if (value == nullptr) {
@@ -43,9 +59,14 @@ static bool ParseValue(const char* value, size_t* parsed_value) {
 
 bool Config::Init() {
     // 退出时输出 trace
-    backtrace_dump_on_exit_ = false;
+    backtrace_dump_on_exit_ = DefaultBacktraceDumpOnExit();
     backtrace_frames_ = DEFAULT_BACKTRACE_FRAMES;
-    backtrace_dump_prefix_ = DEFAULT_BACKTRACE_DUMP_PREFIX;
+    backtrace_dump_prefix_ = ResolveBacktraceDumpPrefix();
+
+    size_t dump_on_exit_env = 0;
+    if (ParseValue(getenv("BACKTRACE_DUMP_ON_EXIT"), &dump_on_exit_env)) {
+        backtrace_dump_on_exit_ = dump_on_exit_env != 0;
+    }
 
     // 如果开启 BACKTRACE_SPECIFIC_SIZES, 请指定内存申请的最大和最小 size
     options_ |= BACKTRACE_SPECIFIC_SIZES;

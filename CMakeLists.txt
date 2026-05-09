@@ -1,9 +1,17 @@
 cmake_minimum_required(VERSION 3.23)
+project(alloc_hook LANGUAGES C CXX ASM)
 
 set(VERSION_SCRIPT ${CMAKE_SOURCE_DIR}/version_script.ld)
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -g -O3 -fPIC")
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+if(ANDROID OR OHOS)
+  set(ALLOC_HOOK_BUILD_TESTS_DEFAULT ON)
+else()
+  set(ALLOC_HOOK_BUILD_TESTS_DEFAULT OFF)
+endif()
+option(ALLOC_HOOK_BUILD_TESTS "Build platform-specific test targets" ${ALLOC_HOOK_BUILD_TESTS_DEFAULT})
 if(ANDROID OR OHOS)
   # now old ANDROID have libc++_shared.so, new ANDROID have libc++.so so we use
   # libc++_static by default, by set ANDROID_STL=c++_static only take effect on old NDK,
@@ -17,7 +25,6 @@ endif()
 # Check if using Clang
 if (CMAKE_CXX_COMPILER_ID MATCHES "Clang")
     set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -Wl,--version-script=${VERSION_SCRIPT}")
-    set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 endif()
 
 add_subdirectory(unwindstack/cmake)
@@ -30,13 +37,20 @@ target_link_libraries(alloc_hook PRIVATE helper)
 # 安装到 out/lib 目录
 install(TARGETS alloc_hook DESTINATION ${CMAKE_INSTALL_PREFIX}/out/lib)
 
-if (TARGET gtest)
-  message(STATUS "gtest is already defined")
+if (ALLOC_HOOK_BUILD_TESTS)
+  enable_testing()
+  if(ANDROID OR OHOS)
+    if (TARGET gtest)
+      message(STATUS "gtest is already defined")
+    else()
+      set(GOOGLETEST_VERSION 1.15.2)
+      add_subdirectory(${PROJECT_SOURCE_DIR}/third_party/googletest/googletest)
+      add_subdirectory(${PROJECT_SOURCE_DIR}/third_party/opencl_stub)
+      add_subdirectory(test)
+    endif()
+  endif()
 else()
-  set(GOOGLETEST_VERSION 1.15.2)
-  add_subdirectory(${PROJECT_SOURCE_DIR}/third_party/googletest/googletest)
-  add_subdirectory(${PROJECT_SOURCE_DIR}/third_party/opencl_stub)
-  add_subdirectory(test)
+  message(STATUS "ALLOC_HOOK_BUILD_TESTS is OFF, skip platform-specific tests")
 endif()
 
 # copy database compile_commands.json to PROJECT_SOURCE_DIR

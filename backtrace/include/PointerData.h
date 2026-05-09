@@ -4,6 +4,7 @@
 #include <stdint.h>
 
 #include <cstdint>
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <memory>
@@ -92,6 +93,8 @@ public:
 
     void Add(const void* ptr, size_t size, MemType type = HOST);
     size_t AddBacktrace(size_t num_frames, size_t size_bytes);
+    bool GetInfo(const void* ptr, PointerInfoType* info);
+    void RecordAdvice(const void* addr, size_t size, int advice);
     void Remove(const void* ptr);
     void RemoveBacktrace(size_t hash_index);
 
@@ -99,11 +102,23 @@ public:
     void DumpPeakInfo();
 
 private:
+    struct AdviceEvent {
+        timeval event_time = {};
+        uintptr_t addr = 0;
+        size_t size = 0;
+        int advice = 0;
+        size_t matched_regions = 0;
+        size_t matched_bytes = 0;
+        bool has_best_match = false;
+        MemType best_match_type = HOST;
+        uintptr_t best_match_pointer = 0;
+        size_t best_match_size = 0;
+    };
+
     inline uintptr_t ManglePointer(uintptr_t pointer) { return pointer ^ UINTPTR_MAX; }
     inline uintptr_t DemanglePointer(uintptr_t pointer) {
         return pointer ^ UINTPTR_MAX;
     }
-
     void GetList(std::vector<ListInfoType>* list, bool only_with_backtrace, Pred pred);
     void GetUniqueList(std::vector<ListInfoType>* list, bool only_with_backtrace);
 
@@ -116,10 +131,46 @@ private:
     std::unordered_map<size_t, std::shared_ptr<std::vector<unwindstack::FrameData>>>
             backtraces_info_;
     size_t cur_hash_index_;
+    size_t advice_dontneed_calls_ = 0;
+    size_t advice_dontneed_bytes_ = 0;
+    size_t advice_free_calls_ = 0;
+    size_t advice_free_bytes_ = 0;
+    size_t advice_populate_write_calls_ = 0;
+    size_t advice_populate_write_bytes_ = 0;
+    size_t advice_other_calls_ = 0;
+    size_t advice_other_bytes_ = 0;
+    size_t advice_matched_calls_ = 0;
+    size_t advice_matched_bytes_ = 0;
+    size_t advice_unmatched_calls_ = 0;
+    size_t advice_unmatched_bytes_ = 0;
+    std::vector<AdviceEvent> recent_advice_events_;
 
     size_t current_used, current_host, current_dma;
     size_t peak_tot, peak_host, peak_dma;
     std::vector<ListInfoType> peak_list;
+    std::atomic<uint64_t> total_add_calls_{0};
+    std::atomic<uint64_t> total_remove_calls_{0};
+    std::atomic<uint64_t> total_size_filtered_{0};
+    std::atomic<uint64_t> total_unwind_success_{0};
+    std::atomic<uint64_t> total_unwind_success_max_frames_{0};
+    std::atomic<uint64_t> total_unwind_success_empty_frames_{0};
+    std::atomic<uint64_t> total_unwind_exit_{0};
+    std::atomic<uint64_t> total_unwind_fail_{0};
+    std::atomic<uint64_t> total_unwind_fail_memory_invalid_{0};
+    std::atomic<uint64_t> total_unwind_fail_unwind_info_{0};
+    std::atomic<uint64_t> total_unwind_fail_unsupported_{0};
+    std::atomic<uint64_t> total_unwind_fail_invalid_map_{0};
+    std::atomic<uint64_t> total_unwind_fail_repeated_frame_{0};
+    std::atomic<uint64_t> total_unwind_fail_invalid_elf_{0};
+    std::atomic<uint64_t> total_unwind_fail_thread_missing_{0};
+    std::atomic<uint64_t> total_unwind_fail_thread_timeout_{0};
+    std::atomic<uint64_t> total_unwind_fail_system_call_{0};
+    std::atomic<uint64_t> total_unwind_fail_bad_arch_{0};
+    std::atomic<uint64_t> total_unwind_fail_maps_parse_{0};
+    std::atomic<uint64_t> total_unwind_fail_invalid_parameter_{0};
+    std::atomic<uint64_t> total_unwind_fail_ptrace_call_{0};
+    std::atomic<uint64_t> total_unwind_fail_other_{0};
+    std::atomic<uint32_t> last_unwind_error_{unwindstack::ERROR_NONE};
 
     BIONIC_DISALLOW_COPY_AND_ASSIGN(PointerData);
 };

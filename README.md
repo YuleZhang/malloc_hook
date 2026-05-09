@@ -12,6 +12,8 @@ use to get malloc and free backtrace, include dmabuffer by hook `ioctl` and `clo
   * then replace `ls` to you real command
   * 如果要抓 trace 请先创建 trace 的输出目录
   * 使用该工具导致程序运行过慢时，可以指定环境 `BACKTRACE_MIN_SIZE` 值，不记录小内存的堆栈信息
+  * 可以通过环境变量 `BACKTRACE_DUMP_PREFIX` 覆盖输出文件前缀，例如 `BACKTRACE_DUMP_PREFIX=/tmp/trace/backtrace_heap`
+  * Linux 默认会在进程退出时输出 trace，可通过 `BACKTRACE_DUMP_ON_EXIT=0/1` 覆盖
 
 * checkpoint
   * 支持在程序指定位置插入检查点，输出当前时刻的未释放的内存的堆栈信息
@@ -161,8 +163,10 @@ use to get malloc and free backtrace, include dmabuffer by hook `ioctl` and `clo
 
 * 配置参数意义
   - `backtrace_dump_on_exit_`: 程序退出时，打印堆栈
+  - `BACKTRACE_DUMP_ON_EXIT`：环境变量，是否在进程退出时打印堆栈，Linux 默认开启
   - `backtrace_frames_`: 抓取堆栈的最大深度，默认 128
   - `backtrace_dump_prefix_`: 输出堆栈信息的文件名前缀
+  - `BACKTRACE_DUMP_PREFIX`：环境变量，覆盖输出堆栈信息的文件名前缀
   - `BACKTRACE_SPECIFIC_SIZES`: 分配内存时，是否抓取指定 alloc size 的堆栈信息
   - `backtrace_min_size_bytes_`: 开启 BACKTRACE_SPECIFIC_SIZES 标志时，抓取 alloc size 大于该值的堆栈信息
   - `backtrace_max_size_bytes_`: 开启 BACKTRACE_SPECIFIC_SIZES 标志时，抓取 alloc size 小于该值的堆栈信息

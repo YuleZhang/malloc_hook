@@ -6,6 +6,7 @@
 bool debug_initialize(void* init_space[]);
 void debug_finalize();
 void debug_dump_heap(const char* file_name);
+void debug_dump_heap_on_signal();
 void* debug_malloc(size_t size);
 void debug_free(void* pointer);
 void* debug_realloc(void* pointer, size_t bytes);
@@ -13,7 +14,14 @@ void* debug_calloc(size_t nmemb, size_t bytes);
 void* debug_memalign(size_t alignment, size_t bytes);
 int debug_posix_memalign(void** memptr, size_t alignment, size_t size);
 void* debug_mmap(void* addr, size_t size, int prot, int flags, int fd, off_t offset);
+void* debug_mremap(
+        void* old_address, size_t old_size, size_t new_size, int flags,
+        void* new_address);
+int debug_madvise(void* addr, size_t size, int advice);
 int debug_munmap(void* addr, size_t size);
 int debug_ioctl(int fd, unsigned int request, void* arg);
 int debug_close(int fd);
+int debug_dup(int oldfd);
+int debug_dup2(int oldfd, int newfd);
+int debug_dup3(int oldfd, int newfd, int flags);
 void* debug_mmap64(void* addr, size_t size, int prot, int flags, int fd, off_t offset);

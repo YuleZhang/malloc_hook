@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include <cstddef>
 #include <stdint.h>
 
 #define BIONIC_DISALLOW_COPY_AND_ASSIGN(TypeName) \
