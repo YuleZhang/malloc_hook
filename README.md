@@ -17,7 +17,7 @@ use to get malloc and free backtrace, include dmabuffer by hook `ioctl` and `clo
 
 * checkpoint
   * 支持在程序指定位置插入检查点，输出当前时刻的未释放的内存的堆栈信息
-  * 第一种方式：使用信号的方式触发堆栈输出，默认信号值为 33，可以在上述配置文件 Config.cpp 中修改，trace 文件以当前时间命名
+  * 第一种方式：使用信号的方式触发堆栈输出，Android 默认信号值为 33，Linux 默认信号值为 12(`SIGUSR2`)，也可以通过环境变量 `BACKTRACE_DUMP_SIGNAL` 覆盖，trace 文件以当前时间命名
     ``` C++
       #include <unistd.h>
       #include <signal.h>
@@ -30,6 +30,7 @@ use to get malloc and free backtrace, include dmabuffer by hook `ioctl` and `clo
         exit(1);
       }
     ```
+    Linux 上请把 `33` 改成 `12`，或者改成 `BACKTRACE_DUMP_SIGNAL` 指定的值。
   * 第二种方式：在代码中插入调用，支持用户自定义文件名，前提需要用户的可执行程序依赖该项目编译生成的 so, 例如在 cmake 文件中做出下面的修改
     ```
       add_library(hook SHARED IMPORTED)
@@ -71,6 +72,7 @@ use to get malloc and free backtrace, include dmabuffer by hook `ioctl` and `clo
 * 如何改造自己的被测试程序以便此工具能`有效`采样
 
   另外在采样过程中，也请务必保证程序处于`停止`状态，常见的做法是在被测试的代码适当位置加上 checkpoint() 或者 kill(getpid(), 33) 以便触发采样，
+  Linux 上对应信号默认为 `12`
   下面解释一下什么叫做`适当`位置
 
   ```
@@ -158,7 +160,7 @@ use to get malloc and free backtrace, include dmabuffer by hook `ioctl` and `clo
     ```
     LD_PRELOAD=liballoc_hook.so LD_LIBRARY_PATH=/path /vendor/bin/hw/camerahalserver
     ```
-  - 在拍照完后, 使用 `kill -33 <pid>` 输出当前时刻的堆栈
+  - 在拍照完后, Android 使用 `kill -33 <pid>`，Linux 使用 `kill -12 <pid>` 输出当前时刻的堆栈
     - 一般返回桌面，等待几秒再调用 kill 命令发送信号，保证相机程序申请的内存已经释放，防止统计错误
 
 * 配置参数意义
@@ -173,7 +175,8 @@ use to get malloc and free backtrace, include dmabuffer by hook `ioctl` and `clo
   - `RECORD_MEMORY_PEAK`: 是否抓取峰值时刻的堆栈信息
   - `backtrace_dump_peak_val_`: 当峰值大于该值时，记录峰值时刻的堆栈
   - `DUMP_ON_SINGAL`: 开启 checkpoint 信号机制
-  - `backtrace_dump_signal_`: checkpoint 信号机制的信号值，默认 33
+  - `backtrace_dump_signal_`: checkpoint 信号机制的信号值，Android 默认 33，Linux 默认 12(`SIGUSR2`)
+  - `BACKTRACE_DUMP_SIGNAL`：环境变量，覆盖 checkpoint 信号值
   - `DUMP_PEAK_VALUE_MB`：环境变量，单位: MB，当内存峰值大于该值时记录峰值内存
   - `BACKTRACE_MIN_SIZE`：环境变量，单位: Byte，当申请内存的 size 大于该值时，才抓取堆栈信息
   - `配置文件位于 backtrace/src/Config.cpp, 可在该文件中修改上述参数`

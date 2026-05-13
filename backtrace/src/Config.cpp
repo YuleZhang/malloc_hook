@@ -1,9 +1,11 @@
 #include <bionic/reserved_signals.h>
 #include <cassert>
 #include <cerrno>
+#include <climits>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <signal.h>
 
 #include "Config.h"
 
@@ -57,6 +59,14 @@ static bool ParseValue(const char* value, size_t* parsed_value) {
     return true;
 }
 
+static int DefaultDumpSignal() {
+#if defined(__BIONIC__)
+    return BIONIC_SIGNAL_BACKTRACE;
+#else
+    return SIGUSR2;
+#endif
+}
+
 bool Config::Init() {
     // 退出时输出 trace
     backtrace_dump_on_exit_ = DefaultBacktraceDumpOnExit();
@@ -92,7 +102,12 @@ bool Config::Init() {
 
     // 通过信号插入 check point
     options_ |= DUMP_ON_SINGAL;
-    backtrace_dump_signal_ = BIONIC_SIGNAL_BACKTRACE;  // BIONIC_SIGNAL_BACKTRACE: 33
+    backtrace_dump_signal_ = DefaultDumpSignal();
+    size_t dump_signal_env = 0;
+    if (ParseValue(getenv("BACKTRACE_DUMP_SIGNAL"), &dump_signal_env) &&
+        dump_signal_env <= static_cast<size_t>(INT_MAX)) {
+        backtrace_dump_signal_ = static_cast<int>(dump_signal_env);
+    }
 
     return true;
 }
