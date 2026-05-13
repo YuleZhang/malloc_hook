@@ -14,6 +14,7 @@ CC="${ARM_GNU_TOOLCHAIN_PATH}/bin/${TARGET_TRIPLE}-gcc"
 CXX="${ARM_GNU_TOOLCHAIN_PATH}/bin/${TARGET_TRIPLE}-g++"
 AR="${ARM_GNU_TOOLCHAIN_PATH}/bin/${TARGET_TRIPLE}-ar"
 RANLIB="${ARM_GNU_TOOLCHAIN_PATH}/bin/${TARGET_TRIPLE}-ranlib"
+LINUX_AARCH64_COMPAT_FLAGS="-march=armv8-a -mno-outline-atomics -mbranch-protection=none"
 
 if [ ! -x "${CC}" ] || [ ! -x "${CXX}" ]; then
     echo "ARM_GNU_TOOLCHAIN_PATH is invalid: ${ARM_GNU_TOOLCHAIN_PATH}"
@@ -43,6 +44,9 @@ cmake_args=(
     -DCMAKE_AR="${AR}"
     -DCMAKE_RANLIB="${RANLIB}"
     -DCMAKE_SYSROOT="${SYSROOT}"
+    -DCMAKE_C_FLAGS="${LINUX_AARCH64_COMPAT_FLAGS}"
+    -DCMAKE_CXX_FLAGS="${LINUX_AARCH64_COMPAT_FLAGS}"
+    -DCMAKE_ASM_FLAGS="${LINUX_AARCH64_COMPAT_FLAGS}"
     -DALLOC_HOOK_BUILD_TESTS=OFF
     -G
     Ninja

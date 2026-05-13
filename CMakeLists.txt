@@ -6,6 +6,14 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -g -O3 -fPIC")
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND
+   CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|AARCH64)$")
+  # Some Linux arm64 targets in the field do not support BTI/LSE instructions
+  # emitted by outlined atomics helpers, which leads to SIGILL during preload.
+  add_compile_options(-march=armv8-a -mno-outline-atomics -mbranch-protection=none)
+endif()
+
 if(ANDROID OR OHOS)
   set(ALLOC_HOOK_BUILD_TESTS_DEFAULT ON)
 else()

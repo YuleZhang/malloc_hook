@@ -33,7 +33,6 @@
 
 #if defined(__linux__) && !defined(__BIONIC__)
 #include <dlfcn.h>
-#include <execinfo.h>
 #endif
 
 #include <mutex>
@@ -46,6 +45,7 @@
 #include <unwindstack/AndroidUnwinder.h>
 #include <unwindstack/Memory.h>
 #include <unwindstack/Maps.h>
+#include <unwindstack/RegsGetLocal.h>
 #include <unwindstack/Unwinder.h>
 
 #include "UnwindBacktrace.h"
@@ -118,22 +118,13 @@ void PopulateFrameFromDladdr(uintptr_t pc, unwindstack::FrameData* frame) {
     }
 }
 
-unwindstack::ErrorCode UnwindWithExecInfo(
+unwindstack::ErrorCode UnwindWithLocalRegs(
         std::vector<uintptr_t>* frames, std::vector<unwindstack::FrameData>* frame_info,
         size_t max_frames) {
     if (max_frames == 0) {
         frames->clear();
         frame_info->clear();
         return unwindstack::ERROR_INVALID_PARAMETER;
-    }
-
-    const size_t capture_limit = max_frames + kLinuxBacktraceExtraFrames;
-    std::vector<void*> raw_frames(capture_limit);
-    int frame_count = backtrace(raw_frames.data(), static_cast<int>(raw_frames.size()));
-    if (frame_count <= 0) {
-        frames->clear();
-        frame_info->clear();
-        return unwindstack::ERROR_UNWIND_INFO;
     }
 
     [[clang::no_destroy]] static std::mutex maps_mutex;
@@ -154,45 +145,52 @@ unwindstack::ErrorCode UnwindWithExecInfo(
     frames->reserve(max_frames);
     frame_info->reserve(max_frames);
 
-    auto append_frame = [&](uintptr_t pc) {
-        uint64_t adjusted_pc = pc > 0 ? pc - 1 : 0;
-        unwindstack::FrameData frame = unwindstack::Unwinder::BuildFrameFromPcOnly(
-                adjusted_pc, CurrentArch(), &maps, nullptr, process_memory, true);
-        frame.num = frame_info->size();
-        frame.pc = adjusted_pc;
-        if (frame.rel_pc == 0) {
-            frame.rel_pc = adjusted_pc;
-        }
+    std::unique_ptr<unwindstack::Regs> regs(unwindstack::Regs::CreateFromLocal());
+    if (regs == nullptr) {
+        return unwindstack::ERROR_BAD_ARCH;
+    }
+    unwindstack::RegsGetLocal(regs.get());
+
+    unwindstack::Unwinder unwinder(
+            max_frames + kLinuxBacktraceExtraFrames, &maps, regs.get(), process_memory);
+    unwinder.Unwind();
+    std::vector<unwindstack::FrameData> raw_frames = unwinder.ConsumeFrames();
+
+    auto append_frame = [&](unwindstack::FrameData frame) {
         if (frame.map_info == nullptr || frame.function_name.empty()) {
-            PopulateFrameFromDladdr(adjusted_pc, &frame);
+            PopulateFrameFromDladdr(frame.pc, &frame);
+        }
+        frame.num = frame_info->size();
+        if (frame.rel_pc == 0) {
+            frame.rel_pc = frame.pc;
         }
         frames->push_back(frame.pc);
         frame_info->push_back(std::move(frame));
     };
 
-    for (int i = 0; i < frame_count && frame_info->size() < max_frames; ++i) {
-        uintptr_t pc = reinterpret_cast<uintptr_t>(raw_frames[static_cast<size_t>(i)]);
-        if (ShouldSkipLinuxBacktraceFrame(pc)) {
+    for (auto& frame : raw_frames) {
+        if (frame_info->size() >= max_frames) {
+            break;
+        }
+        if (ShouldSkipLinuxBacktraceFrame(frame.pc)) {
             continue;
         }
-        append_frame(pc);
+        append_frame(std::move(frame));
     }
 
     if (frame_info->empty()) {
-        for (int i = 0; i < frame_count && frame_info->size() < max_frames; ++i) {
-            uintptr_t pc = reinterpret_cast<uintptr_t>(raw_frames[static_cast<size_t>(i)]);
-            append_frame(pc);
+        for (auto& frame : raw_frames) {
+            if (frame_info->size() >= max_frames) {
+                break;
+            }
+            append_frame(std::move(frame));
         }
     }
 
     if (frame_info->empty()) {
-        return unwindstack::ERROR_UNWIND_INFO;
+        return unwinder.LastErrorCode();
     }
-    if (frame_info->size() == max_frames &&
-        static_cast<size_t>(frame_count) > max_frames) {
-        return unwindstack::ERROR_MAX_FRAMES_EXCEEDED;
-    }
-    return unwindstack::ERROR_NONE;
+    return unwinder.LastErrorCode();
 }
 
 }  // namespace
@@ -202,7 +200,7 @@ unwindstack::ErrorCode Unwind(
         std::vector<uintptr_t>* frames, std::vector<unwindstack::FrameData>* frame_info,
         size_t max_frames) {
 #if defined(__linux__) && !defined(__BIONIC__)
-    return UnwindWithExecInfo(frames, frame_info, max_frames);
+    return UnwindWithLocalRegs(frames, frame_info, max_frames);
 #else
     [[clang::no_destroy]] static unwindstack::AndroidLocalUnwinder unwinder(
             std::vector<std::string>{"liballoc_hook.so"}, {},
