@@ -6,6 +6,7 @@
 #include <linux/dma-heap.h>
 
 #include <cstring>
+#include <mutex>
 #include <string>
 #include <unordered_set>
 #include <android-base/stringprintf.h>
@@ -29,6 +30,7 @@ public:
 
     static void Init() {
         pthread_rwlockattr_t attr;
+        pthread_rwlockattr_init(&attr);
         // Set the attribute so that when a write lock is pending, read locks are no
         // longer granted.
 #if __ANDROID_API__ >= 23
@@ -36,6 +38,7 @@ public:
                 &attr, PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP);
 #endif
         pthread_rwlock_init(&lock_, &attr);
+        pthread_rwlockattr_destroy(&attr);
     }
 
     static void BlockAllOperations() { pthread_rwlock_wrlock(&lock_); }
@@ -46,6 +49,18 @@ private:
 pthread_rwlock_t ScopedConcurrentLock::lock_;
 
 DebugData* g_debug;
+
+static void DumpHeapToFileUnlocked(const char* file_name) {
+    ScopedDisableDebugCalls disable;
+
+    int fd = open(file_name, O_RDWR | O_CREAT | O_NOFOLLOW | O_TRUNC | O_CLOEXEC, 0644);
+    if (fd == -1) {
+        return;
+    }
+
+    g_debug->pointer->DumpLiveToFile(fd);
+    close(fd);
+}
 
 static void singal_dump_heap(int) {
     if ((g_debug->config().options() & BACKTRACE)) {
@@ -98,10 +113,10 @@ void debug_finalize() {
 
     if ((g_debug->config().options() & BACKTRACE) &&
         g_debug->config().backtrace_dump_on_exit()) {
-        debug_dump_heap(android::base::StringPrintf(
-                                "%s.exit.%ld.txt",
-                                g_debug->config().backtrace_dump_prefix(), time(NULL))
-                                .c_str());
+        DumpHeapToFileUnlocked(android::base::StringPrintf(
+                                       "%s.exit.%ld.txt",
+                                       g_debug->config().backtrace_dump_prefix(), time(NULL))
+                                       .c_str());
     }
 
     if (g_debug->TrackPointers()) {
@@ -115,15 +130,7 @@ void debug_finalize() {
 
 void debug_dump_heap(const char* file_name) {
     ScopedConcurrentLock lock;
-    ScopedDisableDebugCalls disable;
-
-    int fd = open(file_name, O_RDWR | O_CREAT | O_NOFOLLOW | O_TRUNC | O_CLOEXEC, 0644);
-    if (fd == -1) {
-        return;
-    }
-
-    g_debug->pointer->DumpLiveToFile(fd);
-    close(fd);
+    DumpHeapToFileUnlocked(file_name);
 }
 
 static void* InternalMalloc(size_t size) {
@@ -287,6 +294,7 @@ int debug_posix_memalign(void** memptr, size_t alignment, size_t size) {
 namespace DMA_BUF {
 
 static thread_local bool gpu_ioctl_alloc = false;  // TLS to store a unique flag per thread
+static std::mutex inode_set_mutex;
 
 static bool is_dma_buf(int fd, size_t* size) {
     static std::unordered_set<uint64_t> inode_set;
@@ -340,6 +348,7 @@ static bool is_dma_buf(int fd, size_t* size) {
         inode = sb.st_ino;
     }
 
+    std::lock_guard<std::mutex> guard(inode_set_mutex);
     return inode_set.insert(inode).second;
 }
 
@@ -378,14 +387,15 @@ int debug_ioctl(int fd, unsigned int request, void* arg) {
         return (int)syscall(SYS_ioctl, fd, request, arg);
     }
 
-    ScopedConcurrentLock lock;
     ScopedDisableDebugCalls disable;
 
+    // Avoid holding the global hook lock while the ioctl blocks in vendor code.
     int ret = (int)syscall(SYS_ioctl, fd, request, arg);
 
     int node_fd = -1;
     size_t node_sz = 0;
     if (g_debug->TrackPointers() && DMA_BUF::handle_dma_node(request, arg, &node_fd, &node_sz)) {
+        ScopedConcurrentLock lock;
         void* ptr = reinterpret_cast<void*>(node_fd);
         g_debug->pointer->Add(ptr, node_sz, DMA);
     }
