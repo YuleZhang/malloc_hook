@@ -28,6 +28,7 @@
 #include <unistd.h>
 
 #include <string>
+#include <mutex>
 #include <vector>
 
 #if defined(__APPLE__)

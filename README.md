@@ -5,6 +5,9 @@ use to get malloc and free backtrace, include dmabuffer by hook `ioctl` and `clo
 * how to build
 
   * ./build_android.sh [armeabi-v7a]
+  * ./build_ohos.sh [arm64-v8a|armeabi-v7a|x86_64]
+    * set `OHOS_NDK_ROOT` to an OHOS `native` NDK directory, or let the script download the default NDK into `.deps/ohos_ndk/native`
+    * output: `out/lib/liballoc_hook.so`
 
 * how to use
   * adb shell mkdir `path`, where `path` is the output path for the unwindstack, default: `/data/local/tmp/trace/`
@@ -13,9 +16,25 @@ use to get malloc and free backtrace, include dmabuffer by hook `ioctl` and `clo
   * 如果要抓 trace 请先创建 trace 的输出目录
   * 使用该工具导致程序运行过慢时，可以指定环境 `BACKTRACE_MIN_SIZE` 值，不记录小内存的堆栈信息
 
+  * how to use on OHOS
+  * 构建: `./build_ohos.sh arm64-v8a`
+  * OHOS 版本默认只导出 heap hooks（`malloc/free/calloc/realloc/aligned_alloc/memalign/posix_memalign/checkpoint`），避免拦截 `mmap/ioctl/close` 影响 OpenCL/DMA 驱动初始化
+  * 如需单独验证匿名 `mmap` 调用栈，可使用 `OHOS_ENABLE_MMAP_HOOK=ON ./build_ohos.sh arm64-v8a` 构建 mmap 调试版；该版本只适合小型复现程序，OpenCL pipeline 中导出 `mmap/munmap` 会触发 vendor runtime `SIGTRAP`，不建议用于正式 pipeline 跑图
+  * OHOS 默认 `BACKTRACE_MIN_SIZE=40960`，可通过环境变量覆盖；不建议设置为 0，会明显拖慢复杂 pipeline
+  * 直接运行命令并抓取: `./run_on_ohos.sh /data/local/tmp/alloc_test ./your_program arg1 arg2`
+  * 手动执行时，先推送 `out/lib/liballoc_hook.so`，然后在 OHOS shell 中运行:
+    ``` bash
+      mkdir -p /data/local/tmp/trace
+      export LD_LIBRARY_PATH=.
+      export BACKTRACE_MIN_SIZE=40960
+      export BACKTRACE_DUMP_SIGNAL=46
+      LD_PRELOAD=./liballoc_hook.so ./your_program
+    ```
+  * 外部触发 checkpoint: `kill -46 <pid>`，其中信号值需和 `BACKTRACE_DUMP_SIGNAL` 保持一致；OHOS 上 `33/45` 可能被系统或运行时保留/覆盖，不建议使用
+
 * checkpoint
   * 支持在程序指定位置插入检查点，输出当前时刻的未释放的内存的堆栈信息
-  * 第一种方式：使用信号的方式触发堆栈输出，默认信号值为 33，可以在上述配置文件 Config.cpp 中修改，trace 文件以当前时间命名
+  * 第一种方式：使用信号的方式触发堆栈输出，Android 默认信号值为 33，OHOS 默认使用 `46`；也可以用环境变量 `BACKTRACE_DUMP_SIGNAL` 指定固定信号值，trace 文件以当前时间命名
     ``` C++
       #include <unistd.h>
       #include <signal.h>
@@ -111,6 +130,7 @@ use to get malloc and free backtrace, include dmabuffer by hook `ioctl` and `clo
   DUMP_PEAK_VALUE_MB=xxx LD_PRELOAD=liballoc_hook.so LD_LIBRARY_PATH=. ls
   ```
   - DUMP_PEAK_VALUE_MB 的单位默认为 MB
+  - `DUMP_PEAK_STEP_MB` 控制峰值快照的最小增长间隔，默认 64MB；设置 `DUMP_PEAK_VALUE_MB` 后，工具会在首次超过阈值时保存峰值快照，之后只有峰值再次增长超过该间隔才重建快照，避免在运行时反复抓取和聚合堆栈导致卡住。
 
 * 内存泄露分析步骤
   - 利用 cheakpoint 机制执行两次程序，并对两次的内存调用堆栈输出进行对比，分析内存调用的增量，此时的内存调用是以时间排序，可以从后向前对比
@@ -156,7 +176,7 @@ use to get malloc and free backtrace, include dmabuffer by hook `ioctl` and `clo
     ```
     LD_PRELOAD=liballoc_hook.so LD_LIBRARY_PATH=/path /vendor/bin/hw/camerahalserver
     ```
-  - 在拍照完后, 使用 `kill -33 <pid>` 输出当前时刻的堆栈
+  - 在拍照完后, Android 使用 `kill -33 <pid>` 输出当前时刻的堆栈；OHOS 使用 `kill -46 <pid>`
     - 一般返回桌面，等待几秒再调用 kill 命令发送信号，保证相机程序申请的内存已经释放，防止统计错误
 
 * 配置参数意义
@@ -171,5 +191,6 @@ use to get malloc and free backtrace, include dmabuffer by hook `ioctl` and `clo
   - `DUMP_ON_SINGAL`: 开启 checkpoint 信号机制
   - `backtrace_dump_signal_`: checkpoint 信号机制的信号值，默认 33
   - `DUMP_PEAK_VALUE_MB`：环境变量，单位: MB，当内存峰值大于该值时记录峰值内存
+  - `DUMP_PEAK_STEP_MB`：环境变量，单位: MB，控制峰值快照重建间隔，默认 64MB
   - `BACKTRACE_MIN_SIZE`：环境变量，单位: Byte，当申请内存的 size 大于该值时，才抓取堆栈信息
   - `配置文件位于 backtrace/src/Config.cpp, 可在该文件中修改上述参数`

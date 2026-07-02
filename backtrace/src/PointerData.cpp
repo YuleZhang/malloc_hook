@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <memory>
 #include <mutex>
 
@@ -18,7 +19,21 @@
 
 constexpr size_t kBacktraceExitIndex = 0;
 constexpr size_t kBacktraceEmptyIndex = 1;
+constexpr size_t kDefaultPeakRecordStepBytes = 64 * 1024 * 1024;
 const char* mtype[3] = {"host", "mmap", "dma"};
+
+static size_t ParsePeakStepBytes() {
+    const char* value = getenv("DUMP_PEAK_STEP_MB");
+    if (value == nullptr) {
+        return kDefaultPeakRecordStepBytes;
+    }
+    char* end = nullptr;
+    long step_mb = strtol(value, &end, 10);
+    if (end == value || *end != '\0' || step_mb < 0) {
+        return kDefaultPeakRecordStepBytes;
+    }
+    return static_cast<size_t>(step_mb) * 1024 * 1024;
+}
 
 static inline bool ShouldBacktraceAllocSize(size_t size_bytes) {
     static bool only_backtrace_specific_sizes =
@@ -43,6 +58,8 @@ bool PointerData::Initialize(const Config& config) {
     cur_hash_index_ = kBacktraceEmptyIndex + 1;
     current_used = current_host = current_dma = 0;
     peak_tot = peak_host = peak_dma = 0;
+    next_peak_record_threshold_ = config.backtrace_dump_peak_val();
+    peak_record_step_bytes_ = ParsePeakStepBytes();
 
     return true;
 }
@@ -71,10 +88,18 @@ void PointerData::Add(const void* ptr, size_t pointer_size, MemType type) {
         peak_tot = current_used;
 
         if ((g_debug->config().options() & RECORD_MEMORY_PEAK) &&
-            peak_tot > g_debug->config().backtrace_dump_peak_val()) {
+            hash_index > kBacktraceEmptyIndex && peak_tot > next_peak_record_threshold_) {
             std::lock_guard<std::mutex> frame_guard(frame_mutex_);
-            peak_list.clear();
-            GetUniqueList(&peak_list, true);
+            std::vector<ListInfoType> next_peak_list;
+            GetUniqueList(&next_peak_list, true);
+            if (!next_peak_list.empty()) {
+                peak_list = std::move(next_peak_list);
+                if (peak_record_step_bytes_ == 0) {
+                    next_peak_record_threshold_ = peak_tot;
+                } else {
+                    next_peak_record_threshold_ = peak_tot + peak_record_step_bytes_;
+                }
+            }
         }
     }
 }
@@ -97,6 +122,10 @@ size_t PointerData::AddBacktrace(size_t num_frames, size_t size_bytes) {
                 return kBacktraceEmptyIndex;
         }
     } else {
+        return kBacktraceEmptyIndex;
+    }
+
+    if (frames.empty()) {
         return kBacktraceEmptyIndex;
     }
 
@@ -235,13 +264,14 @@ void PointerData::GetUniqueList(
     }
 }
 
-void PointerData::DumpLiveToFile(int fd) {
+void PointerData::DumpLiveToFile(int fd, bool dump_peak) {
     std::lock_guard<std::mutex> pointer_guard(pointer_mutex_);
     std::lock_guard<std::mutex> frame_guard(frame_mutex_);
 
-    std::vector<ListInfoType> list = std::move(peak_list);
-    if (!(g_debug->config().options() & RECORD_MEMORY_PEAK)) {
-        list.clear();
+    std::vector<ListInfoType> list;
+    if ((g_debug->config().options() & RECORD_MEMORY_PEAK) && dump_peak) {
+        list = peak_list;
+    } else {
         // Sort by the time of the allocation.
         GetList(&list, true, [](const ListInfoType& a, const ListInfoType& b) {
             return a.alloc_time < b.alloc_time;
