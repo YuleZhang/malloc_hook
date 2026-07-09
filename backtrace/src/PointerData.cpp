@@ -5,12 +5,14 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <memory>
 #include <mutex>
 
 #include "Config.h"
 #include "DebugData.h"
 #include "PointerData.h"
+#include "TraceWriter.h"
 #include "UnwindBacktrace.h"
 
 #include "android-base/stringprintf.h"
@@ -47,36 +49,48 @@ bool PointerData::Initialize(const Config& config) {
     return true;
 }
 
-void PointerData::Add(const void* ptr, size_t pointer_size, MemType type) {
-    size_t hash_index = 0;
-    hash_index = AddBacktrace(g_debug->config().backtrace_frames(), pointer_size);
+size_t PointerData::Add(const void* ptr, size_t pointer_size, MemType type) {
+    bool trace = TraceWriter::Get().IsEnabled();
+
+    size_t hash_index =
+            AddBacktrace(g_debug->config().backtrace_frames(), pointer_size);
 
     // unwind 跳过的函数，不记录其堆栈和 pointer 信息
     if (hash_index == kBacktraceExitIndex)
-        return;
+        return 0;
 
-    std::lock_guard<std::mutex> pointer_guard(pointer_mutex_);
-    struct timeval tv;
-    gettimeofday(&tv, NULL);
-    uintptr_t mangled_ptr = ManglePointer(reinterpret_cast<uintptr_t>(ptr));
-    pointers_[mangled_ptr] = PointerInfoType{pointer_size, hash_index, type, tv};
-    current_used += pointer_size;
-    size_t* current = (type == DMA) ? &current_dma : &current_host;
-    size_t* peak = (type == DMA) ? &peak_dma : &peak_host;
-    *current += pointer_size;
-    if (*current > *peak) {
-        *peak = *current;
-    }
-    if (peak_tot < current_used) {
-        peak_tot = current_used;
+    {
+        std::lock_guard<std::mutex> pointer_guard(pointer_mutex_);
+        struct timeval tv;
+        gettimeofday(&tv, NULL);
+        uintptr_t mangled_ptr = ManglePointer(reinterpret_cast<uintptr_t>(ptr));
+        pointers_[mangled_ptr] = PointerInfoType{pointer_size, hash_index, type, tv};
+        current_used += pointer_size;
+        size_t* current = (type == DMA) ? &current_dma : &current_host;
+        size_t* peak = (type == DMA) ? &peak_dma : &peak_host;
+        *current += pointer_size;
+        if (*current > *peak) {
+            *peak = *current;
+        }
+        if (peak_tot < current_used) {
+            peak_tot = current_used;
 
-        if ((g_debug->config().options() & RECORD_MEMORY_PEAK) &&
-            peak_tot > g_debug->config().backtrace_dump_peak_val()) {
-            std::lock_guard<std::mutex> frame_guard(frame_mutex_);
-            peak_list.clear();
-            GetUniqueList(&peak_list, true);
+            if ((g_debug->config().options() & RECORD_MEMORY_PEAK) &&
+                peak_tot > g_debug->config().backtrace_dump_peak_val()) {
+                std::lock_guard<std::mutex> frame_guard(frame_mutex_);
+                peak_list.clear();
+                GetUniqueList(&peak_list, true);
+            }
         }
     }
+
+    // Emit the Perfetto begin event outside the lock to keep the critical
+    // section short and avoid serializing trace_marker writes.
+    if (trace) {
+        TraceWriter::Get().WriteAsyncBegin(type, pointer_size, ptr, hash_index);
+    }
+
+    return hash_index;
 }
 
 size_t PointerData::AddBacktrace(size_t num_frames, size_t size_bytes) {
@@ -127,6 +141,9 @@ size_t PointerData::AddBacktrace(size_t num_frames, size_t size_bytes) {
 
 void PointerData::Remove(const void* ptr) {
     size_t hash_index;
+    size_t real_size;
+    MemType mem_type;
+    bool trace = TraceWriter::Get().IsEnabled();
     {
         std::lock_guard<std::mutex> pointer_guard(pointer_mutex_);
         uintptr_t mangled_ptr = ManglePointer(reinterpret_cast<uintptr_t>(ptr));
@@ -139,10 +156,16 @@ void PointerData::Remove(const void* ptr) {
         size_t* target = (entry->second.mem_type == DMA) ? &current_dma : &current_host;
         *target -= entry->second.size;
         hash_index = entry->second.hash_index;
+        real_size = entry->second.RealSize();
+        mem_type = entry->second.mem_type;
         pointers_.erase(mangled_ptr);
     }
 
     RemoveBacktrace(hash_index);
+
+    if (trace) {
+        TraceWriter::Get().WriteAsyncEnd(mem_type, real_size, ptr, hash_index);
+    }
 }
 
 void PointerData::RemoveBacktrace(size_t hash_index) {
@@ -182,11 +205,14 @@ void PointerData::GetList(
         auto frame_entry = frames_.find(hash_index);
         FrameInfoType* frame_info = &frame_entry->second;
         auto backtrace_entry = backtraces_info_.find(hash_index);
-        std::shared_ptr<std::vector<unwindstack::FrameData>> backtrace_info = backtrace_entry->second;
+        std::shared_ptr<std::vector<unwindstack::FrameData>> backtrace_info =
+                backtrace_entry->second;
 
-        list->emplace_back(ListInfoType{
-                pointer, 1, entry.second.RealSize(), entry.second.mem_type, frame_info,
-                std::move(backtrace_info), entry.second.alloc_time});
+        list->emplace_back(
+                ListInfoType{
+                        pointer, 1, entry.second.RealSize(), entry.second.mem_type,
+                        hash_index, frame_info, std::move(backtrace_info),
+                        entry.second.alloc_time});
     }
 
     std::sort(list->begin(), list->end(), pred);
@@ -272,9 +298,9 @@ void PointerData::DumpLiveToFile(int fd) {
 
         dprintf(fd,
                 "alloc_size:%fKB \t alloc_type:%s \t alloc_num:%zu \t "
-                "alloc_time:%s.%zu\n",
+                "hash_index:%zu \t alloc_time:%s.%zu\n",
                 info.size / 1024.0, mtype[info.mem_type], info.num_allocations,
-                formatted_time, info.alloc_time.tv_usec / 1000);
+                info.hash_index, formatted_time, info.alloc_time.tv_usec / 1000);
         for (size_t i = 0; i < info.backtrace_info->size(); ++i) {
             const unwindstack::FrameData* frame = &info.backtrace_info->at(i);
             auto map_info = frame->map_info;

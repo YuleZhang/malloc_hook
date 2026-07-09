@@ -159,6 +159,24 @@ use to get malloc and free backtrace, include dmabuffer by hook `ioctl` and `clo
   - 在拍照完后, 使用 `kill -33 <pid>` 输出当前时刻的堆栈
     - 一般返回桌面，等待几秒再调用 kill 命令发送信号，保证相机程序申请的内存已经释放，防止统计错误
 
+* Perfetto trace 抓取
+  - 该功能将每次内存申请/释放作为 async 事件（S/F）通过 `trace_marker` 写入内核 ftrace，再随 Perfetto 一起抓取，可在时间轴上直接观察内存分配的生命周期
+  - 前提：运行环境 `/sys/kernel/tracing/trace_marker`（或 `/sys/kernel/debug/tracing/trace_marker`）可写，并同时用 Perfetto/atrace 抓取 ftrace。若 trace_marker 打开失败会静默禁用，不影响程序运行
+  - 通过设置环境变量 `ENABLE_PERFETTO_TRACE` 开启（任意非空值即可），可选用 `TRACE_MIN_SIZE` / `TRACE_MAX_SIZE`（单位 Byte）过滤事件大小，过滤为闭区间 `[min, max]`
+    ```
+    # 只记录 1MB ~ 64MB 的分配事件
+    ENABLE_PERFETTO_TRACE=1 TRACE_MIN_SIZE=1048576 TRACE_MAX_SIZE=67108864 \
+      LD_PRELOAD=liballoc_hook.so LD_LIBRARY_PATH=. ls
+    ```
+  - 注意 `TRACE_MIN_SIZE` / `TRACE_MAX_SIZE` 仅作用于 Perfetto 事件，与控制堆栈记录的 `BACKTRACE_MIN_SIZE` / `BACKTRACE_MAX_SIZE` 相互独立
+  - 事件名中携带 `.h<hash_index>`，作为与 dump 文件的连接键。抓到 trace 后，用 `scripts/process_memory_stack.py` 符号化 dump 并回填成独立的 "Memory Top Allocations" 轨道，拖入 https://ui.perfetto.dev 查看
+    ```
+    python3 scripts/process_memory_stack.py \
+        -f backtrace_heap.exit.<ts>.txt \
+        --annotate-perfetto raw.perfetto \
+        --annotate-output top_alloc.perfetto
+    ```
+
 * 配置参数意义
   - `backtrace_dump_on_exit_`: 程序退出时，打印堆栈
   - `backtrace_frames_`: 抓取堆栈的最大深度，默认 128
@@ -172,4 +190,11 @@ use to get malloc and free backtrace, include dmabuffer by hook `ioctl` and `clo
   - `backtrace_dump_signal_`: checkpoint 信号机制的信号值，默认 33
   - `DUMP_PEAK_VALUE_MB`：环境变量，单位: MB，当内存峰值大于该值时记录峰值内存
   - `BACKTRACE_MIN_SIZE`：环境变量，单位: Byte，当申请内存的 size 大于该值时，才抓取堆栈信息
+  - `BACKTRACE_MAX_SIZE`：环境变量，单位: Byte，当申请内存的 size 小于该值时，才抓取堆栈信息，默认不限制
+  - `TRACE_PERFETTO`: 是否将内存申请/释放作为 async 事件写入 Perfetto trace
+  - `ENABLE_PERFETTO_TRACE`：环境变量，设置该变量（任意非空值）即开启 Perfetto trace 事件
+  - `trace_min_size_bytes_`: 开启 Perfetto trace 时，只记录 alloc size 大于等于该值的事件
+  - `trace_max_size_bytes_`: 开启 Perfetto trace 时，只记录 alloc size 小于等于该值的事件
+  - `TRACE_MIN_SIZE`：环境变量，单位: Byte，Perfetto trace 事件的 size 下界，默认 0（不限制）
+  - `TRACE_MAX_SIZE`：环境变量，单位: Byte，Perfetto trace 事件的 size 上界，默认不限制
   - `配置文件位于 backtrace/src/Config.cpp, 可在该文件中修改上述参数`

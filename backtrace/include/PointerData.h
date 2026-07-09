@@ -77,6 +77,7 @@ struct ListInfoType {
     size_t num_allocations;
     size_t size;
     MemType mem_type;
+    size_t hash_index;
     FrameInfoType* frame_info;
     std::shared_ptr<std::vector<unwindstack::FrameData>> backtrace_info;
     timeval alloc_time;
@@ -90,7 +91,7 @@ public:
 
     bool Initialize(const Config& config);
 
-    void Add(const void* ptr, size_t size, MemType type = HOST);
+    size_t Add(const void* ptr, size_t size, MemType type = HOST);
     size_t AddBacktrace(size_t num_frames, size_t size_bytes);
     void Remove(const void* ptr);
     void RemoveBacktrace(size_t hash_index);

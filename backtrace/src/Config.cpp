@@ -50,7 +50,9 @@ bool Config::Init() {
     // 如果开启 BACKTRACE_SPECIFIC_SIZES, 请指定内存申请的最大和最小 size
     options_ |= BACKTRACE_SPECIFIC_SIZES;
     ParseValue(getenv("BACKTRACE_MIN_SIZE"), &backtrace_min_size_bytes_);
-    backtrace_max_size_bytes_ = SIZE_MAX;
+    if (!ParseValue(getenv("BACKTRACE_MAX_SIZE"), &backtrace_max_size_bytes_)) {
+        backtrace_max_size_bytes_ = SIZE_MAX;
+    }
 
     // 开启 unwind
     options_ |= BACKTRACE;
@@ -72,6 +74,15 @@ bool Config::Init() {
     // 通过信号插入 check point
     options_ |= DUMP_ON_SINGAL;
     backtrace_dump_signal_ = BIONIC_SIGNAL_BACKTRACE;  // BIONIC_SIGNAL_BACKTRACE: 33
+
+    // Perfetto trace 事件
+    if (getenv("ENABLE_PERFETTO_TRACE") != nullptr) {
+        options_ |= TRACE_PERFETTO;
+        ParseValue(getenv("TRACE_MIN_SIZE"), &trace_min_size_bytes_);
+        if (!ParseValue(getenv("TRACE_MAX_SIZE"), &trace_max_size_bytes_)) {
+            trace_max_size_bytes_ = SIZE_MAX;
+        }
+    }
 
     return true;
 }
