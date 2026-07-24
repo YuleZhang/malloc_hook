@@ -51,7 +51,7 @@ pthread_rwlock_t ScopedConcurrentLock::lock_;
 
 DebugData* g_debug;
 
-static void DumpHeapToFileUnlocked(const char* file_name) {
+static void DumpHeapToFileUnlocked(const char* file_name, bool skip_if_empty = false) {
     ScopedDisableDebugCalls disable;
 
     int fd = open(file_name, O_RDWR | O_CREAT | O_NOFOLLOW | O_TRUNC | O_CLOEXEC, 0644);
@@ -59,16 +59,22 @@ static void DumpHeapToFileUnlocked(const char* file_name) {
         return;
     }
 
-    g_debug->pointer->DumpLiveToFile(fd);
+    bool has_data = g_debug->pointer->DumpLiveToFile(fd);
     close(fd);
+
+    // 没有可记录的分配时删除刚建的空文件(如多进程场景下未达峰值阈值的子进程),
+    // 避免产出一堆空的 dump 文件.
+    if (skip_if_empty && !has_data) {
+        unlink(file_name);
+    }
 }
 
 static void singal_dump_heap(int) {
     if ((g_debug->config().options() & BACKTRACE)) {
         debug_dump_heap(
                 android::base::StringPrintf(
-                        "%s.time.%ld.txt", g_debug->config().backtrace_dump_prefix(),
-                        time(NULL))
+                        "%s.pid.%d.time.%ld.txt",
+                        g_debug->config().backtrace_dump_prefix(), getpid(), time(NULL))
                         .c_str());
     }
 }
@@ -117,9 +123,10 @@ void debug_finalize() {
         g_debug->config().backtrace_dump_on_exit()) {
         DumpHeapToFileUnlocked(
                 android::base::StringPrintf(
-                        "%s.exit.%ld.txt", g_debug->config().backtrace_dump_prefix(),
-                        time(NULL))
-                        .c_str());
+                        "%s.exit.pid.%d.time.%ld.txt",
+                        g_debug->config().backtrace_dump_prefix(), getpid(), time(NULL))
+                        .c_str(),
+                /*skip_if_empty=*/true);
     }
 
     if (g_debug->TrackPointers()) {

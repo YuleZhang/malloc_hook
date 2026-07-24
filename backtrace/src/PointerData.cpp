@@ -45,6 +45,8 @@ bool PointerData::Initialize(const Config& config) {
     cur_hash_index_ = kBacktraceEmptyIndex + 1;
     current_used = current_host = current_dma = 0;
     peak_tot = peak_host = peak_dma = 0;
+    last_dump_peak_tot_ = 0;
+    peak_time_ = {};
 
     return true;
 }
@@ -77,9 +79,21 @@ size_t PointerData::Add(const void* ptr, size_t pointer_size, MemType type) {
 
             if ((g_debug->config().options() & RECORD_MEMORY_PEAK) &&
                 peak_tot > g_debug->config().backtrace_dump_peak_val()) {
-                std::lock_guard<std::mutex> frame_guard(frame_mutex_);
-                peak_list.clear();
-                GetUniqueList(&peak_list, true);
+                // 节流: 开启 THROTTLE_PEAK_DUMP 时, 仅当新峰值比上次重建时高出
+                // delta 才重建 peak_list, 避免内存爬升阶段每次分配都全量遍历+排序.
+                const uint64_t options = g_debug->config().options();
+                bool need_dump = true;
+                if (options & THROTTLE_PEAK_DUMP) {
+                    size_t delta = g_debug->config().backtrace_dump_peak_delta();
+                    need_dump = peak_tot >= last_dump_peak_tot_ + delta;
+                }
+                if (need_dump) {
+                    last_dump_peak_tot_ = peak_tot;
+                    peak_time_ = tv;
+                    std::lock_guard<std::mutex> frame_guard(frame_mutex_);
+                    peak_list.clear();
+                    GetUniqueList(&peak_list, true);
+                }
             }
         }
     }
@@ -261,7 +275,7 @@ void PointerData::GetUniqueList(
     }
 }
 
-void PointerData::DumpLiveToFile(int fd) {
+bool PointerData::DumpLiveToFile(int fd) {
     std::lock_guard<std::mutex> pointer_guard(pointer_mutex_);
     std::lock_guard<std::mutex> frame_guard(frame_mutex_);
 
@@ -272,6 +286,12 @@ void PointerData::DumpLiveToFile(int fd) {
         GetList(&list, true, [](const ListInfoType& a, const ListInfoType& b) {
             return a.alloc_time < b.alloc_time;
         });
+    }
+
+    // list 为空说明没有可记录的分配(如未达峰值阈值的短命进程), 返回 false
+    // 让调用方跳过, 避免产出空文件.
+    if (list.empty()) {
+        return false;
     }
 
     size_t host_use = 0, dma_use = 0;
@@ -285,6 +305,13 @@ void PointerData::DumpLiveToFile(int fd) {
             "used: %fMB\n",
             host_use / 1024.0 / 1024.0, dma_use / 1024.0 / 1024.0,
             (host_use + dma_use) / 1024.0 / 1024.0);
+    // 峰值发生时刻(即最近一次重建 peak_list 的时间), 便于与 trace 时间轴对齐.
+    if ((g_debug->config().options() & RECORD_MEMORY_PEAK) && peak_time_.tv_sec != 0) {
+        struct tm* peak_tm = localtime(&peak_time_.tv_sec);
+        char peak_time_str[20];
+        strftime(peak_time_str, sizeof(peak_time_str), "%Y-%m-%d %H:%M:%S", peak_tm);
+        dprintf(fd, "peak time: %s.%03zu\n", peak_time_str, peak_time_.tv_usec / 1000);
+    }
     dprintf(fd,
             "++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++"
             "+++++++++++++++\n\n");
@@ -336,6 +363,7 @@ void PointerData::DumpLiveToFile(int fd) {
         }
         dprintf(fd, "\n");
     }
+    return true;
 }
 
 void PointerData::DumpPeakInfo() {

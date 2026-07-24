@@ -96,7 +96,8 @@ public:
     void Remove(const void* ptr);
     void RemoveBacktrace(size_t hash_index);
 
-    void DumpLiveToFile(int fd);
+    // 返回是否写出了真实分配数据(list 非空); 空时调用方可据此跳过/删除空文件
+    bool DumpLiveToFile(int fd);
     void DumpPeakInfo();
 
 private:
@@ -121,6 +122,10 @@ private:
     size_t current_used, current_host, current_dma;
     size_t peak_tot, peak_host, peak_dma;
     std::vector<ListInfoType> peak_list;
+    // 上次重建 peak_list 时的 peak_tot, 用于 THROTTLE_PEAK_DUMP 节流判断
+    size_t last_dump_peak_tot_;
+    // 最近一次重建 peak_list(即峰值快照)的时刻, 写入 dump 文件头
+    timeval peak_time_;
 
     BIONIC_DISALLOW_COPY_AND_ASSIGN(PointerData);
 };

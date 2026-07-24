@@ -111,6 +111,13 @@ use to get malloc and free backtrace, include dmabuffer by hook `ioctl` and `clo
   DUMP_PEAK_VALUE_MB=xxx LD_PRELOAD=liballoc_hook.so LD_LIBRARY_PATH=. ls
   ```
   - DUMP_PEAK_VALUE_MB 的单位默认为 MB
+  - 【可选】节流：开启峰值记录后，内存爬升阶段几乎每次分配都会创新高，从而每次都全量遍历+排序重建 peak_list，开销较大。可通过环境变量 `DUMP_PEAK_DELTA_MB` 开启节流——仅当新峰值比上次重建时高出该增量才重建，默认不设则保持每次创新高都重建的旧行为
+  ```
+  # 仅当峰值比上次记录点再高出 10MB 才重建 peak_list
+  DUMP_PEAK_VALUE_MB=570 DUMP_PEAK_DELTA_MB=10 LD_PRELOAD=liballoc_hook.so LD_LIBRARY_PATH=. ls
+  ```
+    - 单位为 MB，仅在已设置 `DUMP_PEAK_VALUE_MB` 时生效
+    - 代价：退出 dump 的 peak_list 是"最近一次通过节流阈值时"的快照，与真实峰值时刻最多相差一个 delta，delta 越小越接近真实峰值
 
 * 内存泄露分析步骤
   - 利用 cheakpoint 机制执行两次程序，并对两次的内存调用堆栈输出进行对比，分析内存调用的增量，此时的内存调用是以时间排序，可以从后向前对比
@@ -172,7 +179,7 @@ use to get malloc and free backtrace, include dmabuffer by hook `ioctl` and `clo
   - 事件名中携带 `.h<hash_index>`，作为与 dump 文件的连接键。抓到 trace 后，用 `scripts/process_memory_stack.py` 符号化 dump 并回填成独立的 "Memory Top Allocations" 轨道，拖入 https://ui.perfetto.dev 查看
     ```
     python3 scripts/process_memory_stack.py \
-        -f backtrace_heap.exit.<ts>.txt \
+        -f backtrace_heap.exit.pid.<pid>.time.<ts>.txt \
         --annotate-perfetto raw.perfetto \
         --annotate-output top_alloc.perfetto
     ```
@@ -186,9 +193,12 @@ use to get malloc and free backtrace, include dmabuffer by hook `ioctl` and `clo
   - `backtrace_max_size_bytes_`: 开启 BACKTRACE_SPECIFIC_SIZES 标志时，抓取 alloc size 小于该值的堆栈信息
   - `RECORD_MEMORY_PEAK`: 是否抓取峰值时刻的堆栈信息
   - `backtrace_dump_peak_val_`: 当峰值大于该值时，记录峰值时刻的堆栈
+  - `THROTTLE_PEAK_DUMP`: 是否对 peak_list 重建做节流（设置 DUMP_PEAK_DELTA_MB 时开启）
+  - `backtrace_dump_peak_delta_`: 峰值 peak_list 重建的节流增量，仅当新峰值比上次重建时高出该值才重建
   - `DUMP_ON_SINGAL`: 开启 checkpoint 信号机制
   - `backtrace_dump_signal_`: checkpoint 信号机制的信号值，默认 33
   - `DUMP_PEAK_VALUE_MB`：环境变量，单位: MB，当内存峰值大于该值时记录峰值内存
+  - `DUMP_PEAK_DELTA_MB`：环境变量，单位: MB，开启峰值 peak_list 重建节流，仅当新峰值比上次重建时高出该增量才重建；仅在已设置 DUMP_PEAK_VALUE_MB 时生效，默认不设则不节流
   - `BACKTRACE_MIN_SIZE`：环境变量，单位: Byte，当申请内存的 size 大于该值时，才抓取堆栈信息
   - `BACKTRACE_MAX_SIZE`：环境变量，单位: Byte，当申请内存的 size 小于该值时，才抓取堆栈信息，默认不限制
   - `TRACE_PERFETTO`: 是否将内存申请/释放作为 async 事件写入 Perfetto trace
@@ -197,4 +207,5 @@ use to get malloc and free backtrace, include dmabuffer by hook `ioctl` and `clo
   - `trace_max_size_bytes_`: 开启 Perfetto trace 时，只记录 alloc size 小于等于该值的事件
   - `TRACE_MIN_SIZE`：环境变量，单位: Byte，Perfetto trace 事件的 size 下界，默认 0（不限制）
   - `TRACE_MAX_SIZE`：环境变量，单位: Byte，Perfetto trace 事件的 size 上界，默认不限制
+  - dump 文件名格式：信号触发为 `<prefix>.pid.<pid>.time.<time>.txt`，退出触发为 `<prefix>.exit.pid.<pid>.time.<time>.txt`，文件名含 pid 以避免多进程（如 fork）互相覆盖
   - `配置文件位于 backtrace/src/Config.cpp, 可在该文件中修改上述参数`

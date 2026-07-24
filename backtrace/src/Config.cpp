@@ -67,6 +67,15 @@ bool Config::Init() {
             backtrace_min_size_bytes_ = 1024;
         }
         backtrace_dump_on_exit_ = true;
+
+        // 峰值 peak_list 重建节流: 仅当新峰值比上次重建时高出 DUMP_PEAK_DELTA_MB
+        // 才重建, 避免内存爬升阶段每次分配都全量遍历+排序. 默认不设则不节流,
+        // 保持每次创新高都重建的旧行为.
+        if (ParseValue(getenv("DUMP_PEAK_DELTA_MB"), &backtrace_dump_peak_delta_)) {
+            options_ |= THROTTLE_PEAK_DUMP;
+            // 单位是 MB
+            backtrace_dump_peak_delta_ *= 1024 * 1024;
+        }
     }
     // 单位是 MB
     backtrace_dump_peak_val_ *= 1024 * 1024;
