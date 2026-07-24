@@ -8,6 +8,8 @@ constexpr uint64_t TRACK_ALLOCS = 0x2;              // 记录内存申请动作
 constexpr uint64_t BACKTRACE_SPECIFIC_SIZES = 0x4;  // 记录特定大小的内存申请
 constexpr uint64_t RECORD_MEMORY_PEAK = 0x8;        // 记录内存峰值
 constexpr uint64_t DUMP_ON_SINGAL = 0x80;           // 记录内存峰值
+constexpr uint64_t TRACE_PERFETTO = 0x10;          // 启用 Perfetto trace 事件
+constexpr uint64_t THROTTLE_PEAK_DUMP = 0x20;       // 峰值 peak_list 重建节流
 
 class Config {
 public:
@@ -26,6 +28,11 @@ public:
 
     size_t backtrace_dump_peak_val() const { return backtrace_dump_peak_val_; }
 
+    size_t backtrace_dump_peak_delta() const { return backtrace_dump_peak_delta_; }
+
+    size_t trace_min_size_bytes() const { return trace_min_size_bytes_; }
+    size_t trace_max_size_bytes() const { return trace_max_size_bytes_; }
+
 private:
     int backtrace_dump_signal_ = 0;
 
@@ -37,6 +44,11 @@ private:
     size_t backtrace_max_size_bytes_ = 0;
 
     size_t backtrace_dump_peak_val_ = 0;
+
+    size_t backtrace_dump_peak_delta_ = 0;
+
+    size_t trace_min_size_bytes_ = 0;
+    size_t trace_max_size_bytes_ = SIZE_MAX;
 
     uint64_t options_ = 0;
 };

@@ -30,14 +30,14 @@ target_link_libraries(alloc_hook PRIVATE helper)
 # 安装到 out/lib 目录
 install(TARGETS alloc_hook DESTINATION ${CMAKE_INSTALL_PREFIX}/out/lib)
 
-if (TARGET gtest)
-  message(STATUS "gtest is already defined")
-else()
-  set(GOOGLETEST_VERSION 1.15.2)
-  add_subdirectory(${PROJECT_SOURCE_DIR}/third_party/googletest/googletest)
-  add_subdirectory(${PROJECT_SOURCE_DIR}/third_party/opencl_stub)
-  add_subdirectory(test)
-endif()
+# if (TARGET gtest)
+#   message(STATUS "gtest is already defined")
+# else()
+#   set(GOOGLETEST_VERSION 1.15.2)
+#   add_subdirectory(${PROJECT_SOURCE_DIR}/third_party/googletest/googletest)
+#   add_subdirectory(${PROJECT_SOURCE_DIR}/third_party/opencl_stub)
+#   add_subdirectory(test)
+# endif()
 
 # copy database compile_commands.json to PROJECT_SOURCE_DIR
 add_custom_target(

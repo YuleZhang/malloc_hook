@@ -1,15 +1,15 @@
+#include <linux/dma-heap.h>
 #include <signal.h>
 #include <sys/mman.h>
 #include <sys/param.h>  // powerof2 ---> ((((x) - 1) & (x)) == 0)
-#include <unistd.h>
 #include <sys/stat.h>
-#include <linux/dma-heap.h>
+#include <unistd.h>
 
+#include <android-base/stringprintf.h>
 #include <cstring>
 #include <mutex>
 #include <string>
 #include <unordered_set>
-#include <android-base/stringprintf.h>
 
 #include "Config.h"
 #include "DebugData.h"
@@ -21,6 +21,7 @@
 #include "msm_ksgl/msm_ksgl.h"
 #include "mtk_camera/camera_mem.h"
 
+#include "TraceWriter.h"
 #include "memory_hook.h"
 
 class ScopedConcurrentLock {
@@ -50,7 +51,7 @@ pthread_rwlock_t ScopedConcurrentLock::lock_;
 
 DebugData* g_debug;
 
-static void DumpHeapToFileUnlocked(const char* file_name) {
+static void DumpHeapToFileUnlocked(const char* file_name, bool skip_if_empty = false) {
     ScopedDisableDebugCalls disable;
 
     int fd = open(file_name, O_RDWR | O_CREAT | O_NOFOLLOW | O_TRUNC | O_CLOEXEC, 0644);
@@ -58,16 +59,23 @@ static void DumpHeapToFileUnlocked(const char* file_name) {
         return;
     }
 
-    g_debug->pointer->DumpLiveToFile(fd);
+    bool has_data = g_debug->pointer->DumpLiveToFile(fd);
     close(fd);
+
+    // 没有可记录的分配时删除刚建的空文件(如多进程场景下未达峰值阈值的子进程),
+    // 避免产出一堆空的 dump 文件.
+    if (skip_if_empty && !has_data) {
+        unlink(file_name);
+    }
 }
 
 static void singal_dump_heap(int) {
     if ((g_debug->config().options() & BACKTRACE)) {
-        debug_dump_heap(android::base::StringPrintf(
-                                "%s.time.%ld.txt",
-                                g_debug->config().backtrace_dump_prefix(), time(NULL))
-                                .c_str());
+        debug_dump_heap(
+                android::base::StringPrintf(
+                        "%s.pid.%d.time.%ld.txt",
+                        g_debug->config().backtrace_dump_prefix(), getpid(), time(NULL))
+                        .c_str());
     }
 }
 
@@ -113,10 +121,12 @@ void debug_finalize() {
 
     if ((g_debug->config().options() & BACKTRACE) &&
         g_debug->config().backtrace_dump_on_exit()) {
-        DumpHeapToFileUnlocked(android::base::StringPrintf(
-                                       "%s.exit.%ld.txt",
-                                       g_debug->config().backtrace_dump_prefix(), time(NULL))
-                                       .c_str());
+        DumpHeapToFileUnlocked(
+                android::base::StringPrintf(
+                        "%s.exit.pid.%d.time.%ld.txt",
+                        g_debug->config().backtrace_dump_prefix(), getpid(), time(NULL))
+                        .c_str(),
+                /*skip_if_empty=*/true);
     }
 
     if (g_debug->TrackPointers()) {
@@ -126,6 +136,8 @@ void debug_finalize() {
     // 对于调试工具或在调试模式下运行的代码, 资源管理可能不是首要关注点.
     // 为了避免在清理过程中出现多线程访问冲突, 决定故意不释放这些资源. 包括
     // g_debug、pthread 键等.
+
+    TraceWriter::Get().Shutdown();
 }
 
 void debug_dump_heap(const char* file_name) {
@@ -135,7 +147,7 @@ void debug_dump_heap(const char* file_name) {
 
 static void* InternalMalloc(size_t size) {
     void* result = m_sys_malloc(size);
-    if (g_debug->TrackPointers()) {
+    if (result != nullptr && g_debug->TrackPointers()) {
         g_debug->pointer->Add(result, size);
     }
 
@@ -293,13 +305,15 @@ int debug_posix_memalign(void** memptr, size_t alignment, size_t size) {
 
 namespace DMA_BUF {
 
-static thread_local bool gpu_ioctl_alloc = false;  // TLS to store a unique flag per thread
+static thread_local bool gpu_ioctl_alloc =
+        false;  // TLS to store a unique flag per thread
 static std::mutex inode_set_mutex;
 
 static bool is_dma_buf(int fd, size_t* size) {
     static std::unordered_set<uint64_t> inode_set;
     std::string fdinfo = android::base::StringPrintf("/proc/self/fdinfo/%d", fd);
-    auto fp = std::unique_ptr<FILE, decltype(&fclose)>{fopen(fdinfo.c_str(), "re"), fclose};
+    auto fp = std::unique_ptr<FILE, decltype(&fclose)>{
+            fopen(fdinfo.c_str(), "re"), fclose};
     if (fp == nullptr) {
         return false;
     }
@@ -366,14 +380,16 @@ static bool handle_dma_node(unsigned int request, void* arg, int* fd, size_t* si
             return set_gpu_ioctl_alloc_and_return_false();
         // parse the backtrace immediately
         case DMA_HEAP_IOCTL_ALLOC: {
-                struct dma_heap_allocation_data* heap = (struct dma_heap_allocation_data*)arg;
-                *fd = heap->fd;
-            }
+            struct dma_heap_allocation_data* heap =
+                    (struct dma_heap_allocation_data*)arg;
+            *fd = heap->fd;
+        }
             return is_dma_buf(*fd, size);
         case CAM_MEM_ION_MAP_PA: {
-                struct CAM_MEM_DEV_ION_NODE_STRUCT* heap = (struct CAM_MEM_DEV_ION_NODE_STRUCT*)arg;
-                *fd = heap->memID;
-            }
+            struct CAM_MEM_DEV_ION_NODE_STRUCT* heap =
+                    (struct CAM_MEM_DEV_ION_NODE_STRUCT*)arg;
+            *fd = heap->memID;
+        }
             return is_dma_buf(*fd, size);
         default:
             return false;
@@ -394,7 +410,8 @@ int debug_ioctl(int fd, unsigned int request, void* arg) {
 
     int node_fd = -1;
     size_t node_sz = 0;
-    if (g_debug->TrackPointers() && DMA_BUF::handle_dma_node(request, arg, &node_fd, &node_sz)) {
+    if (ret >= 0 && g_debug->TrackPointers() &&
+        DMA_BUF::handle_dma_node(request, arg, &node_fd, &node_sz)) {
         ScopedConcurrentLock lock;
         void* ptr = reinterpret_cast<void*>(node_fd);
         g_debug->pointer->Add(ptr, node_sz, DMA);
@@ -434,8 +451,8 @@ void* debug_mmap64(void* addr, size_t size, int prot, int flags, int fd, off_t o
 
     void* result = (void*)syscall(SYS_mmap, addr, size, prot, flags, fd, offset);
 
-    if (g_debug->TrackPointers() && DMA_BUF::gpu_ioctl_alloc) {
-        DMA_BUF::gpu_ioctl_alloc = false;  // Reset the flag immediately after processing
+    if (result != MAP_FAILED && g_debug->TrackPointers() && DMA_BUF::gpu_ioctl_alloc) {
+        DMA_BUF::gpu_ioctl_alloc = false;
         g_debug->pointer->Add(result, size, DMA);
     }
 
@@ -456,11 +473,11 @@ void* debug_mmap(void* addr, size_t size, int prot, int flags, int fd, off_t off
     }
 
     void* result = (void*)syscall(SYS_mmap, addr, size, prot, flags, fd, offset);
-    if (g_debug->TrackPointers()) {
+    if (result != MAP_FAILED && g_debug->TrackPointers()) {
         size_t node_sz = 0;
-        if (fd < 0)
+        if (fd < 0) {
             g_debug->pointer->Add(result, size, MMAP);
-        else if (DMA_BUF::is_dma_buf(fd, &node_sz)) {
+        } else if (DMA_BUF::is_dma_buf(fd, &node_sz)) {
             void* ptr = reinterpret_cast<void*>(fd);
             g_debug->pointer->Add(ptr, node_sz, DMA);
         }

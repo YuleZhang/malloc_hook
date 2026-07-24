@@ -50,7 +50,9 @@ bool Config::Init() {
     // 如果开启 BACKTRACE_SPECIFIC_SIZES, 请指定内存申请的最大和最小 size
     options_ |= BACKTRACE_SPECIFIC_SIZES;
     ParseValue(getenv("BACKTRACE_MIN_SIZE"), &backtrace_min_size_bytes_);
-    backtrace_max_size_bytes_ = SIZE_MAX;
+    if (!ParseValue(getenv("BACKTRACE_MAX_SIZE"), &backtrace_max_size_bytes_)) {
+        backtrace_max_size_bytes_ = SIZE_MAX;
+    }
 
     // 开启 unwind
     options_ |= BACKTRACE;
@@ -65,6 +67,15 @@ bool Config::Init() {
             backtrace_min_size_bytes_ = 1024;
         }
         backtrace_dump_on_exit_ = true;
+
+        // 峰值 peak_list 重建节流: 仅当新峰值比上次重建时高出 DUMP_PEAK_DELTA_MB
+        // 才重建, 避免内存爬升阶段每次分配都全量遍历+排序. 默认不设则不节流,
+        // 保持每次创新高都重建的旧行为.
+        if (ParseValue(getenv("DUMP_PEAK_DELTA_MB"), &backtrace_dump_peak_delta_)) {
+            options_ |= THROTTLE_PEAK_DUMP;
+            // 单位是 MB
+            backtrace_dump_peak_delta_ *= 1024 * 1024;
+        }
     }
     // 单位是 MB
     backtrace_dump_peak_val_ *= 1024 * 1024;
@@ -72,6 +83,15 @@ bool Config::Init() {
     // 通过信号插入 check point
     options_ |= DUMP_ON_SINGAL;
     backtrace_dump_signal_ = BIONIC_SIGNAL_BACKTRACE;  // BIONIC_SIGNAL_BACKTRACE: 33
+
+    // Perfetto trace 事件
+    if (getenv("ENABLE_PERFETTO_TRACE") != nullptr) {
+        options_ |= TRACE_PERFETTO;
+        ParseValue(getenv("TRACE_MIN_SIZE"), &trace_min_size_bytes_);
+        if (!ParseValue(getenv("TRACE_MAX_SIZE"), &trace_max_size_bytes_)) {
+            trace_max_size_bytes_ = SIZE_MAX;
+        }
+    }
 
     return true;
 }
