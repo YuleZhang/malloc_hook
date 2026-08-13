@@ -1,0 +1,35 @@
+{
+global:
+    malloc;
+    free;
+    calloc;
+    realloc;
+    aligned_alloc;
+    memalign;
+    posix_memalign;
+    ioctl;
+    close;
+    checkpoint;
+    _Znwm;
+    _Znam;
+    _ZnwmRKSt9nothrow_t;
+    _ZnamRKSt9nothrow_t;
+    _ZdlPv;
+    _ZdaPv;
+    _ZdlPvm;
+    _ZdaPvm;
+    _ZdlPvRKSt9nothrow_t;
+    _ZdaPvRKSt9nothrow_t;
+    _ZnwmSt11align_val_t;
+    _ZnamSt11align_val_t;
+    _ZnwmSt11align_val_tRKSt9nothrow_t;
+    _ZnamSt11align_val_tRKSt9nothrow_t;
+    _ZdlPvSt11align_val_t;
+    _ZdaPvSt11align_val_t;
+    _ZdlPvmSt11align_val_t;
+    _ZdaPvmSt11align_val_t;
+    _ZdlPvSt11align_val_tRKSt9nothrow_t;
+    _ZdaPvSt11align_val_tRKSt9nothrow_t;
+
+local: *;
+};
