@@ -97,6 +97,7 @@ public:
 
     void DumpLiveToFile(int fd, bool dump_peak = true);
     void DumpPeakInfo();
+    void GetCurrentUsage(size_t* host_bytes, size_t* dma_bytes);
 
 private:
     inline uintptr_t ManglePointer(uintptr_t pointer) { return pointer ^ UINTPTR_MAX; }
