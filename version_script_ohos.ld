@@ -7,8 +7,6 @@ global:
     aligned_alloc;
     memalign;
     posix_memalign;
-    ioctl;
-    close;
     checkpoint;
     malloc_hook_record_sample_peak;
     _Znwm;
