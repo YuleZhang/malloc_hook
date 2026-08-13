@@ -4,6 +4,7 @@ project(malloc_hook LANGUAGES C CXX ASM)
 
 option(MALLOC_HOOK_BUILD_TESTS "Build malloc_hook test binaries" ON)
 option(MALLOC_HOOK_OHOS_MMAP_HOOK "Export mmap/munmap hooks in OHOS builds" OFF)
+option(MALLOC_HOOK_OPENCL_PROBE "Build optional OpenCL API marker probe" OFF)
 
 if(OHOS)
   if(MALLOC_HOOK_OHOS_MMAP_HOOK)
@@ -29,15 +30,18 @@ if(ANDROID OR OHOS)
 endif()
 # Check if using Clang
 if (CMAKE_CXX_COMPILER_ID MATCHES "Clang")
-    set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -Wl,--version-script=${VERSION_SCRIPT}")
     set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 endif()
 
 add_subdirectory(unwindstack/cmake)
 add_subdirectory(backtrace)
 
-# 添加 .so
+# Keep the allocator independent from loader/API probes.
 add_library(alloc_hook SHARED ${CMAKE_SOURCE_DIR}/src/alloc_hook.cpp)
+if (CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+  target_link_options(alloc_hook PRIVATE
+    "-Wl,--version-script=${VERSION_SCRIPT}")
+endif()
 # 链接需要的库和头文件
 target_link_libraries(alloc_hook PRIVATE helper)
 # 安装到 out/lib 目录
@@ -52,6 +56,24 @@ if (MALLOC_HOOK_BUILD_TESTS)
     add_subdirectory(${PROJECT_SOURCE_DIR}/third_party/opencl_stub)
     add_subdirectory(test)
   endif()
+endif()
+
+# Keep OpenCL dlsym interception in a loader-safe companion library.  The
+# allocator library remains independently usable for P0/P1 memory accounting.
+if (MALLOC_HOOK_OPENCL_PROBE)
+  add_library(opencl_probe SHARED ${CMAKE_SOURCE_DIR}/src/opencl_probe.cpp)
+  target_include_directories(opencl_probe PRIVATE
+    ${CMAKE_SOURCE_DIR}/third_party/opencl_stub/include)
+  set_target_properties(opencl_probe PROPERTIES OUTPUT_NAME "opencl_probe")
+  if (OHOS)
+    target_link_options(opencl_probe PRIVATE
+      "-Wl,--version-script=${CMAKE_SOURCE_DIR}/version_script_opencl_probe.ld"
+      "-static-libstdc++")
+  elseif(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    target_link_options(opencl_probe PRIVATE
+      "-Wl,--version-script=${CMAKE_SOURCE_DIR}/version_script_opencl_probe.ld")
+  endif()
+  install(TARGETS opencl_probe DESTINATION ${CMAKE_INSTALL_PREFIX}/out/lib)
 endif()
 
 # copy database compile_commands.json to PROJECT_SOURCE_DIR

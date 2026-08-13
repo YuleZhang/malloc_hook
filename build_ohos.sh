@@ -56,6 +56,7 @@ fi
 echo "Using OHOS NDK: ${OHOS_NDK_NATIVE}"
 echo "Building liballoc_hook.so for ${BUILD_ARCH}"
 echo "OHOS mmap hooks: ${OHOS_ENABLE_MMAP_HOOK:-OFF}"
+echo "OpenCL API markers: ${MALLOC_HOOK_OPENCL_PROBE:-OFF}"
 
 rm -rf "${BUILD_DIR}"
 cmake -S "${SRC_DIR}" -B "${BUILD_DIR}" -G Ninja \
@@ -65,6 +66,7 @@ cmake -S "${SRC_DIR}" -B "${BUILD_DIR}" -G Ninja \
     -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_INSTALL_PREFIX="${SRC_DIR}" \
     -DMALLOC_HOOK_OHOS_MMAP_HOOK="${OHOS_ENABLE_MMAP_HOOK:-OFF}" \
+    -DMALLOC_HOOK_OPENCL_PROBE="${MALLOC_HOOK_OPENCL_PROBE:-OFF}" \
     -DMALLOC_HOOK_BUILD_TESTS=OFF
 cmake --build "${BUILD_DIR}" --target install -v
 

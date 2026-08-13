@@ -37,7 +37,9 @@ CMAKE_PARA_ARMV7="-DCMAKE_TOOLCHAIN_FILE=${NDK_ROOT}/build/cmake/android.toolcha
     -DANDROID_PLATFORM=android-21"
 
 CMAKE_PARA=" -DCMAKE_INSTALL_PREFIX=${SRC_DIR} \
-    -DCMAKE_BUILD_TYPE=Release -G Ninja"
+    -DCMAKE_BUILD_TYPE=Release -G Ninja \
+    -DMALLOC_HOOK_OPENCL_PROBE=${MALLOC_HOOK_OPENCL_PROBE:-OFF} \
+    -DMALLOC_HOOK_BUILD_TESTS=${MALLOC_HOOK_BUILD_TESTS:-ON}"
 
 function cmake_para_gen(){ 
     case ${BUILD_ARCH} in
@@ -86,4 +88,8 @@ function test_func(){
 }
 cmake_para_gen
 build_sdk
-test_func
+if [[ "${MALLOC_HOOK_RUN_DEVICE_TEST:-ON}" == "ON" ]]; then
+    test_func
+else
+    echo "Skipping adb device test (MALLOC_HOOK_RUN_DEVICE_TEST=${MALLOC_HOOK_RUN_DEVICE_TEST})"
+fi

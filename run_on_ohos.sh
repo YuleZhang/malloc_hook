@@ -10,6 +10,7 @@ Example:
 
 Environment:
   HDC                         hdc executable, default: hdc
+  HDC_TARGET                  target passed as "hdc -t <target>"
   LOCAL_LIB                   local hook library, default: out/lib/liballoc_hook.so
   BACKTRACE_MIN_SIZE          minimum allocation size captured, default: 40960
   BACKTRACE_DUMP_SIGNAL       signal used by checkpoint handler, default: 46
@@ -20,6 +21,7 @@ fi
 
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 HDC_BIN="${HDC:-hdc}"
+HDC_TARGET="${HDC_TARGET:-}"
 LOCAL_LIB="${LOCAL_LIB:-${SCRIPT_DIR}/out/lib/liballoc_hook.so}"
 REMOTE_DIR="$1"
 shift
@@ -34,9 +36,15 @@ if [[ ! -f "${LOCAL_LIB}" ]]; then
     exit 1
 fi
 
-"${HDC_BIN}" shell "mkdir -p '${REMOTE_DIR}' '${TRACE_DIR}'"
-"${HDC_BIN}" file send "${LOCAL_LIB}" "${REMOTE_DIR}/liballoc_hook.so" >/dev/null
-"${HDC_BIN}" shell "cd '${REMOTE_DIR}' && chmod 755 ./liballoc_hook.so && \
+HDC_ARGS=()
+if [[ -n "${HDC_TARGET}" ]]; then
+  HDC_ARGS=(-t "${HDC_TARGET}")
+fi
+hdc_run() { "${HDC_BIN}" "${HDC_ARGS[@]}" "$@"; }
+
+hdc_run shell "mkdir -p '${REMOTE_DIR}' '${TRACE_DIR}'"
+hdc_run file send -sync "${LOCAL_LIB}" "${REMOTE_DIR}/liballoc_hook.so" >/dev/null
+hdc_run shell "cd '${REMOTE_DIR}' && chmod 755 ./liballoc_hook.so && \
     export LD_LIBRARY_PATH=.; \
     export BACKTRACE_MIN_SIZE='${MIN_SIZE}'; \
     export BACKTRACE_DUMP_SIGNAL='${DUMP_SIGNAL}'; \

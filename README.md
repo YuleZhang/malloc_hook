@@ -18,7 +18,7 @@ use to get malloc and free backtrace, include dmabuffer by hook `ioctl` and `clo
 
   * how to use on OHOS
   * 构建: `./build_ohos.sh arm64-v8a`
-  * OHOS 版本默认只导出 heap hooks（`malloc/free/calloc/realloc/aligned_alloc/memalign/posix_memalign/checkpoint`），避免拦截 `mmap/ioctl/close` 影响 OpenCL/DMA 驱动初始化
+  * OHOS 版本默认导出 heap hooks 以及 `ioctl/close`，用于记录 `DMA_HEAP_IOCTL_ALLOC` 返回的 DMA-BUF fd 及其释放；仍不导出 `mmap/munmap`，避免影响 OpenCL 驱动映射初始化
   * 如需单独验证匿名 `mmap` 调用栈，可使用 `OHOS_ENABLE_MMAP_HOOK=ON ./build_ohos.sh arm64-v8a` 构建 mmap 调试版；该版本只适合小型复现程序，OpenCL pipeline 中导出 `mmap/munmap` 会触发 vendor runtime `SIGTRAP`，不建议用于正式 pipeline 跑图
   * OHOS 默认 `BACKTRACE_MIN_SIZE=40960`，可通过环境变量覆盖；不建议设置为 0，会明显拖慢复杂 pipeline
   * 直接运行命令并抓取: `./run_on_ohos.sh /data/local/tmp/alloc_test ./your_program arg1 arg2`
@@ -30,6 +30,17 @@ use to get malloc and free backtrace, include dmabuffer by hook `ioctl` and `clo
       export BACKTRACE_DUMP_SIGNAL=46
       LD_PRELOAD=./liballoc_hook.so ./your_program
     ```
+  * Android arm64 可选构建 OpenCL companion probe（仅在需要 API marker 时启用）：
+    ```bash
+    MALLOC_HOOK_BUILD_TESTS=OFF MALLOC_HOOK_OPENCL_PROBE=ON \
+      MALLOC_HOOK_RUN_DEVICE_TEST=OFF ./build_android.sh arm64-v8a
+    ```
+    这会额外生成 `out/lib/libopencl_probe.so`。当前已完成 Android arm64
+    NDK 交叉编译验证；尚未在 Android 真机上完成 FaceSR runtime/marker 验证，
+    因而不能把该 probe 的 Android 行为当作已验证结论。真机验证时应使用
+    `adb -s <serial>`（或设置 `ANDROID_SERIAL`）明确选择设备，并单独检查
+    `MALLOC_HOOK_OPENCL_MARKERS=1` 下 marker 数量、OpenCL 返回码和 workload
+    退出码。
   * 外部触发 checkpoint: `kill -46 <pid>`，其中信号值需和 `BACKTRACE_DUMP_SIGNAL` 保持一致；OHOS 上 `33/45` 可能被系统或运行时保留/覆盖，不建议使用
 
 * checkpoint
@@ -131,6 +142,76 @@ use to get malloc and free backtrace, include dmabuffer by hook `ioctl` and `clo
   ```
   - DUMP_PEAK_VALUE_MB 的单位默认为 MB
   - `DUMP_PEAK_STEP_MB` 控制峰值快照的最小增长间隔，默认 64MB；设置 `DUMP_PEAK_VALUE_MB` 后，工具会在首次超过阈值时保存峰值快照，之后只有峰值再次增长超过该间隔才重建快照，避免在运行时反复抓取和聚合堆栈导致卡住。
+  - OHOS 上设置 `MALLOC_HOOK_TRACE_PEAK=1` 时，每次峰值快照提交都会写入 `/sys/kernel/tracing/trace_marker`。Perfetto/HiTrace 中可搜索 `malloc_hook_peak_snapshot`，并查看 `malloc_hook_peak_total_bytes`、`malloc_hook_peak_host_bytes`、`malloc_hook_peak_dma_bytes` counter；最后一个 snapshot 对应退出时写入 `backtrace_heap.exit.*.txt` 的峰值快照。
+  - 设置 `MALLOC_HOOK_SAMPLE_PEAK=1` 后，支持由采样器调用
+    `malloc_hook_record_sample_peak(epoch_ms, dma_bytes, rss_bytes)` 保存同一采样
+    事件的候选快照。`MALLOC_HOOK_SAMPLE_PEAK_THRESHOLD_MB` 控制首次抓取
+    阈值，`MALLOC_HOOK_SAMPLE_PEAK_STEP_MB` 控制后续新高的最小增量，
+    `MALLOC_HOOK_SAMPLE_PEAK_DIR` 控制输出目录。每张快照包含 smaps、
+    smaps_rollup、ION、hook live ledger、采集起止时间以及可用时的 OpenCL
+    requested-bytes ledger；默认关闭。
+  - 上述两套峰值机制彼此独立：
+    - `DUMP_PEAK_VALUE_MB` / `DUMP_PEAK_STEP_MB` 跟踪 malloc_hook 自身维护的
+      `host live + DMA live`，用于得到分配调用栈峰值。
+    - `MALLOC_HOOK_SAMPLE_PEAK_*` 不主动采样 RSS。HAIO 或其它采样器必须在
+      取得同一行 `dma_cur` 和 `rss_cur` 后调用
+      `malloc_hook_record_sample_peak(epoch_ms, dma_bytes, rss_bytes)`；hook 再按
+      `DMA + RSS` 判断是否保存 smaps/PSS/ION/live-ledger 快照。
+    - 两套阈值可同时启用，互不覆盖。前者可能生成
+      `backtrace_heap*.txt` 和 `malloc_hook_peak_snapshot` trace marker，后者生成
+      `MALLOC_HOOK_SAMPLE_PEAK_DIR` 下的目录快照。分析时必须按各自 accounting
+      domain 展示，不能把 hook live 峰值与 HAIO DMA+RSS 求和。
+    - 如只需要 DMA+RSS/PSS 同时刻快照，可不设置 `DUMP_PEAK_VALUE_MB`，仅开启
+      `MALLOC_HOOK_SAMPLE_PEAK=1` 并由采样器调用导出接口。当前 live ledger 中
+      的调用栈由每个仍存活 allocation 的引用自动保留；需要记录新分配的调用栈
+      时仍应合理设置 `BACKTRACE_MIN_SIZE`。不需要为 sampled mode 额外开启
+      `RECORD_MEMORY_PEAK`。
+    - 两套机制同时启用时不会覆盖彼此：`DUMP_PEAK_VALUE_MB` 仅控制
+      malloc_hook 的 host+DMA peak；`MALLOC_HOOK_SAMPLE_PEAK_*` 仅控制采样器传入
+      的同一行 DMA+RSS 候选。若同时设置同名的 step/threshold，应分别使用各自
+      前缀；不要把两个 accounting domain 的数值相加。
+  - OHOS 构建可选启用 `-DMALLOC_HOOK_OPENCL_PROBE=ON`。运行时再设置
+    `MALLOC_HOOK_OPENCL_MARKERS=1`，malloc_hook 会拦截 FaceSR 内置 OpenCL
+    stub 通过 `dlsym()` 解析出的关键 API（context/queue、buffer/image、
+    program build、kernel、NDRange、release），向 trace_marker 写入 API、
+    对象句柄、请求字节数、live requested bytes 和 dispatch 维度。默认关闭，
+    不导出 OHOS mmap hook；可用 `MALLOC_HOOK_OPENCL_MARKER_PATH=/data/local/tmp/...`
+    写入独立 marker 文件。
+  - 设置 `MALLOC_HOOK_OPENCL_PROCESS_RSS=1` 后，每个 OpenCL marker 额外记录
+    `/proc/self/status` 的 `VmRSS`，用于把 program/kernel 生命周期与进程 RSS
+    高水位对齐。该读取默认关闭，避免给正式 pipeline 增加开销。
+
+* 将 HAIO CSV 合并到 OHOS trace
+  - `scripts/merge_trace_csv.py` 会保留原始 ftrace 中的
+    `malloc_hook_peak_snapshot`、`malloc_hook_ocl` 和其它
+    `tracing_mark_write` 事件，并把 CSV 数值列作为 Perfetto counter tracks
+    合并进去。
+  - 输入原始 ftrace：
+  ```
+  python3 scripts/merge_trace_csv.py \
+      --trace facesr_raw.ftrace \
+      --csv mem_use_info_process_1234.csv \
+      --pid 1234 \
+      --output facesr_memory_overlay.html
+  ```
+  - 输入已经包装好的 systrace HTML：
+  ```
+  python3 scripts/merge_trace_csv.py \
+      --trace facesr_raw.html \
+      --csv mem_use_info_process_1234.csv \
+      --pid 1234 \
+      --output facesr_memory_overlay.html
+  ```
+  - 默认合并 CSV 中除 `time` 外的全部数值列。底层脚本也可单独使用：
+  ```
+  python3 scripts/merge_csv_to_perfetto.py --list-columns --csv memory.csv
+  python3 scripts/merge_csv_to_perfetto.py \
+      --trace facesr_raw.html --csv memory.csv \
+      --column dma_cur --column rss_cur \
+      --html-pid 1234 --output selected_memory_overlay.html
+  ```
+  - 脚本会验证每条 counter track 的事件数是否等于 CSV 行数，并打印 trace
+    与 overlay 时间范围、descriptor 数和 counter event 数。
 
 * 内存泄露分析步骤
   - 利用 cheakpoint 机制执行两次程序，并对两次的内存调用堆栈输出进行对比，分析内存调用的增量，此时的内存调用是以时间排序，可以从后向前对比
