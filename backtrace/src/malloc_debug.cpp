@@ -13,7 +13,7 @@
 #include <cstdint>
 #include <mutex>
 #include <string>
-#include <unordered_map>
+#include <unordered_set>
 #include <android-base/stringprintf.h>
 
 #include "Config.h"
@@ -25,7 +25,6 @@
 #include "midgard/mali_kbase_ioctl.h"
 #include "msm_ksgl/msm_ksgl.h"
 #include "mtk_camera/camera_mem.h"
-#include "ion/ion_uapi.h"
 
 #include "memory_hook.h"
 
@@ -565,134 +564,10 @@ int debug_posix_memalign(void** memptr, size_t alignment, size_t size) {
 namespace DMA_BUF {
 
 static thread_local bool gpu_ioctl_alloc = false;  // TLS to store a unique flag per thread
-struct PendingIonAllocation {
-    size_t size = 0;
-};
-
-struct DmaFdInfo {
-    size_t size = 0;
-    bool tracked = false;
-};
-
-static std::mutex state_mutex;
-static std::unordered_map<uint64_t, PendingIonAllocation> pending_ion_allocations;
-static std::unordered_map<int, DmaFdInfo> dma_fds;
-
-static uint64_t IonHandleKey(int ion_fd, ion_user_handle_t handle) {
-    return (static_cast<uint64_t>(static_cast<uint32_t>(ion_fd)) << 32) |
-           static_cast<uint32_t>(handle);
-}
-
-static bool IsIonRequest(unsigned int request, unsigned int nr, unsigned int size) {
-    return _IOC_TYPE(request) == ALLOC_HOOK_ION_IOC_MAGIC &&
-           _IOC_NR(request) == nr && _IOC_SIZE(request) == size;
-}
-
-static bool IsIonLegacyAlloc(unsigned int request) {
-    return IsIonRequest(request, 0, sizeof(struct ion_allocation_data));
-}
-
-static bool IsIonNewAlloc(unsigned int request) {
-    return IsIonRequest(request, 0, sizeof(struct ion_new_allocation_data));
-}
-
-static bool IsIonFdRequest(unsigned int request, unsigned int nr) {
-    return IsIonRequest(request, nr, sizeof(struct ion_fd_data));
-}
-
-static bool IsIonFree(unsigned int request) {
-    return IsIonRequest(request, 1, sizeof(struct ion_handle_data));
-}
-
-static void ForgetDmaFd(int fd) {
-    std::lock_guard<std::mutex> guard(state_mutex);
-    dma_fds.erase(fd);
-}
-
-static bool RegisterDmaFd(int fd, size_t size, bool* should_track) {
-    if (fd < 0 || size == 0) {
-        return false;
-    }
-    std::lock_guard<std::mutex> guard(state_mutex);
-    auto [entry, inserted] = dma_fds.emplace(fd, DmaFdInfo{size, false});
-    *should_track = inserted || !entry->second.tracked;
-    entry->second.size = size;
-    return true;
-}
-
-static bool LookupDmaFd(int fd, size_t* size, bool* tracked = nullptr) {
-    std::lock_guard<std::mutex> guard(state_mutex);
-    auto entry = dma_fds.find(fd);
-    if (entry == dma_fds.end()) {
-        return false;
-    }
-    *size = entry->second.size;
-    if (tracked != nullptr) {
-        *tracked = entry->second.tracked;
-    }
-    return true;
-}
-
-static void MarkDmaFdTracked(int fd) {
-    std::lock_guard<std::mutex> guard(state_mutex);
-    auto entry = dma_fds.find(fd);
-    if (entry != dma_fds.end()) {
-        entry->second.tracked = true;
-    }
-}
-
-static bool TakeDmaFd(int fd, size_t* size, bool* tracked) {
-    std::lock_guard<std::mutex> guard(state_mutex);
-    auto entry = dma_fds.find(fd);
-    if (entry == dma_fds.end()) {
-        return false;
-    }
-    *size = entry->second.size;
-    *tracked = entry->second.tracked;
-    dma_fds.erase(entry);
-    return true;
-}
-
-static void RecordIonAllocation(int ion_fd, ion_user_handle_t handle, size_t size) {
-    if (size == 0) {
-        return;
-    }
-    std::lock_guard<std::mutex> guard(state_mutex);
-    pending_ion_allocations[IonHandleKey(ion_fd, handle)] = PendingIonAllocation{size};
-}
-
-static size_t LookupIonAllocation(int ion_fd, ion_user_handle_t handle) {
-    std::lock_guard<std::mutex> guard(state_mutex);
-    auto key = IonHandleKey(ion_fd, handle);
-    auto entry = pending_ion_allocations.find(key);
-    if (entry == pending_ion_allocations.end()) {
-        return 0;
-    }
-    return entry->second.size;
-}
-
-static void DropIonAllocation(int ion_fd, ion_user_handle_t handle) {
-    std::lock_guard<std::mutex> guard(state_mutex);
-    pending_ion_allocations.erase(IonHandleKey(ion_fd, handle));
-}
-
-static void DropIonAllocationsForFd(int ion_fd) {
-    std::lock_guard<std::mutex> guard(state_mutex);
-    const uint32_t fd_key = static_cast<uint32_t>(ion_fd);
-    for (auto entry = pending_ion_allocations.begin();
-         entry != pending_ion_allocations.end();) {
-        if (static_cast<uint32_t>(entry->first >> 32) == fd_key) {
-            entry = pending_ion_allocations.erase(entry);
-        } else {
-            ++entry;
-        }
-    }
-}
+static std::mutex inode_set_mutex;
 
 static bool is_dma_buf(int fd, size_t* size) {
-    if (LookupDmaFd(fd, size)) {
-        return true;
-    }
+    static std::unordered_set<uint64_t> inode_set;
     std::string fdinfo = android::base::StringPrintf("/proc/self/fdinfo/%d", fd);
     auto fp = std::unique_ptr<FILE, decltype(&fclose)>{fopen(fdinfo.c_str(), "re"), fclose};
     if (fp == nullptr) {
@@ -743,7 +618,8 @@ static bool is_dma_buf(int fd, size_t* size) {
         inode = sb.st_ino;
     }
 
-    return *size > 0;
+    std::lock_guard<std::mutex> guard(inode_set_mutex);
+    return inode_set.insert(inode).second;
 }
 
 static bool handle_dma_node(unsigned int request, void* arg, int* fd, size_t* size) {
@@ -762,12 +638,6 @@ static bool handle_dma_node(unsigned int request, void* arg, int* fd, size_t* si
         case DMA_HEAP_IOCTL_ALLOC: {
                 struct dma_heap_allocation_data* heap = (struct dma_heap_allocation_data*)arg;
                 *fd = heap->fd;
-#if defined(__MUSL__)
-                // OHOS fdinfo omits Android's size/exp_name fields and may report
-                // ino: 0. DMA_HEAP_IOCTL_ALLOC itself is authoritative here.
-                *size = static_cast<size_t>(heap->len);
-                return *fd >= 0 && *size > 0;
-#endif
             }
             return is_dma_buf(*fd, size);
         case CAM_MEM_ION_MAP_PA: {
@@ -778,38 +648,6 @@ static bool handle_dma_node(unsigned int request, void* arg, int* fd, size_t* si
         default:
             return false;
     }
-}
-
-static bool HandleIonIoctl(
-        int ion_fd, unsigned int request, void* arg, int* dma_fd, size_t* size) {
-    if (arg == nullptr || _IOC_TYPE(request) != ALLOC_HOOK_ION_IOC_MAGIC) {
-        return false;
-    }
-    if (IsIonLegacyAlloc(request)) {
-        auto* allocation = static_cast<struct ion_allocation_data*>(arg);
-        RecordIonAllocation(ion_fd, allocation->handle, allocation->len);
-        return false;
-    }
-    if (IsIonNewAlloc(request)) {
-        auto* allocation = static_cast<struct ion_new_allocation_data*>(arg);
-        *dma_fd = static_cast<int>(allocation->fd);
-        *size = static_cast<size_t>(allocation->len);
-        return *dma_fd >= 0 && *size > 0;
-    }
-    if (IsIonFdRequest(request, 2) || IsIonFdRequest(request, 4)) {
-        auto* fd_data = static_cast<struct ion_fd_data*>(arg);
-        *dma_fd = fd_data->fd;
-        *size = LookupIonAllocation(ion_fd, fd_data->handle);
-        return *dma_fd >= 0 && *size > 0;
-    }
-    if (IsIonFdRequest(request, 5)) {
-        return false;
-    }
-    if (IsIonFree(request)) {
-        auto* handle_data = static_cast<struct ion_handle_data*>(arg);
-        DropIonAllocation(ion_fd, handle_data->handle);
-    }
-    return false;
 }
 
 }  // namespace DMA_BUF
@@ -859,20 +697,10 @@ int debug_ioctl(int fd, unsigned int request, void* arg) {
 
     int node_fd = -1;
     size_t node_sz = 0;
-    if (ret == 0 && g_debug->TrackPointers()) {
-        bool recognized =
-                DMA_BUF::HandleIonIoctl(fd, request, arg, &node_fd, &node_sz) ||
-                DMA_BUF::handle_dma_node(request, arg, &node_fd, &node_sz);
-        if (recognized) {
-            bool should_track = false;
-            if (DMA_BUF::RegisterDmaFd(node_fd, node_sz, &should_track) &&
-                should_track) {
-                ScopedConcurrentLock lock;
-                void* ptr = reinterpret_cast<void*>(node_fd);
-                g_debug->pointer->Add(ptr, node_sz, DMA);
-                DMA_BUF::MarkDmaFdTracked(node_fd);
-            }
-        }
+    if (g_debug->TrackPointers() && DMA_BUF::handle_dma_node(request, arg, &node_fd, &node_sz)) {
+        ScopedConcurrentLock lock;
+        void* ptr = reinterpret_cast<void*>(node_fd);
+        g_debug->pointer->Add(ptr, node_sz, DMA);
     }
 
     return ret;
@@ -883,20 +711,15 @@ int debug_close(int fd) {
         return (int)syscall(SYS_close, fd);
     }
 
+    ScopedConcurrentLock lock;
     ScopedDisableDebugCalls disable;
 
-    int ret = (int)syscall(SYS_close, fd);
-    if (ret == 0 && g_debug->TrackPointers()) {
-        size_t size = 0;
-        bool tracked = false;
-        if (DMA_BUF::TakeDmaFd(fd, &size, &tracked) && tracked) {
-            ScopedConcurrentLock lock;
-            void* ptr = reinterpret_cast<void*>(fd);
-            g_debug->pointer->Remove(ptr);
-        }
-        DMA_BUF::DropIonAllocationsForFd(fd);
+    if (g_debug->TrackPointers()) {
+        void* ptr = reinterpret_cast<void*>(fd);
+        g_debug->pointer->Remove(ptr);
     }
-    return ret;
+
+    return (int)syscall(SYS_close, fd);
 }
 
 void* debug_mmap64(void* addr, size_t size, int prot, int flags, int fd, off_t offset) {
@@ -925,15 +748,6 @@ void* debug_mmap64(void* addr, size_t size, int prot, int flags, int fd, off_t o
 #if defined(__MUSL__)
     if (g_debug->TrackPointers() && ShouldTrackMmapAllocation(result, prot, flags, fd)) {
         g_debug->pointer->Add(result, size, MMAP);
-    } else if (g_debug->TrackPointers() && result != MAP_FAILED && fd >= 0 &&
-               (flags & MAP_SHARED)) {
-        size_t dma_size = 0;
-        bool tracked = false;
-        if (DMA_BUF::LookupDmaFd(fd, &dma_size, &tracked) && !tracked) {
-            void* ptr = reinterpret_cast<void*>(fd);
-            g_debug->pointer->Add(ptr, dma_size, DMA);
-            DMA_BUF::MarkDmaFdTracked(fd);
-        }
     }
 #else
     if (g_debug->TrackPointers() && DMA_BUF::gpu_ioctl_alloc) {
@@ -962,15 +776,6 @@ void* debug_mmap(void* addr, size_t size, int prot, int flags, int fd, off_t off
 #if defined(__MUSL__)
     if (g_debug->TrackPointers() && ShouldTrackMmapAllocation(result, prot, flags, fd)) {
         g_debug->pointer->Add(result, size, MMAP);
-    } else if (g_debug->TrackPointers() && result != MAP_FAILED && fd >= 0 &&
-               (flags & MAP_SHARED)) {
-        size_t dma_size = 0;
-        bool tracked = false;
-        if (DMA_BUF::LookupDmaFd(fd, &dma_size, &tracked) && !tracked) {
-            void* ptr = reinterpret_cast<void*>(fd);
-            g_debug->pointer->Add(ptr, dma_size, DMA);
-            DMA_BUF::MarkDmaFdTracked(fd);
-        }
     }
 #else
     if (g_debug->TrackPointers()) {
