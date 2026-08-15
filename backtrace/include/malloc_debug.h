@@ -2,10 +2,12 @@
 
 #include <sys/types.h>
 #include <cstddef>
+#include <cstdint>
 
 bool debug_initialize(void* init_space[]);
 void debug_finalize();
 void debug_dump_heap(const char* file_name);
+void debug_record_sample_peak(uint64_t epoch_ms, uint64_t dma_bytes, uint64_t rss_bytes);
 void* debug_malloc(size_t size);
 void debug_free(void* pointer);
 void* debug_realloc(void* pointer, size_t bytes);

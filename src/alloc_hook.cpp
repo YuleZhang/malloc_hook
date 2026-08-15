@@ -180,6 +180,14 @@ int CallRealMunmap(void* addr, size_t size) {
     return static_cast<int>(syscall(SYS_munmap, addr, size));
 }
 
+int CallRealIoctl(int fd, unsigned int request, void* arg) {
+    return static_cast<int>(syscall(SYS_ioctl, fd, request, arg));
+}
+
+int CallRealClose(int fd) {
+    return static_cast<int>(syscall(SYS_close, fd));
+}
+
 #if !defined(mmap64)
 void* CallRealMmap64(void* addr, size_t size, int prot, int flags, int fd, off_t offset) {
     RESOLVE(mmap64);
@@ -289,6 +297,9 @@ public:
 #endif
 
     void checkpoint(const char* file_name) { return debug_dump_heap(file_name); }
+    void record_sample_peak(uint64_t epoch_ms, uint64_t dma_bytes, uint64_t rss_bytes) {
+        debug_record_sample_peak(epoch_ms, dma_bytes, rss_bytes);
+    }
 
     static AllocHook& inst();
 
@@ -423,10 +434,16 @@ int ioctl(int fd, int request, ...) {
     void* arg = va_arg(ap, void*);
     va_end(ap);
 
+    if (in_preinit_phase || InitState::allocHook_setup) {
+        return CallRealIoctl(fd, static_cast<unsigned int>(request), arg);
+    }
     return AllocHook::inst().ioctl(fd, request, arg);
 }
 
 int close(int fd) {
+    if (in_preinit_phase || InitState::allocHook_setup) {
+        return CallRealClose(fd);
+    }
     return AllocHook::inst().close(fd);
 }
 
@@ -445,6 +462,14 @@ void* mmap64(void* addr, size_t size, int prot, int flags, int fd, off_t offset)
 
 void checkpoint(const char* file_name) {
     AllocHook::inst().checkpoint(file_name);
+}
+
+void malloc_hook_record_sample_peak(
+        uint64_t epoch_ms, uint64_t dma_bytes, uint64_t rss_bytes) {
+    if (in_preinit_phase || InitState::allocHook_setup) {
+        return;
+    }
+    AllocHook::inst().record_sample_peak(epoch_ms, dma_bytes, rss_bytes);
 }
 }
 
