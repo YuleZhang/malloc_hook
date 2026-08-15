@@ -6,6 +6,7 @@
 #include <unistd.h>
 #include <sys/stat.h>
 #include <linux/dma-heap.h>
+#include <dlfcn.h>
 
 #include <cstring>
 #include <cstdlib>
@@ -59,6 +60,82 @@ static int g_signal_pipe[2] = {-1, -1};
 static pthread_t g_signal_thread;
 static bool g_signal_thread_started = false;
 static bool g_signal_debug_enabled = false;
+static std::mutex g_sample_peak_mutex;
+static uint64_t g_sample_peak_last_total_bytes = 0;
+
+namespace {
+
+bool SamplePeakEnabled() {
+    const char* value = getenv("MALLOC_HOOK_SAMPLE_PEAK");
+    return value != nullptr && value[0] != '\0' && strcmp(value, "0") != 0;
+}
+
+uint64_t ParseEnvMiB(const char* name, uint64_t default_mib) {
+    const char* value = getenv(name);
+    if (value == nullptr || value[0] == '\0') {
+        return default_mib * 1024ULL * 1024ULL;
+    }
+    char* end = nullptr;
+    unsigned long long parsed = strtoull(value, &end, 10);
+    if (end == value || *end != '\0') {
+        return default_mib * 1024ULL * 1024ULL;
+    }
+    return parsed * 1024ULL * 1024ULL;
+}
+
+uint64_t EpochMilliseconds() {
+    struct timespec now = {};
+    clock_gettime(CLOCK_REALTIME, &now);
+    return static_cast<uint64_t>(now.tv_sec) * 1000ULL +
+           static_cast<uint64_t>(now.tv_nsec) / 1000000ULL;
+}
+
+void CopyProcFile(const char* source, const std::string& destination) {
+    int input = open(source, O_RDONLY | O_CLOEXEC);
+    if (input < 0) {
+        return;
+    }
+    int output = open(
+            destination.c_str(),
+            O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW, 0644);
+    if (output < 0) {
+        close(input);
+        return;
+    }
+    char buffer[16384];
+    while (true) {
+        ssize_t count = read(input, buffer, sizeof(buffer));
+        if (count <= 0) {
+            break;
+        }
+        const char* cursor = buffer;
+        while (count > 0) {
+            ssize_t written = write(output, cursor, static_cast<size_t>(count));
+            if (written <= 0) {
+                count = 0;
+                break;
+            }
+            cursor += written;
+            count -= written;
+        }
+    }
+    close(output);
+    close(input);
+}
+
+void QueryOpenClSnapshot(size_t* live_bytes, const char** last_api) {
+    *live_bytes = 0;
+    *last_api = "<unavailable>";
+    using SnapshotFn = void (*)(size_t*, const char**);
+    auto snapshot = reinterpret_cast<SnapshotFn>(
+            dlsym(RTLD_DEFAULT, "malloc_hook_opencl_get_snapshot"));
+    if (snapshot != nullptr) {
+        snapshot(live_bytes, last_api);
+    }
+}
+
+}  // namespace
+
 static bool SignalDebugEnabled() {
     return g_signal_debug_enabled;
 }
@@ -234,6 +311,97 @@ void debug_finalize() {
 void debug_dump_heap(const char* file_name) {
     ScopedConcurrentLock lock;
     DumpHeapToFileUnlocked(file_name, false);
+}
+
+void debug_record_sample_peak(
+        uint64_t epoch_ms, uint64_t dma_bytes, uint64_t rss_bytes) {
+    if (!SamplePeakEnabled() || g_debug == nullptr) {
+        return;
+    }
+    const uint64_t total_bytes = dma_bytes + rss_bytes;
+    const uint64_t threshold =
+            ParseEnvMiB("MALLOC_HOOK_SAMPLE_PEAK_THRESHOLD_MB", 0);
+    const uint64_t step = ParseEnvMiB("MALLOC_HOOK_SAMPLE_PEAK_STEP_MB", 0);
+    if (total_bytes < threshold) {
+        return;
+    }
+
+    std::lock_guard<std::mutex> capture_guard(g_sample_peak_mutex);
+    if (total_bytes <= g_sample_peak_last_total_bytes ||
+        (g_sample_peak_last_total_bytes != 0 &&
+         total_bytes - g_sample_peak_last_total_bytes < step)) {
+        return;
+    }
+    g_sample_peak_last_total_bytes = total_bytes;
+
+    ScopedConcurrentLock operation_lock;
+    ScopedDisableDebugCalls disable;
+    const char* root = getenv("MALLOC_HOOK_SAMPLE_PEAK_DIR");
+    if (root == nullptr || root[0] == '\0') {
+        root = "/data/local/tmp/peak_snapshots";
+    }
+    mkdir(root, 0755);
+
+    char snapshot_dir[512];
+    snprintf(
+            snapshot_dir, sizeof(snapshot_dir), "%s/%llu_%llu", root,
+            static_cast<unsigned long long>(epoch_ms),
+            static_cast<unsigned long long>(total_bytes));
+    if (mkdir(snapshot_dir, 0755) != 0 && errno != EEXIST) {
+        return;
+    }
+
+    const uint64_t capture_start_ms = EpochMilliseconds();
+    size_t hook_host_bytes = 0;
+    size_t hook_dma_bytes = 0;
+    g_debug->pointer->GetCurrentUsage(&hook_host_bytes, &hook_dma_bytes);
+    size_t opencl_live_bytes = 0;
+    const char* opencl_last_api = nullptr;
+    QueryOpenClSnapshot(&opencl_live_bytes, &opencl_last_api);
+
+    // Capture process residency first.  Formatting the hook ledger can be
+    // comparatively expensive, so doing it before smaps would move the PSS
+    // observation farther away from the HAIO sample that triggered us.
+    CopyProcFile("/proc/self/smaps", std::string(snapshot_dir) + "/smaps");
+    CopyProcFile(
+            "/proc/self/smaps_rollup",
+            std::string(snapshot_dir) + "/smaps_rollup");
+    CopyProcFile("/proc/self/status", std::string(snapshot_dir) + "/status");
+    CopyProcFile(
+            "/proc/ion_process_info",
+            std::string(snapshot_dir) + "/ion_process_info");
+    std::string ledger_path = std::string(snapshot_dir) + "/hook_live_ledger.txt";
+    int ledger_fd = open(
+            ledger_path.c_str(),
+            O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW, 0644);
+    if (ledger_fd >= 0) {
+        g_debug->pointer->DumpLiveToFile(ledger_fd, false);
+        close(ledger_fd);
+    }
+
+    const uint64_t capture_end_ms = EpochMilliseconds();
+    std::string metadata_path = std::string(snapshot_dir) + "/metadata.txt";
+    int metadata_fd = open(
+            metadata_path.c_str(),
+            O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW, 0644);
+    if (metadata_fd >= 0) {
+        dprintf(
+                metadata_fd,
+                "pid=%d\ncsv_epoch_ms=%llu\ndma_bytes=%llu\nrss_bytes=%llu\n"
+                "dma_plus_rss_bytes=%llu\ncapture_start_ms=%llu\n"
+                "capture_end_ms=%llu\nhook_host_live_bytes=%zu\n"
+                "hook_dma_live_bytes=%zu\nopencl_live_requested_bytes=%zu\n"
+                "opencl_last_api=%s\n",
+                getpid(), static_cast<unsigned long long>(epoch_ms),
+                static_cast<unsigned long long>(dma_bytes),
+                static_cast<unsigned long long>(rss_bytes),
+                static_cast<unsigned long long>(total_bytes),
+                static_cast<unsigned long long>(capture_start_ms),
+                static_cast<unsigned long long>(capture_end_ms), hook_host_bytes,
+                hook_dma_bytes, opencl_live_bytes,
+                opencl_last_api != nullptr ? opencl_last_api : "<unknown>");
+        close(metadata_fd);
+    }
 }
 
 static void* InternalMalloc(size_t size) {

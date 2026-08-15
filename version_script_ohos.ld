@@ -10,6 +10,7 @@ global:
     ioctl;
     close;
     checkpoint;
+    malloc_hook_record_sample_peak;
     _Znwm;
     _Znam;
     _ZnwmRKSt9nothrow_t;
