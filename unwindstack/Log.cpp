@@ -18,9 +18,6 @@
 #include <stdint.h>
 #include <stdio.h>
 
-#define LOG_TAG "unwind"
-#include <android-base/log_main.h>
-
 #include <android-base/stringprintf.h>
 
 #include <unwindstack/Log.h>

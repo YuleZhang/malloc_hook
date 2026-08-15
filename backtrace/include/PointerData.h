@@ -95,7 +95,7 @@ public:
     void Remove(const void* ptr);
     void RemoveBacktrace(size_t hash_index);
 
-    void DumpLiveToFile(int fd);
+    void DumpLiveToFile(int fd, bool dump_peak = true);
     void DumpPeakInfo();
 
 private:
@@ -119,6 +119,8 @@ private:
 
     size_t current_used, current_host, current_dma;
     size_t peak_tot, peak_host, peak_dma;
+    size_t next_peak_record_threshold_;
+    size_t peak_record_step_bytes_;
     std::vector<ListInfoType> peak_list;
 
     BIONIC_DISALLOW_COPY_AND_ASSIGN(PointerData);

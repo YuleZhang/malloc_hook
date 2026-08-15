@@ -1,15 +1,30 @@
-#include <bionic/reserved_signals.h>
 #include <cassert>
 #include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <signal.h>
+
+#if defined(__BIONIC__)
+#include <bionic/reserved_signals.h>
+#endif
 
 #include "Config.h"
 
 static constexpr size_t DEFAULT_BACKTRACE_FRAMES = 128;
 static constexpr const char DEFAULT_BACKTRACE_DUMP_PREFIX[] =
         "/data/local/tmp/trace/backtrace_heap";
+static constexpr size_t DEFAULT_OHOS_BACKTRACE_MIN_SIZE_BYTES = 40960;
+
+static int DefaultBacktraceSignal() {
+#if defined(__BIONIC__)
+    return BIONIC_SIGNAL_BACKTRACE;
+#elif defined(__MUSL__)
+    return 46;
+#else
+    return SIGRTMIN + 6;
+#endif
+}
 
 static bool ParseValue(const char* value, size_t* parsed_value) {
     *parsed_value = 0;
@@ -49,6 +64,9 @@ bool Config::Init() {
 
     // 如果开启 BACKTRACE_SPECIFIC_SIZES, 请指定内存申请的最大和最小 size
     options_ |= BACKTRACE_SPECIFIC_SIZES;
+#if defined(__MUSL__)
+    backtrace_min_size_bytes_ = DEFAULT_OHOS_BACKTRACE_MIN_SIZE_BYTES;
+#endif
     ParseValue(getenv("BACKTRACE_MIN_SIZE"), &backtrace_min_size_bytes_);
     backtrace_max_size_bytes_ = SIZE_MAX;
 
@@ -71,7 +89,11 @@ bool Config::Init() {
 
     // 通过信号插入 check point
     options_ |= DUMP_ON_SINGAL;
-    backtrace_dump_signal_ = BIONIC_SIGNAL_BACKTRACE;  // BIONIC_SIGNAL_BACKTRACE: 33
+    backtrace_dump_signal_ = DefaultBacktraceSignal();
+    size_t dump_signal = 0;
+    if (ParseValue(getenv("BACKTRACE_DUMP_SIGNAL"), &dump_signal)) {
+        backtrace_dump_signal_ = static_cast<int>(dump_signal);
+    }
 
     return true;
 }

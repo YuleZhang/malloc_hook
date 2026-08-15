@@ -83,24 +83,24 @@ static const char* default_so_paths[] = {
 #include <android/log.h>
 #define LOGD(fmt, v...)                                                  \
     do {                                                                 \
-        __android_log_print(ANDROID_LOG_DEBUG, "jiigan", fmt "\n", ##v); \
+        __android_log_print(ANDROID_LOG_DEBUG, "opencl_stub", fmt "\n", ##v); \
         printf(fmt "\n", ##v);                                           \
     } while (0)
 #define LOGE(fmt, v...)                                                  \
     do {                                                                 \
-        __android_log_print(ANDROID_LOG_ERROR, "jiigan", fmt "\n", ##v); \
+        __android_log_print(ANDROID_LOG_ERROR, "opencl_stub", fmt "\n", ##v); \
         fprintf(stderr, "err: " fmt "\n", ##v);                          \
     } while (0)
 #elif defined(__OHOS__)
 #include <hilog/log.h>
 #define LOGD(fmt, v...)                                                        \
     do {                                                                       \
-        OH_LOG_Print(LOG_APP, LOG_DEBUG, LOG_DOMAIN, "jiigan", fmt "\n", ##v); \
+        OH_LOG_Print(LOG_APP, LOG_DEBUG, LOG_DOMAIN, "opencl_stub", fmt "\n", ##v); \
         printf(fmt "\n", ##v);                                                 \
     } while (0)
 #define LOGE(fmt, v...)                                                        \
     do {                                                                       \
-        OH_LOG_Print(LOG_APP, LOG_ERROR, LOG_DOMAIN, "jiigan", fmt "\n", ##v); \
+        OH_LOG_Print(LOG_APP, LOG_ERROR, LOG_DOMAIN, "opencl_stub", fmt "\n", ##v); \
         fprintf(stderr, "err: " fmt "\n", ##v);                                \
     } while (0)
 #else

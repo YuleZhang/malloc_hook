@@ -1,4 +1,6 @@
 #include <signal.h>
+#include <fcntl.h>
+#include <errno.h>
 #include <sys/mman.h>
 #include <sys/param.h>  // powerof2 ---> ((((x) - 1) & (x)) == 0)
 #include <unistd.h>
@@ -6,6 +8,7 @@
 #include <linux/dma-heap.h>
 
 #include <cstring>
+#include <cstdlib>
 #include <cstdint>
 #include <mutex>
 #include <string>
@@ -52,7 +55,30 @@ pthread_rwlock_t ScopedConcurrentLock::lock_;
 
 DebugData* g_debug;
 
-static void DumpHeapToFileUnlocked(const char* file_name) {
+static int g_signal_pipe[2] = {-1, -1};
+static pthread_t g_signal_thread;
+static bool g_signal_thread_started = false;
+static bool g_signal_debug_enabled = false;
+static bool SignalDebugEnabled() {
+    return g_signal_debug_enabled;
+}
+
+static void SignalDebugLog(const char* message) {
+    if (SignalDebugEnabled()) {
+        write(STDERR_FILENO, message, strlen(message));
+    }
+}
+
+static void SignalDebugLogInt(const char* prefix, int value) {
+    if (!SignalDebugEnabled()) {
+        return;
+    }
+    char buffer[96];
+    snprintf(buffer, sizeof(buffer), "%s%d\n", prefix, value);
+    write(STDERR_FILENO, buffer, strlen(buffer));
+}
+
+static void DumpHeapToFileUnlocked(const char* file_name, bool dump_peak) {
     ScopedDisableDebugCalls disable;
 
     int fd = open(file_name, O_RDWR | O_CREAT | O_NOFOLLOW | O_TRUNC | O_CLOEXEC, 0644);
@@ -60,17 +86,84 @@ static void DumpHeapToFileUnlocked(const char* file_name) {
         return;
     }
 
-    g_debug->pointer->DumpLiveToFile(fd);
+    g_debug->pointer->DumpLiveToFile(fd, dump_peak);
     close(fd);
 }
 
 static void singal_dump_heap(int) {
-    if ((g_debug->config().options() & BACKTRACE)) {
-        debug_dump_heap(android::base::StringPrintf(
-                                "%s.time.%ld.txt",
-                                g_debug->config().backtrace_dump_prefix(), time(NULL))
-                                .c_str());
+    if (g_signal_pipe[1] != -1) {
+        const char command = 'd';
+        ssize_t bytes = write(g_signal_pipe[1], &command, sizeof(command));
+        if (g_signal_debug_enabled) {
+            if (bytes == sizeof(command)) {
+                static const char message[] = "alloc_hook: signal handler queued dump\n";
+                write(STDERR_FILENO, message, sizeof(message) - 1);
+            } else {
+                static const char message[] = "alloc_hook: signal handler write failed\n";
+                write(STDERR_FILENO, message, sizeof(message) - 1);
+            }
+        }
     }
+}
+
+static void* signal_dump_thread(void*) {
+    sigset_t blocked_signals;
+    sigemptyset(&blocked_signals);
+    sigaddset(&blocked_signals, g_debug->config().backtrace_dump_signal());
+    pthread_sigmask(SIG_BLOCK, &blocked_signals, nullptr);
+
+    while (true) {
+        char command;
+        ssize_t bytes = read(g_signal_pipe[0], &command, sizeof(command));
+        if (bytes <= 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            break;
+        }
+        if (command != 'd' || g_debug == nullptr ||
+            !(g_debug->config().options() & BACKTRACE)) {
+            continue;
+        }
+
+        char file_name[256];
+        snprintf(
+                file_name, sizeof(file_name), "%s.time.%ld.txt",
+                g_debug->config().backtrace_dump_prefix(), time(NULL));
+        SignalDebugLog("alloc_hook: signal thread dumping heap\n");
+        debug_dump_heap(file_name);
+        SignalDebugLog("alloc_hook: signal thread finished heap dump\n");
+    }
+    return nullptr;
+}
+
+static bool StartSignalDumpThread() {
+    g_signal_debug_enabled = getenv("ALLOC_HOOK_DEBUG_SIGNAL") != nullptr;
+    if (g_signal_thread_started) {
+        return true;
+    }
+    if (pipe(g_signal_pipe) != 0) {
+        g_signal_pipe[0] = -1;
+        g_signal_pipe[1] = -1;
+        return false;
+    }
+    fcntl(g_signal_pipe[0], F_SETFD, FD_CLOEXEC);
+    fcntl(g_signal_pipe[1], F_SETFD, FD_CLOEXEC);
+    int flags = fcntl(g_signal_pipe[1], F_GETFL, 0);
+    if (flags != -1) {
+        fcntl(g_signal_pipe[1], F_SETFL, flags | O_NONBLOCK);
+    }
+    if (pthread_create(&g_signal_thread, nullptr, signal_dump_thread, nullptr) != 0) {
+        close(g_signal_pipe[0]);
+        close(g_signal_pipe[1]);
+        g_signal_pipe[0] = -1;
+        g_signal_pipe[1] = -1;
+        return false;
+    }
+    pthread_detach(g_signal_thread);
+    g_signal_thread_started = true;
+    SignalDebugLog("alloc_hook: signal dump thread started\n");
+    return true;
 }
 
 bool debug_initialize(void* init_space[]) {
@@ -88,12 +181,20 @@ bool debug_initialize(void* init_space[]) {
     ScopedConcurrentLock::Init();
 
     if (g_debug->config().options() & DUMP_ON_SINGAL) {
+        if (!StartSignalDumpThread()) {
+            return false;
+        }
         struct sigaction enable_act = {};
         enable_act.sa_handler = singal_dump_heap;
+        sigemptyset(&enable_act.sa_mask);
         enable_act.sa_flags = SA_RESTART | SA_ONSTACK;
+        SignalDebugLogInt(
+                "alloc_hook: installing dump signal ",
+                g_debug->config().backtrace_dump_signal());
         if (sigaction(
                     g_debug->config().backtrace_dump_signal(), &enable_act, nullptr) !=
             0) {
+            SignalDebugLog("alloc_hook: failed to install dump signal\n");
             return false;
         }
     }
@@ -118,7 +219,7 @@ void debug_finalize() {
         DumpHeapToFileUnlocked(android::base::StringPrintf(
                                        "%s.exit.%ld.txt",
                                        g_debug->config().backtrace_dump_prefix(), time(NULL))
-                                       .c_str());
+                                       .c_str(), true);
     }
 
     if (g_debug->TrackPointers()) {
@@ -132,7 +233,7 @@ void debug_finalize() {
 
 void debug_dump_heap(const char* file_name) {
     ScopedConcurrentLock lock;
-    DumpHeapToFileUnlocked(file_name);
+    DumpHeapToFileUnlocked(file_name, false);
 }
 
 static void* InternalMalloc(size_t size) {
@@ -477,6 +578,19 @@ static bool is_dma_buf(int fd, size_t* size) {
     return *size > 0;
 }
 
+static void IonPathLog(const char* tag, unsigned int request, size_t sz) {
+    static bool enabled = getenv("ALLOC_HOOK_DEBUG_ION") != nullptr;
+    if (!enabled) {
+        return;
+    }
+    char buf[160];
+    int n = snprintf(buf, sizeof(buf), "alloc_hook_ion: %s nr=%u size=%zu\n",
+                     tag, _IOC_NR(request), sz);
+    if (n > 0) {
+        write(STDERR_FILENO, buf, static_cast<size_t>(n));
+    }
+}
+
 static bool handle_dma_node(unsigned int request, void* arg, int* fd, size_t* size) {
     // delay parsing the backtrace until mmap64.
     auto set_gpu_ioctl_alloc_and_return_false = []() -> bool {
@@ -493,6 +607,13 @@ static bool handle_dma_node(unsigned int request, void* arg, int* fd, size_t* si
         case DMA_HEAP_IOCTL_ALLOC: {
                 struct dma_heap_allocation_data* heap = (struct dma_heap_allocation_data*)arg;
                 *fd = heap->fd;
+                IonPathLog("DMA_HEAP", request, static_cast<size_t>(heap->len));
+#if defined(__MUSL__)
+                // OHOS fdinfo omits Android's size/exp_name fields and may report
+                // ino: 0. DMA_HEAP_IOCTL_ALLOC itself is authoritative here.
+                *size = static_cast<size_t>(heap->len);
+                return *fd >= 0 && *size > 0;
+#endif
             }
             return is_dma_buf(*fd, size);
         case CAM_MEM_ION_MAP_PA: {
@@ -512,11 +633,13 @@ static bool HandleIonIoctl(
     }
     if (IsIonLegacyAlloc(request)) {
         auto* allocation = static_cast<struct ion_allocation_data*>(arg);
+        IonPathLog("ION_LEGACY_ALLOC", request, allocation->len);
         RecordIonAllocation(ion_fd, allocation->handle, allocation->len);
         return false;
     }
     if (IsIonNewAlloc(request)) {
         auto* allocation = static_cast<struct ion_new_allocation_data*>(arg);
+        IonPathLog("ION_MODERN_ALLOC", request, static_cast<size_t>(allocation->len));
         *dma_fd = static_cast<int>(allocation->fd);
         *size = static_cast<size_t>(allocation->len);
         return *dma_fd >= 0 && *size > 0;
@@ -525,6 +648,7 @@ static bool HandleIonIoctl(
         auto* fd_data = static_cast<struct ion_fd_data*>(arg);
         *dma_fd = fd_data->fd;
         *size = LookupIonAllocation(ion_fd, fd_data->handle);
+        IonPathLog("ION_MAP_SHARE", request, *size);
         return *dma_fd >= 0 && *size > 0;
     }
     if (IsIonFdRequest(request, 5)) {
@@ -538,6 +662,39 @@ static bool HandleIonIoctl(
 }
 
 }  // namespace DMA_BUF
+
+#if defined(__MUSL__)
+static bool ShouldTrackMmapAllocation(void* result, int prot, int flags, int fd) {
+    if (result == MAP_FAILED) {
+        return false;
+    }
+    (void)prot;
+    return fd < 0 && (flags & MAP_ANONYMOUS);
+}
+#endif
+
+static void* CallMmap(void* addr, size_t size, int prot, int flags, int fd, off_t offset) {
+    if (m_sys_mmap != nullptr) {
+        return m_sys_mmap(addr, size, prot, flags, fd, offset);
+    }
+    return reinterpret_cast<void*>(syscall(SYS_mmap, addr, size, prot, flags, fd, offset));
+}
+
+static int CallMunmap(void* addr, size_t size) {
+    if (m_sys_munmap != nullptr) {
+        return m_sys_munmap(addr, size);
+    }
+    return static_cast<int>(syscall(SYS_munmap, addr, size));
+}
+
+#if !defined(mmap64)
+static void* CallMmap64(void* addr, size_t size, int prot, int flags, int fd, off_t offset) {
+    if (m_sys_mmap64 != nullptr) {
+        return m_sys_mmap64(addr, size, prot, flags, fd, offset);
+    }
+    return CallMmap(addr, size, prot, flags, fd, offset);
+}
+#endif
 
 int debug_ioctl(int fd, unsigned int request, void* arg) {
     if (DebugCallsDisabled()) {
@@ -593,7 +750,11 @@ int debug_close(int fd) {
 
 void* debug_mmap64(void* addr, size_t size, int prot, int flags, int fd, off_t offset) {
     if (DebugCallsDisabled()) {
-        return (void*)syscall(SYS_mmap, addr, size, prot, flags, fd, offset);
+#if !defined(mmap64)
+        return CallMmap64(addr, size, prot, flags, fd, offset);
+#else
+        return CallMmap(addr, size, prot, flags, fd, offset);
+#endif
     }
 
     ScopedConcurrentLock lock;
@@ -604,19 +765,38 @@ void* debug_mmap64(void* addr, size_t size, int prot, int flags, int fd, off_t o
         return nullptr;
     }
 
-    void* result = (void*)syscall(SYS_mmap, addr, size, prot, flags, fd, offset);
+#if !defined(mmap64)
+    void* result = CallMmap64(addr, size, prot, flags, fd, offset);
+#else
+    void* result = CallMmap(addr, size, prot, flags, fd, offset);
+#endif
 
+#if defined(__MUSL__)
+    if (g_debug->TrackPointers() && ShouldTrackMmapAllocation(result, prot, flags, fd)) {
+        g_debug->pointer->Add(result, size, MMAP);
+    } else if (g_debug->TrackPointers() && result != MAP_FAILED && fd >= 0 &&
+               (flags & MAP_SHARED)) {
+        size_t dma_size = 0;
+        bool tracked = false;
+        if (DMA_BUF::LookupDmaFd(fd, &dma_size, &tracked) && !tracked) {
+            void* ptr = reinterpret_cast<void*>(fd);
+            g_debug->pointer->Add(ptr, dma_size, DMA);
+            DMA_BUF::MarkDmaFdTracked(fd);
+        }
+    }
+#else
     if (g_debug->TrackPointers() && DMA_BUF::gpu_ioctl_alloc) {
         DMA_BUF::gpu_ioctl_alloc = false;  // Reset the flag immediately after processing
         g_debug->pointer->Add(result, size, DMA);
     }
+#endif
 
     return result;
 }
 
 void* debug_mmap(void* addr, size_t size, int prot, int flags, int fd, off_t offset) {
     if (DebugCallsDisabled()) {
-        return (void*)syscall(SYS_mmap, addr, size, prot, flags, fd, offset);
+        return CallMmap(addr, size, prot, flags, fd, offset);
     }
 
     ScopedConcurrentLock lock;
@@ -627,23 +807,38 @@ void* debug_mmap(void* addr, size_t size, int prot, int flags, int fd, off_t off
         return nullptr;
     }
 
-    void* result = (void*)syscall(SYS_mmap, addr, size, prot, flags, fd, offset);
+    void* result = CallMmap(addr, size, prot, flags, fd, offset);
+#if defined(__MUSL__)
+    if (g_debug->TrackPointers() && ShouldTrackMmapAllocation(result, prot, flags, fd)) {
+        g_debug->pointer->Add(result, size, MMAP);
+    } else if (g_debug->TrackPointers() && result != MAP_FAILED && fd >= 0 &&
+               (flags & MAP_SHARED)) {
+        size_t dma_size = 0;
+        bool tracked = false;
+        if (DMA_BUF::LookupDmaFd(fd, &dma_size, &tracked) && !tracked) {
+            void* ptr = reinterpret_cast<void*>(fd);
+            g_debug->pointer->Add(ptr, dma_size, DMA);
+            DMA_BUF::MarkDmaFdTracked(fd);
+        }
+    }
+#else
     if (g_debug->TrackPointers()) {
         size_t node_sz = 0;
-        if (fd < 0)
+        if (fd < 0) {
             g_debug->pointer->Add(result, size, MMAP);
-        else if (DMA_BUF::is_dma_buf(fd, &node_sz)) {
+        } else if (DMA_BUF::is_dma_buf(fd, &node_sz)) {
             void* ptr = reinterpret_cast<void*>(fd);
             g_debug->pointer->Add(ptr, node_sz, DMA);
         }
     }
+#endif
 
     return result;
 }
 
 int debug_munmap(void* addr, size_t size) {
     if (DebugCallsDisabled()) {
-        return (int)syscall(SYS_munmap, addr, size);
+        return CallMunmap(addr, size);
     }
 
     ScopedConcurrentLock lock;
@@ -653,5 +848,5 @@ int debug_munmap(void* addr, size_t size) {
         g_debug->pointer->Remove(addr);
     }
 
-    return (int)syscall(SYS_munmap, addr, size);
+    return CallMunmap(addr, size);
 }
