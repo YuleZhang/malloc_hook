@@ -1,5 +1,6 @@
 #include <cassert>
 #include <cerrno>
+#include <climits>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -22,8 +23,24 @@ static int DefaultBacktraceSignal() {
 #elif defined(__MUSL__)
     return 46;
 #else
-    return SIGRTMIN + 6;
+    return SIGUSR2;
 #endif
+}
+
+static bool DefaultBacktraceDumpOnExit() {
+#if defined(__BIONIC__)
+    return false;
+#else
+    return true;
+#endif
+}
+
+static const char* ResolveBacktraceDumpPrefix() {
+    const char* dump_prefix = getenv("BACKTRACE_DUMP_PREFIX");
+    if (dump_prefix != nullptr && dump_prefix[0] != '\0') {
+        return dump_prefix;
+    }
+    return DEFAULT_BACKTRACE_DUMP_PREFIX;
 }
 
 static bool ParseValue(const char* value, size_t* parsed_value) {
@@ -58,9 +75,14 @@ static bool ParseValue(const char* value, size_t* parsed_value) {
 
 bool Config::Init() {
     // 退出时输出 trace
-    backtrace_dump_on_exit_ = false;
+    backtrace_dump_on_exit_ = DefaultBacktraceDumpOnExit();
     backtrace_frames_ = DEFAULT_BACKTRACE_FRAMES;
-    backtrace_dump_prefix_ = DEFAULT_BACKTRACE_DUMP_PREFIX;
+    backtrace_dump_prefix_ = ResolveBacktraceDumpPrefix();
+
+    size_t dump_on_exit_env = 0;
+    if (ParseValue(getenv("BACKTRACE_DUMP_ON_EXIT"), &dump_on_exit_env)) {
+        backtrace_dump_on_exit_ = dump_on_exit_env != 0;
+    }
 
     // 如果开启 BACKTRACE_SPECIFIC_SIZES, 请指定内存申请的最大和最小 size
     options_ |= BACKTRACE_SPECIFIC_SIZES;
@@ -91,7 +113,8 @@ bool Config::Init() {
     options_ |= DUMP_ON_SINGAL;
     backtrace_dump_signal_ = DefaultBacktraceSignal();
     size_t dump_signal = 0;
-    if (ParseValue(getenv("BACKTRACE_DUMP_SIGNAL"), &dump_signal)) {
+    if (ParseValue(getenv("BACKTRACE_DUMP_SIGNAL"), &dump_signal) &&
+        dump_signal <= static_cast<size_t>(INT_MAX)) {
         backtrace_dump_signal_ = static_cast<int>(dump_signal);
     }
 

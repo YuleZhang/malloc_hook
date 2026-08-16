@@ -5,7 +5,7 @@
 #include <sys/param.h>  // powerof2 ---> ((((x) - 1) & (x)) == 0)
 #include <unistd.h>
 #include <sys/stat.h>
-#include <linux/dma-heap.h>
+#include "linux_dma_heap_compat.h"
 
 #include <cstring>
 #include <cstdlib>

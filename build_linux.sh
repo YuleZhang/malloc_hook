@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+set -euo pipefail
+set -x
+
+export ARM_GNU_TOOLCHAIN_PATH="${ARM_GNU_TOOLCHAIN_PATH:-}"
+if [ -z "${ARM_GNU_TOOLCHAIN_PATH}" ]; then
+    echo "set ARM_GNU_TOOLCHAIN_PATH to your aarch64 GNU toolchain root (e.g. .../gcc-arm-<ver>-x86_64-aarch64-none-linux-gnu)" >&2
+    exit 1
+fi
+
+TARGET_TRIPLE="aarch64-none-linux-gnu"
+SRC_DIR=$(readlink -f "$(dirname "$0")")
+BUILD_DIR="${SRC_DIR}/build_linux"
+INSTALL_PREFIX="${SRC_DIR}"
+
+CC="${ARM_GNU_TOOLCHAIN_PATH}/bin/${TARGET_TRIPLE}-gcc"
+CXX="${ARM_GNU_TOOLCHAIN_PATH}/bin/${TARGET_TRIPLE}-g++"
+AR="${ARM_GNU_TOOLCHAIN_PATH}/bin/${TARGET_TRIPLE}-ar"
+RANLIB="${ARM_GNU_TOOLCHAIN_PATH}/bin/${TARGET_TRIPLE}-ranlib"
+LINUX_AARCH64_COMPAT_FLAGS="-march=armv8-a -mno-outline-atomics -mbranch-protection=none"
+
+if [ ! -x "${CC}" ] || [ ! -x "${CXX}" ]; then
+    echo "ARM_GNU_TOOLCHAIN_PATH is invalid: ${ARM_GNU_TOOLCHAIN_PATH}"
+    exit 1
+fi
+
+SYSROOT="$("${CC}" -print-sysroot)"
+if [ -z "${SYSROOT}" ] || [ ! -d "${SYSROOT}" ]; then
+    echo "failed to resolve sysroot from ${CC}"
+    exit 1
+fi
+
+echo "use ${ARM_GNU_TOOLCHAIN_PATH} to build for linux (${TARGET_TRIPLE})"
+
+cd "${SRC_DIR}"
+rm -rf "${BUILD_DIR}"
+rm -rf out
+mkdir -p "${BUILD_DIR}" out/lib out/bin
+
+cmake_args=(
+    -DCMAKE_INSTALL_PREFIX="${INSTALL_PREFIX}"
+    -DCMAKE_BUILD_TYPE=Release
+    -DCMAKE_SYSTEM_NAME=Linux
+    -DCMAKE_SYSTEM_PROCESSOR=aarch64
+    -DCMAKE_C_COMPILER="${CC}"
+    -DCMAKE_CXX_COMPILER="${CXX}"
+    -DCMAKE_AR="${AR}"
+    -DCMAKE_RANLIB="${RANLIB}"
+    -DCMAKE_SYSROOT="${SYSROOT}"
+    -DCMAKE_C_FLAGS="${LINUX_AARCH64_COMPAT_FLAGS}"
+    -DCMAKE_CXX_FLAGS="${LINUX_AARCH64_COMPAT_FLAGS}"
+    -DCMAKE_ASM_FLAGS="${LINUX_AARCH64_COMPAT_FLAGS}"
+    -DALLOC_HOOK_BUILD_TESTS=OFF
+    -G
+    Ninja
+)
+
+cmake -S "${SRC_DIR}" -B "${BUILD_DIR}" "${cmake_args[@]}" "$@"
+cmake --build "${BUILD_DIR}" --target install -v
+
+echo "build finished"
+echo "library output: ${SRC_DIR}/out/lib/liballoc_hook.so"

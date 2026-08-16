@@ -18,6 +18,7 @@
 #define _LIBUNWINDSTACK_DWARF_MEMORY_H
 
 #include <stddef.h>
+#include <cstddef>
 #include <stdint.h>
 
 namespace unwindstack {

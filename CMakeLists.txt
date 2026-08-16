@@ -1,5 +1,4 @@
 cmake_minimum_required(VERSION 3.23)
-
 project(malloc_hook LANGUAGES C CXX ASM)
 
 option(MALLOC_HOOK_BUILD_TESTS "Build malloc_hook test binaries" ON)
@@ -17,6 +16,15 @@ endif()
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -g -O3 -fPIC")
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND
+   CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|AARCH64)$")
+  # Some Linux arm64 targets in the field do not support BTI/LSE instructions
+  # emitted by outlined atomics helpers, which leads to SIGILL during preload.
+  add_compile_options(-march=armv8-a -mno-outline-atomics -mbranch-protection=none)
+endif()
+
 if(ANDROID OR OHOS)
   # now old ANDROID have libc++_shared.so, new ANDROID have libc++.so so we use
   # libc++_static by default, by set ANDROID_STL=c++_static only take effect on old NDK,
@@ -30,7 +38,6 @@ endif()
 # Check if using Clang
 if (CMAKE_CXX_COMPILER_ID MATCHES "Clang")
     set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -Wl,--version-script=${VERSION_SCRIPT}")
-    set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 endif()
 
 add_subdirectory(unwindstack/cmake)
@@ -44,13 +51,17 @@ target_link_libraries(alloc_hook PRIVATE helper)
 install(TARGETS alloc_hook DESTINATION ${CMAKE_INSTALL_PREFIX}/out/lib)
 
 if (MALLOC_HOOK_BUILD_TESTS)
-  if (TARGET gtest)
-    message(STATUS "gtest is already defined")
+  if(ANDROID OR OHOS)
+    if (TARGET gtest)
+      message(STATUS "gtest is already defined")
+    else()
+      set(GOOGLETEST_VERSION 1.15.2)
+      add_subdirectory(${PROJECT_SOURCE_DIR}/third_party/googletest/googletest)
+      add_subdirectory(${PROJECT_SOURCE_DIR}/third_party/opencl_stub)
+      add_subdirectory(test)
+    endif()
   else()
-    set(GOOGLETEST_VERSION 1.15.2)
-    add_subdirectory(${PROJECT_SOURCE_DIR}/third_party/googletest/googletest)
-    add_subdirectory(${PROJECT_SOURCE_DIR}/third_party/opencl_stub)
-    add_subdirectory(test)
+    message(STATUS "tests are ANDROID/OHOS-only; skipping on this platform")
   endif()
 endif()
 
