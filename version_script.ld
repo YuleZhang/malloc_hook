@@ -1,3 +1,6 @@
+/* Android and generic Linux currently share this documented C hook ABI.
+ * Platform selection remains explicit in CMake so either policy can diverge
+ * without changing capture or bookkeeping code. */
 {
 global:
     malloc;
@@ -9,6 +12,7 @@ global:
     posix_memalign;
     mmap;
     munmap;
+    mremap;
     ioctl;
     close;
     mmap64;

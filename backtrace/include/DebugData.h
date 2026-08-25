@@ -1,7 +1,5 @@
 #pragma once
 
-#include <bionic/macros.h>
-
 #include "Config.h"
 #include "PointerData.h"
 
@@ -21,7 +19,8 @@ public:
 private:
     Config config_;
 
-    BIONIC_DISALLOW_COPY_AND_ASSIGN(DebugData);
+    DebugData(const DebugData&) = delete;
+    DebugData& operator=(const DebugData&) = delete;
 };
 
 extern DebugData* g_debug;

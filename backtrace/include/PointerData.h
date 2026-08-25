@@ -2,31 +2,38 @@
 
 #include <fcntl.h>
 #include <stdint.h>
+#include <sys/time.h>
 
 #include <cstdint>
 #include <cstdio>
+#include <array>
+#include <atomic>
 #include <cstdlib>
 #include <memory>
 #include <mutex>
+#include <functional>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
-#include <bionic/macros.h>
-#include <unwindstack/Unwinder.h>
-
 #include "Config.h"
+#include "AsyncStackPipeline.h"
+#include "Sampling.h"
+#include "UnwindBacktrace.h"
 
 enum MemType { HOST, MMAP, DMA };
 
 struct FrameKeyType {
-    size_t num_frames;
-    uintptr_t* frames;
+    uint16_t frame_count = 0;
+    uint64_t module_generation = 0;
+    std::array<uintptr_t, kMaxAsyncRawFrames> pcs{};
 
     bool operator==(const FrameKeyType& comp) const {
-        if (num_frames != comp.num_frames)
+        if (frame_count != comp.frame_count ||
+            module_generation != comp.module_generation)
             return false;
-        for (size_t i = 0; i < num_frames; i++) {
-            if (frames[i] != comp.frames[i]) {
+        for (size_t i = 0; i < frame_count; i++) {
+            if (pcs[i] != comp.pcs[i]) {
                 return false;
             }
         }
@@ -39,11 +46,15 @@ namespace std {
 template <>
 struct hash<FrameKeyType> {
     std::size_t operator()(const FrameKeyType& key) const {
-        std::size_t cur_hash = key.frames[0];
+        if (key.frame_count == 0) {
+            return static_cast<std::size_t>(key.module_generation);
+        }
+        std::size_t cur_hash =
+                key.pcs[0] ^ static_cast<std::size_t>(key.module_generation);
         // Limit the number of frames to speed up hashing.
-        size_t max_frames = (key.num_frames > 5) ? 5 : key.num_frames;
+        size_t max_frames = (key.frame_count > 5) ? 5 : key.frame_count;
         for (size_t i = 1; i < max_frames; i++) {
-            cur_hash ^= key.frames[i];
+            cur_hash ^= key.pcs[i];
         }
         return cur_hash;
     }
@@ -53,6 +64,11 @@ struct hash<FrameKeyType> {
 struct FrameInfoType {
     size_t references = 0;
     std::vector<uintptr_t> frames;
+    uint64_t module_generation = 0;
+    StackCaptureState capture_state = StackCaptureState::Empty;
+    uint8_t terminal_error = 0;
+    AsyncStackId async_stack_id = 0;
+    StackResolutionState resolution_state = StackResolutionState::Pending;
 };
 
 // 新增 timeval 比较函数
@@ -78,7 +94,10 @@ struct ListInfoType {
     size_t size;
     MemType mem_type;
     FrameInfoType* frame_info;
-    std::shared_ptr<std::vector<unwindstack::FrameData>> backtrace_info;
+    std::shared_ptr<std::vector<SymbolizedFrame>> backtrace_info;
+    StackCaptureState capture_state = StackCaptureState::Empty;
+    uint8_t terminal_error = 0;
+    StackResolutionState resolution_state = StackResolutionState::Pending;
     timeval alloc_time;
 };
 using Pred = std::function<bool(const ListInfoType&, const ListInfoType&)>;
@@ -86,17 +105,28 @@ using Pred = std::function<bool(const ListInfoType&, const ListInfoType&)>;
 class PointerData {
 public:
     PointerData() = default;
-    virtual ~PointerData() = default;
+    virtual ~PointerData();
 
     bool Initialize(const Config& config);
 
-    void Add(const void* ptr, size_t size, MemType type = HOST);
+    bool ShouldTrackAllocation(size_t size, MemType type, size_t* tracked_size);
+    bool MightContain(const void* ptr) const;
+    void Add(
+            const void* ptr, size_t requested_size, size_t tracked_size,
+            MemType type = HOST);
+    // Update a tracked mapping after a successful mremap without capturing a
+    // second allocation stack. Untracked mappings remain untracked.
+    void Remap(const void* old_ptr, const void* new_ptr, size_t new_size);
     size_t AddBacktrace(size_t num_frames, size_t size_bytes);
     void Remove(const void* ptr);
     void RemoveBacktrace(size_t hash_index);
 
     void DumpLiveToFile(int fd, bool dump_peak = true);
     void DumpPeakInfo();
+    void FlushAsync();
+    void BeginFinalization();
+    void CompleteAsyncStack(const StackResult& result);
+    AsyncStackStats AsyncStats() const;
 
 private:
     inline uintptr_t ManglePointer(uintptr_t pointer) { return pointer ^ UINTPTR_MAX; }
@@ -113,8 +143,9 @@ private:
     std::mutex frame_mutex_;
     std::unordered_map<FrameKeyType, size_t> key_to_index_;
     std::unordered_map<size_t, FrameInfoType> frames_;
-    std::unordered_map<size_t, std::shared_ptr<std::vector<unwindstack::FrameData>>>
-            backtraces_info_;
+    std::unordered_map<size_t, std::shared_ptr<std::vector<SymbolizedFrame>>> backtraces_info_;
+    std::unordered_map<AsyncStackId, size_t> async_stack_to_index_;
+    std::unique_ptr<AsyncStackPipeline> async_pipeline_;
     size_t cur_hash_index_;
 
     size_t current_used, current_host, current_dma;
@@ -122,6 +153,9 @@ private:
     size_t next_peak_record_threshold_;
     size_t peak_record_step_bytes_;
     std::vector<ListInfoType> peak_list;
+    static constexpr size_t kPointerFilterWords = 1 << 13;
+    std::array<std::atomic<uint64_t>, kPointerFilterWords> pointer_filter_{};
 
-    BIONIC_DISALLOW_COPY_AND_ASSIGN(PointerData);
+    PointerData(const PointerData&) = delete;
+    PointerData& operator=(const PointerData&) = delete;
 };

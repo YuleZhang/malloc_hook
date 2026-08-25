@@ -1,10 +1,16 @@
 #include <sys/mman.h>
 #include <sys/syscall.h>
+#include <sys/ioctl.h>
+#if defined(MALLOC_HOOK_TARGET_OS_OHOS)
+#include <asm-generic/ioctl.h>
+#endif
 #include <unistd.h>
 #include <algorithm>
 #include <cstdarg>
 #include <cstddef>
 #include <cstdint>
+#include <climits>
+#include <cerrno>
 #include <cstring>
 #include <new>
 
@@ -38,8 +44,16 @@ namespace {
 
 volatile bool g_resolving_symbols = false;
 
+#if defined(MALLOC_HOOK_TARGET_OS_ANDROID) || defined(MALLOC_HOOK_TARGET_OS_OHOS)
+using HookIoctlRequest = int;
+#else
+using HookIoctlRequest = unsigned long;
+#endif
+
 struct alignas(std::max_align_t) BootstrapHeader {
+    void* map_base;
     size_t map_size;
+    size_t requested_size;
     uint64_t magic;
     BootstrapHeader* next;
 };
@@ -47,9 +61,24 @@ struct alignas(std::max_align_t) BootstrapHeader {
 constexpr uint64_t kBootstrapMagic = 0x6d616c6c6f635f68ULL;
 BootstrapHeader* g_bootstrap_list = nullptr;
 
+bool IsPowerOfTwo(size_t value) {
+    return value != 0 && (value & (value - 1)) == 0;
+}
+
+bool CheckedAdd(size_t lhs, size_t rhs, size_t* result) {
+    if (rhs > SIZE_MAX - lhs) {
+        return false;
+    }
+    *result = lhs + rhs;
+    return true;
+}
+
 size_t PageAlign(size_t size) {
     long page_size = sysconf(_SC_PAGESIZE);
     size_t alignment = page_size > 0 ? static_cast<size_t>(page_size) : 4096;
+    if (!IsPowerOfTwo(alignment) || size > SIZE_MAX - (alignment - 1)) {
+        return 0;
+    }
     return (size + alignment - 1) & ~(alignment - 1);
 }
 
@@ -65,20 +94,48 @@ bool IsBootstrapPointer(const void* ptr) {
     return false;
 }
 
-void* BootstrapMalloc(size_t size) {
-    size_t map_size = PageAlign(sizeof(BootstrapHeader) + size);
+void* BootstrapAlignedMalloc(size_t alignment, size_t size) {
+    if (!IsPowerOfTwo(alignment) || alignment < alignof(void*)) {
+        errno = EINVAL;
+        return nullptr;
+    }
+    const size_t effective_alignment =
+            std::max(alignment, alignof(BootstrapHeader));
+    size_t payload = 0;
+    size_t total = 0;
+    if (!CheckedAdd(sizeof(BootstrapHeader), size, &payload) ||
+        !CheckedAdd(payload, effective_alignment - 1, &total)) {
+        errno = ENOMEM;
+        return nullptr;
+    }
+    size_t map_size = PageAlign(total);
+    if (map_size == 0) {
+        errno = ENOMEM;
+        return nullptr;
+    }
     void* map = reinterpret_cast<void*>(syscall(
             SYS_mmap, nullptr, map_size, PROT_READ | PROT_WRITE,
             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
     if (map == MAP_FAILED) {
         return nullptr;
     }
-    auto* header = reinterpret_cast<BootstrapHeader*>(map);
+    const uintptr_t first_payload =
+            reinterpret_cast<uintptr_t>(map) + sizeof(BootstrapHeader);
+    const uintptr_t aligned_payload =
+            (first_payload + effective_alignment - 1) &
+            ~(effective_alignment - 1);
+    auto* header = reinterpret_cast<BootstrapHeader*>(aligned_payload) - 1;
+    header->map_base = map;
     header->map_size = map_size;
+    header->requested_size = size;
     header->magic = kBootstrapMagic;
     header->next = g_bootstrap_list;
     g_bootstrap_list = header;
     return header + 1;
+}
+
+void* BootstrapMalloc(size_t size) {
+    return BootstrapAlignedMalloc(alignof(std::max_align_t), size);
 }
 
 void BootstrapFree(void* ptr) {
@@ -95,7 +152,7 @@ void BootstrapFree(void* ptr) {
     }
     size_t map_size = header->map_size;
     header->magic = 0;
-    syscall(SYS_munmap, header, map_size);
+    syscall(SYS_munmap, header->map_base, map_size);
 }
 
 void* BootstrapCalloc(size_t nmemb, size_t size) {
@@ -119,8 +176,10 @@ void* BootstrapRealloc(void* ptr, size_t size) {
         BootstrapFree(ptr);
         return nullptr;
     }
-    auto* header = reinterpret_cast<BootstrapHeader*>(ptr) - 1;
-    size_t old_size = IsBootstrapPointer(ptr) ? header->map_size - sizeof(BootstrapHeader) : 0;
+    auto* header = IsBootstrapPointer(ptr)
+            ? reinterpret_cast<BootstrapHeader*>(ptr) - 1
+            : nullptr;
+    size_t old_size = header == nullptr ? 0 : header->requested_size;
     void* new_ptr = BootstrapMalloc(size);
     if (new_ptr != nullptr && old_size != 0) {
         memcpy(new_ptr, ptr, std::min(old_size, size));
@@ -136,7 +195,7 @@ void* ResolveLibcSymbol(const char* name) {
 
     g_resolving_symbols = true;
     void* addr = dlsym(RTLD_NEXT, name);
-#if !defined(__MUSL__)
+#if !defined(MALLOC_HOOK_TARGET_OS_OHOS)
     if (addr == nullptr) {
         void* handle = dlopen("libc.so", RTLD_LAZY);
         if (handle) {
@@ -157,13 +216,27 @@ void ResolveAllLibcAllocationSymbols() {
     RESOLVE(memalign);
     RESOLVE(aligned_alloc);
     RESOLVE(posix_memalign);
+#if MALLOC_HOOK_EXPORT_MMAP_HOOK
     RESOLVE(mmap);
     RESOLVE(munmap);
+    RESOLVE(mremap);
 #if !defined(mmap64)
     RESOLVE(mmap64);
 #endif
+#endif
 }
 
+#if MALLOC_HOOK_EXPORT_RESOURCE_HOOKS
+int CallRealIoctl(int fd, unsigned long request, void* arg) {
+    return static_cast<int>(syscall(SYS_ioctl, fd, request, arg));
+}
+
+int CallRealClose(int fd) {
+    return static_cast<int>(syscall(SYS_close, fd));
+}
+#endif
+
+#if MALLOC_HOOK_EXPORT_MMAP_HOOK
 void* CallRealMmap(void* addr, size_t size, int prot, int flags, int fd, off_t offset) {
     RESOLVE(mmap);
     if (m_sys_mmap != nullptr) {
@@ -180,6 +253,28 @@ int CallRealMunmap(void* addr, size_t size) {
     return static_cast<int>(syscall(SYS_munmap, addr, size));
 }
 
+void* CallRealMremap(
+        void* old_addr, size_t old_size, size_t new_size, int flags, void* new_addr) {
+    RESOLVE(mremap);
+    if (m_sys_mremap != nullptr) {
+        if ((flags & MREMAP_FIXED) != 0) {
+            return m_sys_mremap(old_addr, old_size, new_size, flags, new_addr);
+        }
+        return m_sys_mremap(old_addr, old_size, new_size, flags);
+    }
+#if defined(SYS_mremap)
+    if ((flags & MREMAP_FIXED) != 0) {
+        return reinterpret_cast<void*>(
+                syscall(SYS_mremap, old_addr, old_size, new_size, flags, new_addr));
+    }
+    return reinterpret_cast<void*>(
+            syscall(SYS_mremap, old_addr, old_size, new_size, flags));
+#else
+    errno = ENOSYS;
+    return MAP_FAILED;
+#endif
+}
+
 #if !defined(mmap64)
 void* CallRealMmap64(void* addr, size_t size, int prot, int flags, int fd, off_t offset) {
     RESOLVE(mmap64);
@@ -188,6 +283,7 @@ void* CallRealMmap64(void* addr, size_t size, int prot, int flags, int fd, off_t
     }
     return CallRealMmap(addr, size, prot, flags, fd, offset);
 }
+#endif
 #endif
 
 struct AddressRange {
@@ -258,6 +354,24 @@ class AllocHook {
 public:
     AllocHook() {
         InitState state;
+#if defined(MALLOC_HOOK_TARGET_OS_ANDROID)
+        // Disable Bionic heap tagging process-wide: tagged pointers are
+        // incompatible with this interposer's raw-pointer bookkeeping.
+        // This trades allocator memory-tag diagnostics for hook correctness.
+        // Resolve mallopt at runtime: the symbol is absent from old Bionic
+        // releases and its declaration is gated by the compile-time API level.
+        using MalloptFn = int (*)(int, int);
+        constexpr int kBionicSetHeapTaggingLevel = -204;
+        constexpr int kHeapTaggingLevelNone = 0;
+        auto mallopt = reinterpret_cast<MalloptFn>(ResolveLibcSymbol("mallopt"));
+        if (mallopt != nullptr) {
+            if (mallopt(kBionicSetHeapTaggingLevel, kHeapTaggingLevelNone) == 0) {
+                static constexpr char kMessage[] =
+                        "alloc_hook: Bionic heap-tagging disable failed\n";
+                syscall(SYS_write, STDERR_FILENO, kMessage, sizeof(kMessage) - 1);
+            }
+        }
+#endif
         ResolveAllLibcAllocationSymbols();
         void* ptr[2] = {&Db_storage, &Pd_storage};
         debug_initialize(ptr);
@@ -280,7 +394,13 @@ public:
         return debug_mmap(addr, size, prot, flags, fd, offset);
     }
     int munmap(void* addr, size_t size) { return debug_munmap(addr, size); }
-    int ioctl(int fd, int request, void* arg) { return debug_ioctl(fd, request, arg); }
+    void* mremap(void* old_addr, size_t old_size, size_t new_size,
+                 int flags, void* new_addr) {
+        return debug_mremap(old_addr, old_size, new_size, flags, new_addr);
+    }
+    int ioctl(int fd, unsigned long request, void* arg) {
+        return debug_ioctl(fd, request, arg);
+    }
     int close(int fd) { return debug_close(fd); }
 #if !defined(mmap64)
     void* mmap64(void* addr, size_t size, int prot, int flags, int fd, off_t offset) {
@@ -311,6 +431,20 @@ __attribute__((constructor(201))) void mark_init_done() {
     in_preinit_phase = false;
 }
 
+// Hook-source capability contract:
+// - Current creation sources are the malloc family, C++ new/new[], successful
+//   anonymous mmap/mmap64, and selected successful resource-allocating ioctl
+//   calls. Successful mremap preserves the original stack identity while
+//   updating the tracked mapping identity and size.
+// - Release paths reuse stored identity and never capture a new allocation stack.
+// - mmap/ioctl interposition covers exported libc calls only; direct syscalls are
+//   an explicit limitation. Platform export policy decides which sources are
+//   enabled without changing the shared capture contract.
+// - ARCH-01 source ownership is local to this adapter: malloc family and C++
+//   new creation enter the shared tracker, anonymous mmap is success-only when
+//   exported, and resource ioctl records are success/filter gated. Direct
+//   mremap syscalls remain outside the interposition boundary, as do
+//   managed-runtime/other-thread captures.
 extern "C" {
 // 程序初始化会间接调用 malloc 和 free
 void* malloc(size_t size) {
@@ -367,7 +501,12 @@ void* aligned_alloc(size_t alignment, size_t size) {
     RESOLVE(aligned_alloc);
     if (InitState::allocHook_setup || g_resolving_symbols || m_sys_aligned_alloc == nullptr) {
         if (m_sys_aligned_alloc == nullptr) {
-            return BootstrapMalloc(size);
+            if (!IsPowerOfTwo(alignment) || alignment < alignof(void*) ||
+                size % alignment != 0) {
+                errno = EINVAL;
+                return nullptr;
+            }
+            return BootstrapAlignedMalloc(alignment, size);
         }
         return m_sys_aligned_alloc(alignment, size);
     }
@@ -378,7 +517,7 @@ void* memalign(size_t alignment, size_t bytes)  {
     RESOLVE(memalign);
     if (InitState::allocHook_setup || g_resolving_symbols || m_sys_memalign == nullptr) {
         if (m_sys_memalign == nullptr) {
-            return BootstrapMalloc(bytes);
+            return BootstrapAlignedMalloc(alignment, bytes);
         }
         return m_sys_memalign(alignment, bytes);
     }
@@ -391,7 +530,11 @@ int posix_memalign(void** ptr, size_t alignment, size_t size) {
     RESOLVE(posix_memalign);
     if (InitState::allocHook_setup || g_resolving_symbols || m_sys_posix_memalign == nullptr) {
         if (m_sys_posix_memalign == nullptr) {
-            *ptr = BootstrapMalloc(size);
+            if (ptr == nullptr || !IsPowerOfTwo(alignment) ||
+                alignment < sizeof(void*) || alignment % sizeof(void*) != 0) {
+                return EINVAL;
+            }
+            *ptr = BootstrapAlignedMalloc(alignment, size);
             return (*ptr != nullptr) ? 0 : ENOMEM;
         }
         return m_sys_posix_memalign(ptr, alignment, size);
@@ -399,6 +542,7 @@ int posix_memalign(void** ptr, size_t alignment, size_t size) {
     return AllocHook::inst().posix_memalign(ptr, alignment, size);
 }
 
+#if MALLOC_HOOK_EXPORT_MMAP_HOOK
 void* mmap(void* addr, size_t size, int prot, int flags, int fd, off_t offset) {
     if (in_preinit_phase || InitState::allocHook_setup) {
         return CallRealMmap(addr, size, prot, flags, fd, offset);
@@ -417,20 +561,58 @@ int munmap(void* addr, size_t size) {
     return AllocHook::inst().munmap(addr, size);
 }
 
-int ioctl(int fd, int request, ...) {
-    va_list ap;
-    va_start(ap, request);
-    void* arg = va_arg(ap, void*);
-    va_end(ap);
+void* mremap(
+        void* old_addr, size_t old_size, size_t new_size, int flags, ...) {
+    void* new_addr = nullptr;
+    if ((flags & MREMAP_FIXED) != 0) {
+        va_list ap;
+        va_start(ap, flags);
+        new_addr = va_arg(ap, void*);
+        va_end(ap);
+    }
+    if (in_preinit_phase || InitState::allocHook_setup) {
+        return CallRealMremap(old_addr, old_size, new_size, flags, new_addr);
+    }
+    return AllocHook::inst().mremap(old_addr, old_size, new_size, flags, new_addr);
+}
+#endif
 
-    return AllocHook::inst().ioctl(fd, request, arg);
+#if MALLOC_HOOK_EXPORT_RESOURCE_HOOKS
+int ioctl(int fd, HookIoctlRequest request, ...) {
+    const unsigned long request_value = static_cast<unsigned long>(request);
+    const bool has_argument =
+            (request_value > UINT_MAX) ||
+            _IOC_SIZE(static_cast<unsigned int>(request_value)) != 0;
+    if (in_preinit_phase || InitState::allocHook_setup) {
+        void* arg = nullptr;
+        if (has_argument) {
+            va_list ap;
+            va_start(ap, request);
+            arg = va_arg(ap, void*);
+            va_end(ap);
+        }
+        return CallRealIoctl(fd, request_value, arg);
+    }
+    void* arg = nullptr;
+    if (has_argument) {
+        va_list ap;
+        va_start(ap, request);
+        arg = va_arg(ap, void*);
+        va_end(ap);
+    }
+
+    return AllocHook::inst().ioctl(fd, request_value, arg);
 }
 
 int close(int fd) {
+    if (in_preinit_phase || InitState::allocHook_setup) {
+        return CallRealClose(fd);
+    }
     return AllocHook::inst().close(fd);
 }
+#endif
 
-#if !defined(mmap64)
+#if MALLOC_HOOK_EXPORT_MMAP_HOOK && !defined(mmap64)
 void* mmap64(void* addr, size_t size, int prot, int flags, int fd, off_t offset) {
     if (in_preinit_phase || InitState::allocHook_setup) {
         return CallRealMmap64(addr, size, prot, flags, fd, offset);
@@ -448,6 +630,7 @@ void checkpoint(const char* file_name) {
 }
 }
 
+#if MALLOC_HOOK_EXPORT_CPP_NEW_HOOK
 namespace {
 
 void* HookOperatorNew(size_t size) {
@@ -519,3 +702,4 @@ void operator delete(void* ptr, size_t, std::align_val_t) noexcept { free(ptr); 
 void operator delete[](void* ptr, size_t, std::align_val_t) noexcept { free(ptr); }
 void operator delete(void* ptr, std::align_val_t, const std::nothrow_t&) noexcept { free(ptr); }
 void operator delete[](void* ptr, std::align_val_t, const std::nothrow_t&) noexcept { free(ptr); }
+#endif

@@ -1,3 +1,5 @@
+/* OHOS default ABI: C allocation/resource hooks plus C++ allocation hooks.
+ * mmap interposition is opt-in through version_script_ohos_mmap.ld. */
 {
 global:
     malloc;
@@ -11,23 +13,35 @@ global:
     close;
     checkpoint;
     _Znwm;
+    _Znwj;
     _Znam;
+    _Znaj;
     _ZnwmRKSt9nothrow_t;
+    _ZnwjRKSt9nothrow_t;
     _ZnamRKSt9nothrow_t;
+    _ZnajRKSt9nothrow_t;
     _ZdlPv;
     _ZdaPv;
     _ZdlPvm;
+    _ZdlPvj;
     _ZdaPvm;
+    _ZdaPvj;
     _ZdlPvRKSt9nothrow_t;
     _ZdaPvRKSt9nothrow_t;
     _ZnwmSt11align_val_t;
+    _ZnwjSt11align_val_t;
     _ZnamSt11align_val_t;
+    _ZnajSt11align_val_t;
     _ZnwmSt11align_val_tRKSt9nothrow_t;
+    _ZnwjSt11align_val_tRKSt9nothrow_t;
     _ZnamSt11align_val_tRKSt9nothrow_t;
+    _ZnajSt11align_val_tRKSt9nothrow_t;
     _ZdlPvSt11align_val_t;
     _ZdaPvSt11align_val_t;
     _ZdlPvmSt11align_val_t;
+    _ZdlPvjSt11align_val_t;
     _ZdaPvmSt11align_val_t;
+    _ZdaPvjSt11align_val_t;
     _ZdlPvSt11align_val_tRKSt9nothrow_t;
     _ZdaPvSt11align_val_tRKSt9nothrow_t;
 

@@ -3,8 +3,6 @@
 #include <sys/syscall.h>
 #include <unistd.h>
 
-#include <bionic/reserved_signals.h>
-
 // =============================================================================
 // Used to disable the debug allocation calls.
 // =============================================================================
@@ -30,5 +28,6 @@ public:
 private:
     bool disabled_;
 
-    BIONIC_DISALLOW_COPY_AND_ASSIGN(ScopedDisableDebugCalls);
+    ScopedDisableDebugCalls(const ScopedDisableDebugCalls&) = delete;
+    ScopedDisableDebugCalls& operator=(const ScopedDisableDebugCalls&) = delete;
 };
