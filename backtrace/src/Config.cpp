@@ -20,6 +20,9 @@ static constexpr char kSamplingIntervalBytesEnv[] =
         "ALLOC_HOOK_SAMPLING_INTERVAL_BYTES";
 static constexpr char kSamplingIntervalCompatEnv[] =
         "ALLOC_HOOK_SAMPLING_INTERVAL";
+static constexpr char kFastCaptureIntervalEnv[] =
+        "ALLOC_HOOK_FAST_CAPTURE_INTERVAL_BYTES";
+static constexpr char kDumpPrefixEnv[] = "ALLOC_HOOK_DUMP_PREFIX";
 
 static int DefaultBacktraceSignal() {
 #if defined(__BIONIC__)
@@ -74,8 +77,18 @@ bool Config::Init() {
     backtrace_dump_on_exit_ = false;
     backtrace_frames_ = DEFAULT_BACKTRACE_FRAMES;
     backtrace_dump_prefix_ = DEFAULT_BACKTRACE_DUMP_PREFIX;
+    const char* dump_prefix = getenv(kDumpPrefixEnv);
+    if (dump_prefix != nullptr && dump_prefix[0] != '\0') {
+        backtrace_dump_prefix_ = dump_prefix;
+    }
     capture_mode_ = ParseCaptureMode(getenv("ALLOC_HOOK_CAPTURE_MODE"));
     sampling_interval_bytes_ = 1;
+    fast_capture_interval_bytes_ = 1;
+    size_t fast_capture_interval = 0;
+    if (ParseValue(getenv(kFastCaptureIntervalEnv), &fast_capture_interval) &&
+        fast_capture_interval > 1) {
+        fast_capture_interval_bytes_ = fast_capture_interval;
+    }
     const char* sampling_interval_env = getenv(kSamplingIntervalBytesEnv);
     if (sampling_interval_env == nullptr) {
         sampling_interval_env = getenv(kSamplingIntervalCompatEnv);

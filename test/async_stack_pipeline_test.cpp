@@ -225,6 +225,66 @@ TEST(AsyncStackPipeline, DropsOnBoundedQueueAndFlushesAcceptedWork) {
     pipeline.Flush();
 }
 
+TEST(AsyncStackPipeline, DroppedRecordsAreReclaimedInsteadOfLeaking) {
+    auto symbolizer = std::make_unique<BlockingSymbolizer>();
+    BlockingSymbolizer* symbolizer_ptr = symbolizer.get();
+    // Capacity 1 also bounds the retained-record count at 1, which makes the
+    // reclamation observable without submitting hundreds of stacks.
+    AsyncStackPipeline pipeline(
+            std::make_unique<ModuleRegistry>(), std::move(symbolizer), 1);
+
+    ASSERT_TRUE(pipeline.Submit(MakeRaw(0x2001, 1)).accepted);
+    // The worker has taken the first item, so exactly one queue slot is free.
+    symbolizer_ptr->WaitUntilStarted();
+    ASSERT_TRUE(pipeline.Submit(MakeRaw(0x2002, 1)).accepted);
+
+    const auto first_drop = pipeline.Submit(MakeRaw(0x2003, 1));
+    const auto second_drop = pipeline.Submit(MakeRaw(0x2004, 1));
+    ASSERT_TRUE(first_drop.dropped);
+    ASSERT_TRUE(second_drop.dropped);
+
+    // Dropped submissions are retained in a bounded FIFO: the newest stays
+    // queryable for diagnostics while the older one is reclaimed. Retaining
+    // every drop forever would leak a full RawStackRecord per dropped stack.
+    StackResult result;
+    EXPECT_FALSE(pipeline.GetResult(first_drop.id, &result));
+    ASSERT_TRUE(pipeline.GetResult(second_drop.id, &result));
+    EXPECT_EQ(result.state, StackResolutionState::Dropped);
+
+    symbolizer_ptr->Release();
+    pipeline.Flush();
+    EXPECT_EQ(pipeline.stats().dropped, 2u);
+}
+
+TEST(AsyncStackPipeline, DuplicateSubmitPublishesTheCachedResult) {
+    auto resolver = std::make_unique<ModuleRegistry>();
+    ModuleRegistry* registry = resolver.get();
+    const uint64_t generation = registry->Publish({ModuleInfo{
+            .start = 0x3000, .end = 0x4000, .name = "cached.so", .build_id = ""}});
+    AsyncStackPipeline pipeline(
+            std::move(resolver), std::make_unique<RecordingSymbolizer>(), 4);
+
+    const RawStackRecord raw = MakeRaw(0x3010, generation);
+    const auto first = pipeline.Submit(raw);
+    ASSERT_TRUE(first.accepted);
+    pipeline.Flush();
+
+    // A new owner of an already-resolved stack (its previous owner released its
+    // frame entry) is told the submission is a duplicate and gets no further
+    // completion callback. The cached result must therefore be readable, or the
+    // report would show a permanently pending stack with no frames.
+    const auto again = pipeline.Submit(raw);
+    EXPECT_TRUE(again.duplicate);
+    EXPECT_FALSE(again.accepted);
+    EXPECT_EQ(again.id, first.id);
+
+    StackResult cached;
+    ASSERT_TRUE(pipeline.GetResult(again.id, &cached));
+    EXPECT_EQ(cached.state, StackResolutionState::Resolved);
+    ASSERT_EQ(cached.frames.size(), 1u);
+    EXPECT_EQ(cached.frames[0].module_name, "cached.so");
+}
+
 TEST(AsyncStackPipeline, ModuleGenerationPreventsAddressReuseMisSymbolization) {
     auto resolver = std::make_unique<ModuleRegistry>();
     ModuleRegistry* registry = resolver.get();

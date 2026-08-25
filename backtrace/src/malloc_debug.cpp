@@ -12,11 +12,11 @@
 #include <string>
 #include <unordered_map>
 #ifndef MALLOC_HOOK_ENABLE_RESOURCE_TRACKING
-#define MALLOC_HOOK_ENABLE_RESOURCE_TRACKING 1
+#define MALLOC_HOOK_ENABLE_RESOURCE_TRACKING 0
 #endif
 
 #if MALLOC_HOOK_ENABLE_RESOURCE_TRACKING
-#include <linux/dma-heap.h>
+#include "LinuxResourceBackend.h"
 #endif
 
 #include "Config.h"
@@ -390,12 +390,32 @@ void* debug_realloc(void* pointer, size_t bytes) {
 
     size_t tracked_size = bytes;
     bool track_new_allocation = ShouldTrackAllocation(bytes, HOST, &tracked_size);
+
+    // Detach the old record *before* the allocator can release the block. If we
+    // waited until after m_sys_realloc(), a concurrent malloc on another thread
+    // could be handed the freed address and register it, and our removal would
+    // erase that thread's live record instead of ours.
+    PointerInfoType previous{};
+    const bool had_entry =
+            g_debug->TrackPointers() && g_debug->pointer->TakeEntry(pointer, &previous);
+
     void* new_pointer = m_sys_realloc(pointer, bytes);
-    if (hook_source::AllocationSucceeded(new_pointer) && g_debug->TrackPointers()) {
-        g_debug->pointer->Remove(pointer);
-        if (track_new_allocation) {
-            g_debug->pointer->Add(new_pointer, bytes, tracked_size);
+    if (!hook_source::AllocationSucceeded(new_pointer)) {
+        // realloc() failed, so the original block is still live and must stay
+        // tracked exactly as it was.
+        if (had_entry) {
+            g_debug->pointer->RestoreEntry(pointer, previous);
         }
+        return new_pointer;
+    }
+
+    if (track_new_allocation && g_debug->TrackPointers()) {
+        g_debug->pointer->Add(new_pointer, bytes, tracked_size);
+    }
+    if (had_entry) {
+        // Released after the new Add() so an unchanged call site keeps its
+        // frame entry alive instead of being dropped and re-symbolized.
+        g_debug->pointer->RemoveBacktrace(previous.hash_index);
     }
 
     return new_pointer;
@@ -991,9 +1011,20 @@ int debug_munmap(void* addr, size_t size) {
     ScopedConcurrentLock lock;
     ScopedDisableDebugCalls disable;
 
+    // Same ordering constraint as realloc: the record must be gone before the
+    // kernel can hand the address to a concurrent mmap on another thread.
+    PointerInfoType previous{};
+    const bool had_entry =
+            g_debug->TrackPointers() && g_debug->pointer->TakeEntry(addr, &previous);
+
     int ret = CallMunmap(addr, size);
-    if (hook_source::SyscallSucceeded(ret) && g_debug->TrackPointers()) {
-        g_debug->pointer->Remove(addr);
+    if (hook_source::SyscallSucceeded(ret)) {
+        if (had_entry) {
+            g_debug->pointer->RemoveBacktrace(previous.hash_index);
+        }
+    } else if (had_entry) {
+        // The mapping is still live; restore its accounting untouched.
+        g_debug->pointer->RestoreEntry(addr, previous);
     }
     return ret;
 }

@@ -1,4 +1,13 @@
 find_package(Threads REQUIRED)
+
+# Several gates express their expectations with <cassert>. A build that defines
+# NDEBUG (CMAKE_BUILD_TYPE=Release does) would compile those checks away and the
+# gates would pass without verifying anything. Keep assertions live for every
+# test target in this directory, independently of the selected build type.
+if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+    add_compile_options(-UNDEBUG)
+endif()
+
 if(MALLOC_HOOK_BUILD_GL_TESTS AND ANDROID)
     add_subdirectory(gl_test)
 endif()
@@ -99,6 +108,17 @@ if(NOT ANDROID AND NOT OHOS)
     set_tests_properties(task10_hook_boundary PROPERTIES TIMEOUT 5)
 
     if(MALLOC_HOOK_TARGET_OS STREQUAL "linux")
+        add_executable(linux_mmap_ioctl_regression_test
+            linux_mmap_ioctl_regression_test.cpp)
+        target_compile_features(linux_mmap_ioctl_regression_test PRIVATE cxx_std_17)
+        target_include_directories(linux_mmap_ioctl_regression_test PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/../backtrace/include)
+        target_link_libraries(linux_mmap_ioctl_regression_test PRIVATE
+            helper Threads::Threads)
+        add_test(NAME linux_mmap_ioctl_regression
+            COMMAND linux_mmap_ioctl_regression_test)
+        set_tests_properties(linux_mmap_ioctl_regression PROPERTIES TIMEOUT 10)
+
         add_executable(mremap_lifecycle_test
             mremap_lifecycle_test.cpp)
         target_compile_features(mremap_lifecycle_test PRIVATE cxx_std_17)

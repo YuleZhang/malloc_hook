@@ -64,6 +64,8 @@ struct hash<FrameKeyType> {
 struct FrameInfoType {
     size_t references = 0;
     std::vector<uintptr_t> frames;
+    std::vector<uintptr_t> relative_pcs;
+    std::vector<std::string> module_names;
     uint64_t module_generation = 0;
     StackCaptureState capture_state = StackCaptureState::Empty;
     uint8_t terminal_error = 0;
@@ -94,6 +96,9 @@ struct ListInfoType {
     size_t size;
     MemType mem_type;
     FrameInfoType* frame_info;
+    std::vector<uintptr_t> raw_frames;
+    std::vector<uintptr_t> relative_pcs;
+    std::vector<std::string> module_names;
     std::shared_ptr<std::vector<SymbolizedFrame>> backtrace_info;
     StackCaptureState capture_state = StackCaptureState::Empty;
     uint8_t terminal_error = 0;
@@ -117,7 +122,20 @@ public:
     // Update a tracked mapping after a successful mremap without capturing a
     // second allocation stack. Untracked mappings remain untracked.
     void Remap(const void* old_ptr, const void* new_ptr, size_t new_size);
+    // Detach a tracked pointer and hand its record back to the caller. Size
+    // accounting is reversed immediately, but the allocation stack reference is
+    // retained so the caller can either release it (RemoveBacktrace) once the
+    // underlying free/unmap has succeeded, or hand the record back through
+    // RestoreEntry() if the operation failed. Callers must take the entry
+    // *before* the memory can be released, otherwise a concurrent allocation
+    // may be handed the same address and have its record erased instead.
+    bool TakeEntry(const void* ptr, PointerInfoType* info);
+    // Re-attach a record produced by TakeEntry(). No allocation stack is
+    // captured and no peak is recorded: the record is restored to the exact
+    // state it had before the failed operation.
+    void RestoreEntry(const void* ptr, const PointerInfoType& info);
     size_t AddBacktrace(size_t num_frames, size_t size_bytes);
+    bool ShouldCaptureBacktrace(size_t size_bytes);
     void Remove(const void* ptr);
     void RemoveBacktrace(size_t hash_index);
 
@@ -136,6 +154,9 @@ private:
 
     void GetList(std::vector<ListInfoType>* list, bool only_with_backtrace, Pred pred);
     void GetUniqueList(std::vector<ListInfoType>* list, bool only_with_backtrace);
+    // Records `ptr` in the probabilistic membership filter. Caller holds
+    // pointer_mutex_; the words themselves are atomic so lookups stay lock-free.
+    void MarkPointerFilter(const void* ptr);
 
     std::mutex pointer_mutex_;
     std::unordered_map<uintptr_t, PointerInfoType> pointers_;

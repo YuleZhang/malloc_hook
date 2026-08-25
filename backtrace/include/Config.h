@@ -28,6 +28,7 @@ public:
 
     size_t backtrace_dump_peak_val() const { return backtrace_dump_peak_val_; }
     size_t sampling_interval_bytes() const { return sampling_interval_bytes_; }
+    size_t fast_capture_interval_bytes() const { return fast_capture_interval_bytes_; }
     bool sampling_enabled() const {
         return capture_mode_ == StackCaptureMode::Fast && sampling_interval_bytes_ > 1;
     }
@@ -47,6 +48,7 @@ private:
 
     size_t backtrace_dump_peak_val_ = 0;
     size_t sampling_interval_bytes_ = 1;
+    size_t fast_capture_interval_bytes_ = 1;
     StackCaptureMode capture_mode_ = StackCaptureMode::Fast;
 
     uint64_t options_ = 0;

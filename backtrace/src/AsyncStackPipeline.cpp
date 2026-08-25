@@ -363,6 +363,11 @@ AsyncStackPipeline::SubmitResult AsyncStackPipeline::Submit(const RawStackRecord
     if (queue_size_ == capacity_) {
         results_[id].state = StackResolutionState::Dropped;
         unique_stacks_.erase(key);
+        // The dropped record must remain reclaimable. Without an owning FIFO its
+        // results_/id_to_key_ entries are unreachable by eviction and leak for
+        // the lifetime of the process, once per dropped unique stack.
+        dropped_order_.push_back(id);
+        EvictDroppedCacheLocked();
         ++stats_.dropped;
         return SubmitResult{.id = id, .dropped = true};
     }
@@ -387,6 +392,17 @@ bool AsyncStackPipeline::Release(AsyncStackId id) {
         result->second.state == StackResolutionState::Pending) {
         return false;
     }
+    EraseResultLocked(id);
+    result_order_.erase(
+            std::remove(result_order_.begin(), result_order_.end(), id),
+            result_order_.end());
+    dropped_order_.erase(
+            std::remove(dropped_order_.begin(), dropped_order_.end(), id),
+            dropped_order_.end());
+    return true;
+}
+
+void AsyncStackPipeline::EraseResultLocked(AsyncStackId id) {
     auto key = id_to_key_.find(id);
     if (key != id_to_key_.end()) {
         auto unique = unique_stacks_.find(key->second);
@@ -395,11 +411,7 @@ bool AsyncStackPipeline::Release(AsyncStackId id) {
         }
         id_to_key_.erase(key);
     }
-    results_.erase(result);
-    result_order_.erase(
-            std::remove(result_order_.begin(), result_order_.end(), id),
-            result_order_.end());
-    return true;
+    results_.erase(id);
 }
 
 void AsyncStackPipeline::EvictResultCacheLocked() {
@@ -411,15 +423,15 @@ void AsyncStackPipeline::EvictResultCacheLocked() {
             result->second.state == StackResolutionState::Pending) {
             continue;
         }
-        auto key = id_to_key_.find(evicted);
-        if (key != id_to_key_.end()) {
-            auto unique = unique_stacks_.find(key->second);
-            if (unique != unique_stacks_.end() && unique->second == evicted) {
-                unique_stacks_.erase(unique);
-            }
-            id_to_key_.erase(key);
-        }
-        results_.erase(result);
+        EraseResultLocked(evicted);
+    }
+}
+
+void AsyncStackPipeline::EvictDroppedCacheLocked() {
+    while (dropped_order_.size() > result_capacity_) {
+        const AsyncStackId evicted = dropped_order_.front();
+        dropped_order_.pop_front();
+        EraseResultLocked(evicted);
     }
 }
 

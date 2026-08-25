@@ -63,6 +63,17 @@ if(NOT MALLOC_HOOK_ENABLE_RESOURCE_TRACKING)
   set(MALLOC_HOOK_EXPORT_RESOURCE_HOOKS 0)
 endif()
 
+if(MALLOC_HOOK_ENABLE_RESOURCE_TRACKING AND
+   MALLOC_HOOK_TARGET_OS STREQUAL "linux")
+  include(CheckIncludeFileCXX)
+  check_include_file_cxx("linux/dma-heap.h" MALLOC_HOOK_HAVE_DMA_HEAP_UAPI)
+  if(NOT MALLOC_HOOK_HAVE_DMA_HEAP_UAPI)
+    message(FATAL_ERROR
+      "Resource tracking requires linux/dma-heap.h; disable "
+      "MALLOC_HOOK_ENABLE_RESOURCE_TRACKING for generic Linux builds")
+  endif()
+endif()
+
 if(ANDROID_ABI)
   set(_malloc_hook_target_processor "${ANDROID_ABI}")
 elseif(OHOS_ARCH)

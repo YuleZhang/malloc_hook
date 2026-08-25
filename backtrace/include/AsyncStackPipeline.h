@@ -204,7 +204,15 @@ private:
     };
 
     static RawStackKey MakeKey(const RawStackRecord& raw);
+    // Drops every trace of `id`: cached result, id->key mapping, and the dedup
+    // entry when it still points at this id.
+    void EraseResultLocked(AsyncStackId id);
     void EvictResultCacheLocked();
+    // Dropped submissions are retained for diagnostics in their own bounded
+    // FIFO. They deliberately do not share result_order_: a dropped record must
+    // not be pushed out by unrelated completions, and it must still be
+    // reclaimable instead of living until process exit.
+    void EvictDroppedCacheLocked();
     void WorkerLoop();
 
     std::unique_ptr<ModuleResolver> resolver_;
@@ -235,5 +243,6 @@ private:
     std::unordered_map<AsyncStackId, RawStackKey> id_to_key_;
     std::unordered_map<AsyncStackId, StackResult> results_;
     std::deque<AsyncStackId> result_order_;
+    std::deque<AsyncStackId> dropped_order_;
     std::thread worker_;
 };
