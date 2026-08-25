@@ -579,28 +579,26 @@ void* mremap(
 
 #if MALLOC_HOOK_EXPORT_RESOURCE_HOOKS
 int ioctl(int fd, HookIoctlRequest request, ...) {
-    const unsigned long request_value = static_cast<unsigned long>(request);
-    const bool has_argument =
-            (request_value > UINT_MAX) ||
-            _IOC_SIZE(static_cast<unsigned int>(request_value)) != 0;
+    // The public Android/OHOS libc prototype uses a signed int for the
+    // request, while _IOWR requests commonly have bit 31 set.  Normalize
+    // through unsigned int before widening so the backend sees the original
+    // 32-bit ioctl number instead of a sign-extended value.
+    const unsigned long request_value =
+            static_cast<unsigned long>(static_cast<unsigned int>(request));
+
+    // ioctl is a variadic ABI.  A number of legacy and value-passing commands
+    // have no _IOC_SIZE encoding but still require the third argument.  The
+    // previous size-based heuristic silently forwarded nullptr for those
+    // commands.  Preserve the established interposer contract and forward the
+    // caller-supplied argument unchanged.
+    va_list ap;
+    va_start(ap, request);
+    void* arg = va_arg(ap, void*);
+    va_end(ap);
+
     if (in_preinit_phase || InitState::allocHook_setup) {
-        void* arg = nullptr;
-        if (has_argument) {
-            va_list ap;
-            va_start(ap, request);
-            arg = va_arg(ap, void*);
-            va_end(ap);
-        }
         return CallRealIoctl(fd, request_value, arg);
     }
-    void* arg = nullptr;
-    if (has_argument) {
-        va_list ap;
-        va_start(ap, request);
-        arg = va_arg(ap, void*);
-        va_end(ap);
-    }
-
     return AllocHook::inst().ioctl(fd, request_value, arg);
 }
 

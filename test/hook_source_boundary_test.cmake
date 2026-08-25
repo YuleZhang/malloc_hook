@@ -19,6 +19,28 @@ foreach(route IN ITEMS
   endif()
 endforeach()
 
+# ioctl requests are 32-bit values even on Android/OHOS, where the public
+# prototype takes a signed int.  The interposer must normalize through
+# unsigned int before widening; otherwise _IOWR values sign-extend and the
+# DMA/ION/GPU recognizers never match.
+foreach(contract IN ITEMS
+    "static_cast<unsigned int>(request)"
+    "va_arg(ap, void*)")
+  string(FIND "${source}" "${contract}" position)
+  if(position EQUAL -1)
+    message(FATAL_ERROR "Missing ioctl ABI contract: ${contract}")
+  endif()
+endforeach()
+
+foreach(forbidden IN ITEMS
+    "request <= UINT_MAX"
+    "_IOC_SIZE(static_cast<unsigned int>(request_value))")
+  string(FIND "${source}" "${forbidden}" position)
+  if(NOT position EQUAL -1)
+    message(FATAL_ERROR "Found obsolete ioctl argument/request guard: ${forbidden}")
+  endif()
+endforeach()
+
 foreach(contract IN ITEMS
     "direct syscalls are"
     "success-only"

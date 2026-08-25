@@ -716,14 +716,13 @@ static bool handle_dma_node(unsigned long request, void* arg, int* fd, size_t* s
                 struct dma_heap_allocation_data* heap = (struct dma_heap_allocation_data*)arg;
                 *fd = heap->fd;
                 IonPathLog("DMA_HEAP", request, static_cast<size_t>(heap->len));
-#if defined(MALLOC_HOOK_TARGET_OS_OHOS)
-                // OHOS fdinfo omits Android's size/exp_name fields and may report
-                // ino: 0. DMA_HEAP_IOCTL_ALLOC itself is authoritative here.
+                // The successful allocation ioctl already returns the exact
+                // requested buffer length.  Use it on every platform instead
+                // of depending on optional /proc fdinfo fields (which vary
+                // across Android kernels and are absent on OHOS).
                 *size = static_cast<size_t>(heap->len);
                 return *fd >= 0 && *size > 0;
-#endif
             }
-            return is_dma_buf(*fd, size);
         case CAM_MEM_ION_MAP_PA: {
                 struct CAM_MEM_DEV_ION_NODE_STRUCT* heap = (struct CAM_MEM_DEV_ION_NODE_STRUCT*)arg;
                 *fd = heap->memID;
@@ -847,12 +846,17 @@ int debug_ioctl(int fd, unsigned long request, void* arg) {
     int node_fd = -1;
     size_t node_sz = 0;
     if (hook_source::SyscallSucceeded(ret) && g_debug->TrackPointers()) {
-        bool recognized = false;
-        if (request <= UINT_MAX) {
-            recognized =
-                    DMA_BUF::HandleIonIoctl(fd, request, arg, &node_fd, &node_sz) ||
-                    DMA_BUF::handle_dma_node(request, arg, &node_fd, &node_sz);
-        }
+        // ioctl request numbers are 32-bit values even when the backend API
+        // stores them in unsigned long.  Keep the low 32 bits so Android's
+        // signed-int libc prototype cannot sign-extend _IOWR requests and
+        // defeat the command match.
+        const unsigned int normalized_request =
+                static_cast<unsigned int>(request);
+        const bool recognized =
+                DMA_BUF::HandleIonIoctl(
+                        fd, normalized_request, arg, &node_fd, &node_sz) ||
+                DMA_BUF::handle_dma_node(
+                        normalized_request, arg, &node_fd, &node_sz);
         if (recognized) {
             bool should_track = false;
             if (DMA_BUF::RegisterDmaFd(node_fd, node_sz, &should_track) &&
