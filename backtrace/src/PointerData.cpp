@@ -308,29 +308,6 @@ size_t PointerData::AddBacktrace(size_t num_frames, size_t size_bytes) {
     }
 #endif
     std::vector<uintptr_t> frames(raw.pcs.begin(), raw.pcs.begin() + raw.frame_count);
-    std::vector<uintptr_t> relative_pcs;
-    std::vector<std::string> module_names;
-#if defined(MALLOC_HOOK_TARGET_OS_LINUX)
-    relative_pcs.reserve(raw.frame_count);
-    module_names.reserve(raw.frame_count);
-    for (size_t i = 0; i < raw.frame_count; ++i) {
-        const uintptr_t pc = raw.pcs[i];
-        Dl_info dl = {};
-        uintptr_t rel_pc = pc;
-        const char* module_name = "<unknown>";
-        if (dladdr(reinterpret_cast<void*>(pc), &dl) != 0 &&
-            dl.dli_fname != nullptr) {
-            module_name = dl.dli_fname;
-            const uintptr_t base = reinterpret_cast<uintptr_t>(dl.dli_fbase);
-            if (pc >= base) {
-                rel_pc = pc - base;
-            }
-        }
-        relative_pcs.push_back(rel_pc);
-        module_names.emplace_back(module_name);
-    }
-#endif
-
     FrameKeyType key;
     key.frame_count = raw.frame_count;
     key.module_generation = raw.module_generation;
@@ -342,12 +319,40 @@ size_t PointerData::AddBacktrace(size_t num_frames, size_t size_bytes) {
         hash_index = cur_hash_index_++;
         key_to_index_.emplace(key, hash_index);
 
+#if defined(MALLOC_HOOK_TARGET_OS_LINUX)
+        // Resolve module identity only once per unique stack, after raw-PC
+        // deduplication. This keeps Fast capture free of per-allocation
+        // dladdr work while preserving an offline-symbolizer-compatible
+        // report for each retained stack.
+        std::vector<uintptr_t> relative_pcs;
+        std::vector<std::string> module_names;
+        relative_pcs.reserve(raw.frame_count);
+        module_names.reserve(raw.frame_count);
+        for (size_t i = 0; i < raw.frame_count; ++i) {
+            const uintptr_t pc = raw.pcs[i];
+            Dl_info dl = {};
+            uintptr_t rel_pc = pc;
+            const char* module_name = "<unknown>";
+            if (dladdr(reinterpret_cast<void*>(pc), &dl) != 0 &&
+                dl.dli_fname != nullptr) {
+                module_name = dl.dli_fname;
+                const uintptr_t base = reinterpret_cast<uintptr_t>(dl.dli_fbase);
+                if (pc >= base) {
+                    rel_pc = pc - base;
+                }
+            }
+            relative_pcs.push_back(rel_pc);
+            module_names.emplace_back(module_name);
+        }
+#endif
         frames_.emplace(
                 hash_index,
                 FrameInfoType{.references = 1,
                               .frames = std::move(frames),
+#if defined(MALLOC_HOOK_TARGET_OS_LINUX)
                               .relative_pcs = std::move(relative_pcs),
                               .module_names = std::move(module_names),
+#endif
                               .module_generation = raw.module_generation,
                               .capture_state = raw.capture_state,
                               .terminal_error = raw.terminal_error,
