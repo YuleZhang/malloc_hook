@@ -1,6 +1,7 @@
 #include <signal.h>
 #include <fcntl.h>
 #include <errno.h>
+#include <limits.h>
 #include <sys/mman.h>
 #include <sys/param.h>  // powerof2 ---> ((((x) - 1) & (x)) == 0)
 #include <unistd.h>
@@ -93,11 +94,54 @@ static void SignalDebugLogInt(const char* prefix, int value) {
     write(STDERR_FILENO, buffer, strlen(buffer));
 }
 
+// Create the directories leading to `path`, like `mkdir -p`.
+//
+// The default dump prefix points into a directory that does not exist on a
+// freshly flashed device. Without this, report generation fails at open() and
+// the run produces memory counters but no report at all, with nothing in the
+// log to say why.
+static void EnsureParentDirectory(const char* path) {
+    char buffer[PATH_MAX];
+    const size_t length = strlen(path);
+    if (length == 0 || length >= sizeof(buffer)) {
+        return;
+    }
+    memcpy(buffer, path, length + 1);
+    char* last_slash = strrchr(buffer, '/');
+    if (last_slash == nullptr || last_slash == buffer) {
+        // Relative name, or a file directly under "/": nothing to create.
+        return;
+    }
+    *last_slash = '\0';
+    // Walk the prefix creating each component; an already-existing component
+    // reports EEXIST, which is the expected outcome and not an error.
+    for (char* cursor = buffer + 1; *cursor != '\0'; ++cursor) {
+        if (*cursor != '/') {
+            continue;
+        }
+        *cursor = '\0';
+        mkdir(buffer, 0755);
+        *cursor = '/';
+    }
+    mkdir(buffer, 0755);
+}
+
 static void DumpHeapToFileUnlocked(const char* file_name, bool dump_peak) {
     ScopedDisableDebugCalls disable;
 
+    EnsureParentDirectory(file_name);
     int fd = open(file_name, O_RDWR | O_CREAT | O_NOFOLLOW | O_TRUNC | O_CLOEXEC, 0644);
     if (fd == -1) {
+        // Never fail silently here: a missing report is otherwise
+        // indistinguishable from a hook that captured nothing.
+        char message[PATH_MAX + 64];
+        const int written = snprintf(
+                message, sizeof(message),
+                "alloc_hook: cannot write report to %s: %s\n", file_name,
+                strerror(errno));
+        if (written > 0) {
+            write(STDERR_FILENO, message, static_cast<size_t>(written));
+        }
         return;
     }
 

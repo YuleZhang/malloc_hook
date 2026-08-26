@@ -231,6 +231,157 @@ private:
 // frames that survive inlining.
 void SelfModuleProbe() {}
 
+// Reads this process's own resident-set breakdown.
+//
+// Tracked allocation bytes can only ever explain the anonymous part of RSS.
+// Recording the split next to the tracked totals makes the difference
+// attributable instead of leaving the reader to guess whether the hook missed
+// allocations or is simply being compared against file-backed pages it can
+// never see.
+struct RssBreakdown {
+    size_t vm_rss_kb = 0;
+    size_t anon_kb = 0;
+    size_t file_kb = 0;
+    size_t shmem_kb = 0;
+    bool valid = false;
+};
+
+size_t ReadStatusField(const char* text, const char* key) {
+    const char* found = strstr(text, key);
+    if (found == nullptr) {
+        return 0;
+    }
+    found += strlen(key);
+    while (*found == ' ' || *found == '\t') {
+        ++found;
+    }
+    size_t value = 0;
+    while (*found >= '0' && *found <= '9') {
+        value = value * 10 + static_cast<size_t>(*found - '0');
+        ++found;
+    }
+    return value;
+}
+
+RssBreakdown ReadSelfRss() {
+    RssBreakdown rss;
+    const int fd = open("/proc/self/status", O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        return rss;
+    }
+    char buffer[8192];
+    size_t used = 0;
+    ssize_t bytes;
+    while (used + 1 < sizeof(buffer) &&
+           (bytes = read(fd, buffer + used, sizeof(buffer) - used - 1)) > 0) {
+        used += static_cast<size_t>(bytes);
+    }
+    close(fd);
+    buffer[used] = '\0';
+    rss.vm_rss_kb = ReadStatusField(buffer, "VmRSS:");
+    rss.anon_kb = ReadStatusField(buffer, "RssAnon:");
+    rss.file_kb = ReadStatusField(buffer, "RssFile:");
+    rss.shmem_kb = ReadStatusField(buffer, "RssShmem:");
+    rss.valid = rss.vm_rss_kb != 0;
+    return rss;
+}
+
+// Resident bytes grouped by backing mapping, read from /proc/self/smaps.
+//
+// This is the only meaningful attribution for the parts of RSS that allocation
+// stacks cannot explain. A file-backed page has no allocation call site at all:
+// it becomes resident when the CPU touches code or constant data that the
+// dynamic loader mapped, so its owner is the mapped file, not a stack. Likewise
+// the allocator's own arena shows up here as one anonymous region serving
+// thousands of individual mallocs.
+//
+// Must be sampled at the same instant as the peak totals. Read at process exit
+// instead, the anonymous side has already collapsed (the heap was freed) and
+// would understate the peak by more than an order of magnitude.
+void CollectMappingRss(
+        std::vector<MappingRss>* ranked, MappingTotals* totals, size_t top_n) {
+    ranked->clear();
+    *totals = MappingTotals{};
+    const int maps_fd = open("/proc/self/smaps", O_RDONLY | O_CLOEXEC);
+    if (maps_fd < 0) {
+        return;
+    }
+    std::unordered_map<std::string, MappingRss> by_mapping;
+    std::string pending;
+    std::string current = "[anonymous]";
+    char chunk[16384];
+    ssize_t bytes;
+    while ((bytes = read(maps_fd, chunk, sizeof(chunk))) > 0) {
+        pending.append(chunk, static_cast<size_t>(bytes));
+        size_t start = 0;
+        for (;;) {
+            const size_t eol = pending.find('\n', start);
+            if (eol == std::string::npos) {
+                break;
+            }
+            const std::string line = pending.substr(start, eol - start);
+            start = eol + 1;
+            const bool is_file = !current.empty() && current[0] == '/';
+            if (line.compare(0, 4, "Rss:") == 0) {
+                const size_t kb = ReadStatusField(line.c_str(), "Rss:");
+                MappingRss& entry = by_mapping[current];
+                entry.name = current;
+                entry.rss_kb += kb;
+                if (is_file) {
+                    totals->file_rss_kb += kb;
+                } else {
+                    totals->anon_rss_kb += kb;
+                }
+            } else if (line.compare(0, 5, "Size:") == 0) {
+                const size_t kb = ReadStatusField(line.c_str(), "Size:");
+                MappingRss& entry = by_mapping[current];
+                entry.name = current;
+                entry.size_kb += kb;
+                if (is_file) {
+                    totals->file_size_kb += kb;
+                } else {
+                    totals->anon_size_kb += kb;
+                }
+            } else if (!line.empty() && line[0] >= '0' && line[0] <= '9' &&
+                       line.find('-') != std::string::npos) {
+                // Mapping header: "<start>-<end> perms offset dev inode  path".
+                size_t field = 0;
+                size_t pos = 0;
+                while (field < 5 && pos != std::string::npos) {
+                    pos = line.find(' ', pos);
+                    if (pos == std::string::npos) {
+                        break;
+                    }
+                    while (pos < line.size() && line[pos] == ' ') {
+                        ++pos;
+                    }
+                    ++field;
+                }
+                std::string path =
+                        pos == std::string::npos ? std::string() : line.substr(pos);
+                while (!path.empty() && (path.back() == ' ' || path.back() == '\r')) {
+                    path.pop_back();
+                }
+                current = path.empty() ? "[anonymous]" : path;
+            }
+        }
+        pending.erase(0, start);
+    }
+    close(maps_fd);
+
+    ranked->reserve(by_mapping.size());
+    for (auto& entry : by_mapping) {
+        ranked->push_back(std::move(entry.second));
+    }
+    std::sort(ranked->begin(), ranked->end(),
+              [](const MappingRss& a, const MappingRss& b) {
+                  return a.rss_kb > b.rss_kb;
+              });
+    if (ranked->size() > top_n) {
+        ranked->resize(top_n);
+    }
+}
+
 pthread_key_t& SamplerKey() {
     static pthread_key_t key;
     static pthread_once_t once = PTHREAD_ONCE_INIT;
@@ -399,6 +550,24 @@ void PointerData::Add(
                 peak_list = std::move(next_peak_list);
                 peak_list_host = current_host;
                 peak_list_dma = current_dma;
+                const RssBreakdown rss = ReadSelfRss();
+                if (rss.valid) {
+                    peak_rss_kb = rss.vm_rss_kb;
+                    peak_rss_anon_kb = rss.anon_kb;
+                    peak_rss_file_kb = rss.file_kb;
+                    peak_rss_shmem_kb = rss.shmem_kb;
+                    CollectMappingRss(&peak_mappings, &peak_map_totals, 12);
+                }
+                peak_live_pointers = pointers_.size();
+                peak_pointer_buckets = pointers_.bucket_count();
+                peak_unique_stacks = frames_.size();
+                peak_stack_pc_bytes = 0;
+                for (const auto& frame : frames_) {
+                    if (frame.second.frames != nullptr) {
+                        peak_stack_pc_bytes +=
+                                frame.second.frames->size() * sizeof(uintptr_t);
+                    }
+                }
                 if (peak_record_step_bytes_ == 0) {
                     next_peak_record_threshold_ = peak_tot;
                 } else {
@@ -752,6 +921,95 @@ void PointerData::DumpLiveToFile(int fd, bool dump_peak) {
             "used: %fMB\n",
             host_use / 1024.0 / 1024.0, dma_use / 1024.0 / 1024.0,
             (host_use + dma_use) / 1024.0 / 1024.0);
+    // Accounting reference: tracked host bytes can only ever explain the
+    // anonymous part of RSS. rss_file is code/data pages of the loaded ELFs and
+    // is unreachable by allocator interposition; rss_anon minus tracked host is
+    // allocator retention plus any mapping the build does not interpose.
+    //
+    // Every line below is tagged with the instant it was sampled at. The peak
+    // and exit values are not comparable: by exit the heap has been released,
+    // so the anonymous side reads far lower than it did at the peak.
+    const bool have_peak_rss = dumping_peak && peak_rss_kb != 0;
+    const RssBreakdown rss = have_peak_rss
+            ? RssBreakdown{peak_rss_kb, peak_rss_anon_kb, peak_rss_file_kb,
+                           peak_rss_shmem_kb, true}
+            : ReadSelfRss();
+    const char* rss_when = have_peak_rss ? "at_peak" : "at_exit";
+    if (rss.valid) {
+        dprintf(fd,
+                "rss_breakdown(%s): rss_total=%fMB rss_anon=%fMB rss_file=%fMB "
+                "rss_shmem=%fMB tracked_host=%fMB unattributed_anon=%fMB\n",
+                rss_when, rss.vm_rss_kb / 1024.0, rss.anon_kb / 1024.0,
+                rss.file_kb / 1024.0, rss.shmem_kb / 1024.0,
+                host_use / 1024.0 / 1024.0,
+                rss.anon_kb / 1024.0 - host_use / 1024.0 / 1024.0);
+    }
+
+    std::vector<MappingRss> mappings;
+    MappingTotals map_totals;
+    const char* map_when = "at_exit";
+    if (have_peak_rss && !peak_mappings.empty()) {
+        mappings = peak_mappings;
+        map_totals = peak_map_totals;
+        map_when = "at_peak";
+    } else {
+        CollectMappingRss(&mappings, &map_totals, 12);
+    }
+    if (!mappings.empty()) {
+        // Virtual size is reported next to resident size on purpose. Tracked
+        // allocation bytes are *requested* bytes and therefore line up with
+        // virtual size, while an RSS-based evaluator sees only resident pages;
+        // comparing the two per mapping shows where the difference sits.
+        //
+        // No aggregate "untouched" figure is derived from these totals: an
+        // anonymous mapping's virtual size also covers address space the
+        // allocator merely reserved, so a global size-minus-rss would be
+        // dominated by reservation rather than by allocated-but-unwritten
+        // pages. The per-mapping pair below is the honest form.
+        dprintf(fd,
+                "rss_by_mapping(%s): file_rss=%fMB file_size=%fMB anon_rss=%fMB "
+                "anon_size=%fMB top=%zu\n",
+                map_when, map_totals.file_rss_kb / 1024.0,
+                map_totals.file_size_kb / 1024.0, map_totals.anon_rss_kb / 1024.0,
+                map_totals.anon_size_kb / 1024.0, mappings.size());
+        for (const auto& mapping : mappings) {
+            dprintf(fd, "rss_mapping(%s): rss=%fMB size=%fMB %s\n", map_when,
+                    mapping.rss_kb / 1024.0, mapping.size_kb / 1024.0,
+                    mapping.name.c_str());
+        }
+    }
+
+    // What the tool itself costs the traced process. Reported so a RSS
+    // difference against an unhooked baseline can be attributed instead of
+    // guessed. pointers_ carries one entry per live tracked allocation, so it
+    // scales with allocation count, not with allocation size, and is unaffected
+    // by BACKTRACE_MIN_SIZE.
+    {
+        const size_t live = have_peak_rss ? peak_live_pointers : pointers_.size();
+        const size_t buckets =
+                have_peak_rss ? peak_pointer_buckets : pointers_.bucket_count();
+        const size_t stacks = have_peak_rss ? peak_unique_stacks : frames_.size();
+        const size_t pc_bytes = peak_stack_pc_bytes;
+        // unordered_map node: key + value + forward pointer, rounded by the
+        // allocator; plus the bucket array.
+        const size_t node_bytes =
+                sizeof(std::pair<const uintptr_t, PointerInfoType>) + sizeof(void*);
+        const double pointers_mb =
+                (live * node_bytes + buckets * sizeof(void*)) / 1024.0 / 1024.0;
+        const double stacks_mb =
+                (stacks * (sizeof(FrameInfoType) + 3 * sizeof(void*)) + pc_bytes) /
+                1024.0 / 1024.0;
+        const double peak_list_mb =
+                peak_list.capacity() * sizeof(ListInfoType) / 1024.0 / 1024.0;
+        const double filter_mb = sizeof(pointer_filter_) / 1024.0 / 1024.0;
+        dprintf(fd,
+                "hook_overhead(%s): live_pointers=%zu unique_stacks=%zu "
+                "peak_list_entries=%zu pointers_est=%fMB stacks_est=%fMB "
+                "peak_list_est=%fMB filter=%fMB total_est=%fMB\n",
+                map_when, live, stacks, peak_list.size(), pointers_mb, stacks_mb,
+                peak_list_mb, filter_mb,
+                pointers_mb + stacks_mb + peak_list_mb + filter_mb);
+    }
     const std::string async_stats_line = FormatAsyncStackStats(async_stats);
     dprintf(fd, "async_stack_stats: %s\n", async_stats_line.c_str());
     dprintf(fd,

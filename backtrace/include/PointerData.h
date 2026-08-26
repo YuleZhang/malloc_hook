@@ -21,6 +21,24 @@
 #include "Sampling.h"
 #include "UnwindBacktrace.h"
 
+// One mapped region's virtual size and resident size, as reported by
+// /proc/self/smaps. Both are needed: tracked allocation bytes are *requested*
+// bytes, so they line up with virtual size, while an evaluator measuring RSS
+// sees only the resident part. Pages that were allocated but never written
+// appear in size_kb and not in rss_kb.
+struct MappingRss {
+    std::string name;
+    size_t rss_kb = 0;
+    size_t size_kb = 0;
+};
+
+struct MappingTotals {
+    size_t file_rss_kb = 0;
+    size_t anon_rss_kb = 0;
+    size_t file_size_kb = 0;
+    size_t anon_size_kb = 0;
+};
+
 enum MemType { HOST, MMAP, DMA };
 
 // Dedup key for a captured raw stack. It deliberately *borrows* the PC array
@@ -186,6 +204,25 @@ private:
     // these counters rather than from summing the list.
     size_t peak_list_host = 0;
     size_t peak_list_dma = 0;
+    // This process's own RSS breakdown at that same moment, so a reader can see
+    // how much of RSS tracked allocations could possibly account for.
+    size_t peak_rss_kb = 0;
+    size_t peak_rss_anon_kb = 0;
+    size_t peak_rss_file_kb = 0;
+    size_t peak_rss_shmem_kb = 0;
+    // Per-mapping residency at that same moment. Sampled with the totals rather
+    // than at exit: by exit the heap is gone and the anonymous side reads an
+    // order of magnitude low.
+    std::vector<MappingRss> peak_mappings;
+    MappingTotals peak_map_totals;
+    // The hook's own bookkeeping at that moment. This is what the tool adds to
+    // the traced process's RSS, and it is dominated by one pointers_ entry per
+    // live tracked allocation -- a cost paid for every allocation, independent
+    // of BACKTRACE_MIN_SIZE, which only gates stack capture.
+    size_t peak_live_pointers = 0;
+    size_t peak_pointer_buckets = 0;
+    size_t peak_unique_stacks = 0;
+    size_t peak_stack_pc_bytes = 0;
     static constexpr size_t kPointerFilterWords = 1 << 13;
     std::array<std::atomic<uint64_t>, kPointerFilterWords> pointer_filter_{};
 
