@@ -18,6 +18,7 @@
 
 #include "Config.h"
 #include "AsyncStackPipeline.h"
+#include "ObservedMemory.h"
 #include "Sampling.h"
 #include "UnwindBacktrace.h"
 
@@ -49,7 +50,32 @@ struct MappingTotals {
     size_t anon_size_kb = 0;
 };
 
+// The /proc-derived context recorded alongside a peak snapshot.
+//
+// Collected outside the allocation locks wherever the caller can, because
+// reading /proc/self/smaps walks this process's page tables: on a 200 MB heap
+// it took up to 20 ms, and every allocation in the process would be blocked for
+// all of it. The sampler thread can afford that time; the allocators cannot.
+struct PeakProcContext {
+    RssBreakdown rss;
+    std::vector<MappingRss> mappings;
+    MappingTotals totals;
+    bool filled = false;
+};
+
 enum MemType { HOST, MMAP, DMA };
+
+// What made the retained peak snapshot the peak.
+//
+// `Tracked` is the sum of requested bytes the hook is accounting for, which is
+// what the allocation path can see. `Observed` is host RSS plus dmabuf bytes
+// read from /proc, which is what an external evaluator reports. They peak at
+// different instants, so a report has to say which one it snapshotted.
+enum class PeakSnapshotSource : uint8_t {
+    None = 0,
+    Tracked,
+    Observed,
+};
 
 // Dedup key for a captured raw stack. It deliberately *borrows* the PC array
 // rather than owning a fixed-size copy: an inline std::array<uintptr_t, 256>
@@ -176,6 +202,15 @@ public:
 
     void DumpLiveToFile(int fd, bool dump_peak = true);
     void DumpPeakInfo();
+    // Snapshots the live allocation stacks because the evaluator-visible
+    // footprint (host RSS + dmabuf bytes) has reached a new maximum. Called
+    // from the sampler thread, never from the allocation path.
+    //
+    // Taking this over as the peak criterion is the point of the call: once an
+    // observed peak has been snapshotted, the tracked-bytes trigger stops
+    // overwriting it, because that trigger fires at an instant nothing outside
+    // the process reports.
+    void RecordObservedPeak(const ObservedMemSample& sample);
     void FlushAsync();
     void BeginFinalization();
     void CompleteAsyncStack(const StackResult& result);
@@ -194,6 +229,17 @@ private:
     // Records a peak snapshot if the new peak has passed the next threshold.
     // Caller must hold pointer_mutex_; this takes frame_mutex_.
     void MaybeRecordPeakSnapshotLocked();
+    // Copies the live allocation stacks and the surrounding /proc state into
+    // the retained snapshot. Caller must hold pointer_mutex_; this takes
+    // frame_mutex_. Shared by both peak criteria so the snapshot contents can
+    // never differ depending on what triggered it. `proc` is the already
+    // collected /proc context, or nullptr to collect it under the locks.
+    void TakePeakSnapshotLocked(
+            PeakSnapshotSource source, const ObservedMemSample* observed,
+            PeakProcContext* proc);
+    // Reads the /proc state a snapshot records. Takes no hook lock, so it can
+    // be hoisted out of the locked region by callers that are able to.
+    void CollectPeakProcContext(PeakProcContext* out);
     // Records `ptr` in the probabilistic membership filter. Caller holds
     // pointer_mutex_; the words themselves are atomic so lookups stay lock-free.
     void MarkPointerFilter(const void* ptr);
@@ -220,6 +266,17 @@ private:
     size_t peak_list_host = 0;
     size_t peak_list_dma = 0;
     size_t peak_list_tot = 0;
+    // Which criterion produced the retained snapshot, and -- when it was the
+    // observed footprint -- what that footprint read at that instant. Reported
+    // so the snapshot can be lined up against an external sampler's series
+    // instead of being assumed to describe the same moment.
+    PeakSnapshotSource peak_snapshot_source_ = PeakSnapshotSource::None;
+    size_t peak_observed_rss_ = 0;
+    size_t peak_observed_dma_ = 0;
+    size_t peak_observed_gpu_ = 0;
+    // Set once an observed peak has been snapshotted. From then on the
+    // allocation path must not overwrite it with a tracked-bytes peak.
+    std::atomic<bool> observed_peak_active_{false};
     // This process's own RSS breakdown at that same moment, so a reader can see
     // how much of RSS tracked allocations could possibly account for.
     size_t peak_rss_kb = 0;

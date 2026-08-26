@@ -23,6 +23,7 @@
 #include "Config.h"
 #include "DebugData.h"
 #include "HookSourcePolicy.h"
+#include "ObservedMemory.h"
 #include "PointerData.h"
 #include "debug_disable.h"
 #include "malloc_debug.h"
@@ -234,6 +235,44 @@ static bool StartSignalDumpThread() {
     return true;
 }
 
+// Relays a new evaluator-visible peak to the allocation bookkeeping, which
+// snapshots the live stacks at that instant.
+static void OnObservedMemoryPeak(const ObservedMemSample& sample) {
+    if (g_debug != nullptr && g_debug->TrackPointers()) {
+        g_debug->pointer->RecordObservedPeak(sample);
+    }
+}
+
+// Starts sampling this process's real footprint, so the peak snapshot lands at
+// the instant an external evaluator calls the peak rather than at the instant
+// tracked bytes happen to top out. Off unless something is sampling the process
+// (see Config::observed_peak_sample_ms) -- with nothing to align to, the extra
+// thread would cost the run without making any report more accurate.
+static void StartObservedPeakSampler() {
+    if (!(g_debug->config().options() & RECORD_MEMORY_PEAK)) {
+        return;
+    }
+    const unsigned interval_ms = g_debug->config().observed_peak_sample_ms();
+    if (interval_ms == 0) {
+        return;
+    }
+    const bool started = ObservedPeakSamplerInstance().Start(
+            interval_ms, g_debug->config().backtrace_dump_peak_val(),
+            g_debug->config().peak_record_step_bytes(), &OnObservedMemoryPeak);
+    if (!started) {
+        // Not fatal: the allocation-path criterion still produces a snapshot,
+        // and the report says which criterion produced the one it retained.
+        static const char message[] =
+                "alloc_hook: could not start the memory peak sampler; peak "
+                "snapshots fall back to tracked allocation bytes\n";
+        write(STDERR_FILENO, message, sizeof(message) - 1);
+    } else {
+        SignalDebugLogInt(
+                "alloc_hook: peak sampler started, interval ms ",
+                static_cast<int>(interval_ms));
+    }
+}
+
 bool debug_initialize(void* init_space[]) {
     if (!DebugDisableInitialize()) {
         return false;
@@ -267,6 +306,8 @@ bool debug_initialize(void* init_space[]) {
         }
     }
 
+    StartObservedPeakSampler();
+
     return true;
 }
 
@@ -274,6 +315,12 @@ void debug_finalize() {
     if (g_debug == nullptr) {
         return;
     }
+
+    // Stopped before anything else: the sampler thread takes the allocation
+    // locks to snapshot stacks, and the next step blocks every allocator
+    // operation in the process. Stop() joins, so no snapshot can be in flight
+    // once it returns.
+    ObservedPeakSamplerInstance().Stop();
 
     // Prevent the async resolver from starting another dynamic-loader/module
     // snapshot refresh while allocator and C++ runtime teardown is underway.

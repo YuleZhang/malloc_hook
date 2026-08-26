@@ -19,14 +19,29 @@ target_include_directories(hook_source_policy_test PRIVATE
 
 add_executable(config_capture_mode_test
     config_capture_mode_test.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/../backtrace/src/Config.cpp)
+    ${CMAKE_CURRENT_SOURCE_DIR}/../backtrace/src/Config.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../backtrace/src/ObservedMemory.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../backtrace/src/debug_disable.cpp)
 target_compile_features(config_capture_mode_test PRIVATE cxx_std_17)
 target_include_directories(config_capture_mode_test PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../backtrace/include)
-target_link_libraries(config_capture_mode_test PRIVATE ${CMAKE_DL_LIBS})
+target_link_libraries(config_capture_mode_test PRIVATE
+    ${CMAKE_DL_LIBS} Threads::Threads)
 
 add_test(NAME hook_source_policy COMMAND hook_source_policy_test)
 add_test(NAME config_capture_mode COMMAND config_capture_mode_test)
+
+add_executable(observed_memory_test
+    observed_memory_test.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../backtrace/src/Config.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../backtrace/src/ObservedMemory.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../backtrace/src/debug_disable.cpp)
+target_compile_features(observed_memory_test PRIVATE cxx_std_17)
+target_include_directories(observed_memory_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../backtrace/include)
+target_link_libraries(observed_memory_test PRIVATE
+    ${CMAKE_DL_LIBS} Threads::Threads)
+add_test(NAME observed_memory COMMAND observed_memory_test)
 
 add_executable(sampling_test sampling_test.cpp)
 target_compile_features(sampling_test PRIVATE cxx_std_17)

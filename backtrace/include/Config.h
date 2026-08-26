@@ -27,6 +27,11 @@ public:
     size_t backtrace_max_size_bytes() const { return backtrace_max_size_bytes_; }
 
     size_t backtrace_dump_peak_val() const { return backtrace_dump_peak_val_; }
+    size_t peak_record_step_bytes() const { return peak_record_step_bytes_; }
+    // Interval, in milliseconds, at which the evaluator-visible footprint
+    // (host RSS + dmabuf bytes, read from /proc) is sampled. 0 leaves the peak
+    // criterion on tracked allocation bytes.
+    unsigned observed_peak_sample_ms() const { return observed_peak_sample_ms_; }
     size_t sampling_interval_bytes() const { return sampling_interval_bytes_; }
     size_t fast_capture_interval_bytes() const { return fast_capture_interval_bytes_; }
     bool sampling_enabled() const {
@@ -47,6 +52,8 @@ private:
     size_t backtrace_max_size_bytes_ = 0;
 
     size_t backtrace_dump_peak_val_ = 0;
+    size_t peak_record_step_bytes_ = 0;
+    unsigned observed_peak_sample_ms_ = 0;
     size_t sampling_interval_bytes_ = 1;
     size_t fast_capture_interval_bytes_ = 1;
     StackCaptureMode capture_mode_ = StackCaptureMode::Fast;
