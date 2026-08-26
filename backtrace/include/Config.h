@@ -3,6 +3,8 @@
 #include <stdint.h>
 #include <cstddef>
 
+#include "UnwindBacktrace.h"
+
 constexpr uint64_t BACKTRACE = 0x1;                 // 记录堆栈
 constexpr uint64_t TRACK_ALLOCS = 0x2;              // 记录内存申请动作
 constexpr uint64_t BACKTRACE_SPECIFIC_SIZES = 0x4;  // 记录特定大小的内存申请
@@ -25,6 +27,14 @@ public:
     size_t backtrace_max_size_bytes() const { return backtrace_max_size_bytes_; }
 
     size_t backtrace_dump_peak_val() const { return backtrace_dump_peak_val_; }
+    size_t sampling_interval_bytes() const { return sampling_interval_bytes_; }
+    size_t fast_capture_interval_bytes() const { return fast_capture_interval_bytes_; }
+    bool sampling_enabled() const {
+        return capture_mode_ == StackCaptureMode::Fast && sampling_interval_bytes_ > 1;
+    }
+    StackCaptureMode capture_mode() const { return capture_mode_; }
+
+    static StackCaptureMode ParseCaptureMode(const char* value);
 
 private:
     int backtrace_dump_signal_ = 0;
@@ -37,6 +47,9 @@ private:
     size_t backtrace_max_size_bytes_ = 0;
 
     size_t backtrace_dump_peak_val_ = 0;
+    size_t sampling_interval_bytes_ = 1;
+    size_t fast_capture_interval_bytes_ = 1;
+    StackCaptureMode capture_mode_ = StackCaptureMode::Fast;
 
     uint64_t options_ = 0;
 };

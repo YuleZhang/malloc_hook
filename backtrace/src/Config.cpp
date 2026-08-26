@@ -4,6 +4,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <signal.h>
+#include <strings.h>
 
 #if defined(__BIONIC__)
 #include <bionic/reserved_signals.h>
@@ -15,15 +16,27 @@ static constexpr size_t DEFAULT_BACKTRACE_FRAMES = 128;
 static constexpr const char DEFAULT_BACKTRACE_DUMP_PREFIX[] =
         "/data/local/tmp/trace/backtrace_heap";
 static constexpr size_t DEFAULT_OHOS_BACKTRACE_MIN_SIZE_BYTES = 40960;
+static constexpr char kSamplingIntervalBytesEnv[] =
+        "ALLOC_HOOK_SAMPLING_INTERVAL_BYTES";
+static constexpr char kFastCaptureIntervalEnv[] =
+        "ALLOC_HOOK_FAST_CAPTURE_INTERVAL_BYTES";
+static constexpr char kDumpPrefixEnv[] = "ALLOC_HOOK_DUMP_PREFIX";
 
 static int DefaultBacktraceSignal() {
 #if defined(__BIONIC__)
     return BIONIC_SIGNAL_BACKTRACE;
-#elif defined(__MUSL__)
+#elif defined(MALLOC_HOOK_TARGET_OS_OHOS)
     return 46;
 #else
     return SIGRTMIN + 6;
 #endif
+}
+
+StackCaptureMode Config::ParseCaptureMode(const char* value) {
+    if (value != nullptr && strcasecmp(value, "accurate") == 0) {
+        return StackCaptureMode::Accurate;
+    }
+    return StackCaptureMode::Fast;
 }
 
 static bool ParseValue(const char* value, size_t* parsed_value) {
@@ -57,14 +70,33 @@ static bool ParseValue(const char* value, size_t* parsed_value) {
 }
 
 bool Config::Init() {
+    options_ = 0;
     // 退出时输出 trace
     backtrace_dump_on_exit_ = false;
     backtrace_frames_ = DEFAULT_BACKTRACE_FRAMES;
     backtrace_dump_prefix_ = DEFAULT_BACKTRACE_DUMP_PREFIX;
+    const char* dump_prefix = getenv(kDumpPrefixEnv);
+    if (dump_prefix != nullptr && dump_prefix[0] != '\0') {
+        backtrace_dump_prefix_ = dump_prefix;
+    }
+    capture_mode_ = ParseCaptureMode(getenv("ALLOC_HOOK_CAPTURE_MODE"));
+    sampling_interval_bytes_ = 1;
+    fast_capture_interval_bytes_ = 1;
+    size_t fast_capture_interval = 0;
+    if (ParseValue(getenv(kFastCaptureIntervalEnv), &fast_capture_interval) &&
+        fast_capture_interval > 1) {
+        fast_capture_interval_bytes_ = fast_capture_interval;
+    }
+    const char* sampling_interval_env = getenv(kSamplingIntervalBytesEnv);
+    size_t sampling_interval = 0;
+    if (ParseValue(sampling_interval_env, &sampling_interval) &&
+        sampling_interval > 1) {
+        sampling_interval_bytes_ = sampling_interval;
+    }
 
     // 如果开启 BACKTRACE_SPECIFIC_SIZES, 请指定内存申请的最大和最小 size
     options_ |= BACKTRACE_SPECIFIC_SIZES;
-#if defined(__MUSL__)
+#if defined(MALLOC_HOOK_TARGET_OS_OHOS)
     backtrace_min_size_bytes_ = DEFAULT_OHOS_BACKTRACE_MIN_SIZE_BYTES;
 #endif
     ParseValue(getenv("BACKTRACE_MIN_SIZE"), &backtrace_min_size_bytes_);
