@@ -21,6 +21,16 @@
 #include "Sampling.h"
 #include "UnwindBacktrace.h"
 
+// Live allocations left out of a report because they carry no stack (filtered
+// by size, or capture was suppressed/failed). Reported as one aggregate line:
+// emitting a block per allocation made a signal-triggered dump grow to one
+// entry per live pointer, written with unbuffered dprintf while every
+// allocation in the process is blocked.
+struct OmittedStats {
+    size_t count = 0;
+    size_t bytes = 0;
+};
+
 // One mapped region's virtual size and resident size, as reported by
 // /proc/self/smaps. Both are needed: tracked allocation bytes are *requested*
 // bytes, so they line up with virtual size, while an evaluator measuring RSS
@@ -177,7 +187,9 @@ private:
         return pointer ^ UINTPTR_MAX;
     }
 
-    void GetList(std::vector<ListInfoType>* list, bool only_with_backtrace, Pred pred);
+    void GetList(
+            std::vector<ListInfoType>* list, bool only_with_backtrace, Pred pred,
+            OmittedStats* omitted = nullptr);
     void GetUniqueList(std::vector<ListInfoType>* list, bool only_with_backtrace);
     // Records `ptr` in the probabilistic membership filter. Caller holds
     // pointer_mutex_; the words themselves are atomic so lookups stay lock-free.

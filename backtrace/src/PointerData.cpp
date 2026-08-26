@@ -1,4 +1,6 @@
 #include <cxxabi.h>
+#include <elf.h>
+#include <link.h>
 #include <inttypes.h>
 #include <pthread.h>
 #include <sys/time.h>
@@ -123,23 +125,36 @@ public:
             pos = eol + 1;
         }
 
-        // The load bias of a mapped ELF is the start of its offset-0 mapping:
-        // the first PT_LOAD of a shared object or PIE has p_vaddr == 0 and
-        // p_offset == 0, so that mapping begins exactly at the bias.
+        // The load bias of a mapped ELF is the start of its offset-0 mapping
+        // *minus the first PT_LOAD's p_vaddr*. For a PIE or shared object that
+        // p_vaddr is 0 and the bias is simply the mapping start, but a non-PIE
+        // ET_EXEC is linked at a fixed base (0x400000 is typical), so its bias
+        // is 0 and every relative PC would otherwise be shifted by the link
+        // base -- making offline symbolization resolve to the wrong function or
+        // to nothing at all.
         //
-        // Deriving the bias per-mapping as (start - offset) is wrong: with
+        // p_vaddr is read from the ELF header already mapped at that address
+        // rather than from the file on disk: the mapping is what the loader
+        // actually used, and it stays readable even if the file was replaced or
+        // deleted.
+        //
+        // Deriving the bias per-mapping as (start - offset) is also wrong: with
         // -z separate-code (the default in modern binutils) a segment's
         // page-aligned p_vaddr and p_offset differ, which silently shifts every
-        // relative PC in that segment by a page and makes offline symbolization
-        // resolve to the wrong function.
+        // relative PC in that segment by a page.
         std::unordered_map<std::string, uintptr_t> module_base;
         for (const RawMapping& mapping : mappings) {
-            if (mapping.offset != 0) {
+            if (mapping.offset != 0 || !mapping.readable) {
                 continue;
             }
+            uintptr_t bias = mapping.start;
+            uintptr_t first_vaddr = 0;
+            if (FirstLoadVaddr(mapping, &first_vaddr) && first_vaddr <= bias) {
+                bias -= first_vaddr;
+            }
             auto known = module_base.find(mapping.name);
-            if (known == module_base.end() || mapping.start < known->second) {
-                module_base[mapping.name] = mapping.start;
+            if (known == module_base.end() || bias < known->second) {
+                module_base[mapping.name] = bias;
             }
         }
 
@@ -190,8 +205,42 @@ private:
         uintptr_t end = 0;
         uintptr_t offset = 0;
         bool executable = false;
+        bool readable = false;
         std::string name;
     };
+
+    // Reads the first PT_LOAD's p_vaddr out of the ELF header mapped at
+    // `mapping.start`. Every access is bounded by the mapping itself and the
+    // ELF magic is checked first, so a non-ELF or truncated mapping is rejected
+    // rather than dereferenced blindly.
+    static bool FirstLoadVaddr(const RawMapping& mapping, uintptr_t* vaddr) {
+        const size_t length = mapping.end - mapping.start;
+        if (!mapping.readable || length < sizeof(ElfW(Ehdr))) {
+            return false;
+        }
+        const auto* base = reinterpret_cast<const unsigned char*>(mapping.start);
+        if (memcmp(base, ELFMAG, SELFMAG) != 0) {
+            return false;
+        }
+        const auto* header = reinterpret_cast<const ElfW(Ehdr)*>(base);
+        if (header->e_phentsize != sizeof(ElfW(Phdr)) || header->e_phnum == 0) {
+            return false;
+        }
+        const size_t table_bytes =
+                static_cast<size_t>(header->e_phnum) * sizeof(ElfW(Phdr));
+        if (header->e_phoff > length || table_bytes > length - header->e_phoff) {
+            return false;
+        }
+        const auto* headers =
+                reinterpret_cast<const ElfW(Phdr)*>(base + header->e_phoff);
+        for (ElfW(Half) i = 0; i < header->e_phnum; ++i) {
+            if (headers[i].p_type == PT_LOAD) {
+                *vaddr = static_cast<uintptr_t>(headers[i].p_vaddr);
+                return true;
+            }
+        }
+        return false;
+    }
 
     static void ParseLine(
             const std::string& entry, std::vector<RawMapping>* mappings) {
@@ -219,6 +268,7 @@ private:
         mapping.end = end;
         mapping.offset = offset;
         mapping.executable = strchr(perms, 'x') != nullptr;
+        mapping.readable = strchr(perms, 'r') != nullptr;
         mapping.name = path;
         mappings->push_back(std::move(mapping));
     }
@@ -582,41 +632,69 @@ void PointerData::Remap(const void* old_ptr, const void* new_ptr, size_t new_siz
     if (old_ptr == nullptr || new_ptr == nullptr || new_size > PointerInfoType::MaxSize()) {
         return;
     }
-    std::lock_guard<std::mutex> pointer_guard(pointer_mutex_);
-    const uintptr_t old_key = ManglePointer(reinterpret_cast<uintptr_t>(old_ptr));
-    auto entry = pointers_.find(old_key);
-    if (entry == pointers_.end()) {
-        return;
-    }
-    PointerInfoType info = entry->second;
-    const size_t old_size = info.size;
-    info.size = new_size;
-    pointers_.erase(entry);
-    pointers_[ManglePointer(reinterpret_cast<uintptr_t>(new_ptr))] = info;
-    if (new_size >= old_size) {
-        current_used += new_size - old_size;
-        if (info.mem_type == DMA) {
-            current_dma += new_size - old_size;
-        } else {
-            current_host += new_size - old_size;
+    // A displaced destination entry's stack reference is released after the
+    // pointer lock is dropped, matching Remove()'s ordering.
+    size_t displaced_hash_index = 0;
+    {
+        std::lock_guard<std::mutex> pointer_guard(pointer_mutex_);
+        const uintptr_t old_key = ManglePointer(reinterpret_cast<uintptr_t>(old_ptr));
+        auto entry = pointers_.find(old_key);
+        if (entry == pointers_.end()) {
+            return;
         }
-    } else {
-        current_used -= old_size - new_size;
-        if (info.mem_type == DMA) {
-            current_dma -= old_size - new_size;
-        } else {
-            current_host -= old_size - new_size;
+        PointerInfoType info = entry->second;
+        const size_t old_size = info.size;
+        info.size = new_size;
+        pointers_.erase(entry);
+
+        // mremap with MREMAP_FIXED unmaps the destination range, so a tracked
+        // mapping may already live there. Reverse its accounting instead of
+        // letting the assignment drop it: otherwise its bytes stay in
+        // current_used forever (permanent upward drift) and its unique-stack
+        // entry is never released.
+        const uintptr_t new_key = ManglePointer(reinterpret_cast<uintptr_t>(new_ptr));
+        auto displaced = pointers_.find(new_key);
+        if (displaced != pointers_.end()) {
+            const size_t displaced_size = displaced->second.size;
+            current_used -= displaced_size;
+            if (displaced->second.mem_type == DMA) {
+                current_dma -= displaced_size;
+            } else {
+                current_host -= displaced_size;
+            }
+            displaced_hash_index = displaced->second.hash_index;
+            pointers_.erase(displaced);
         }
+
+        pointers_[new_key] = info;
+        if (new_size >= old_size) {
+            current_used += new_size - old_size;
+            if (info.mem_type == DMA) {
+                current_dma += new_size - old_size;
+            } else {
+                current_host += new_size - old_size;
+            }
+        } else {
+            current_used -= old_size - new_size;
+            if (info.mem_type == DMA) {
+                current_dma -= old_size - new_size;
+            } else {
+                current_host -= old_size - new_size;
+            }
+        }
+        size_t* peak = info.mem_type == DMA ? &peak_dma : &peak_host;
+        size_t current = info.mem_type == DMA ? current_dma : current_host;
+        if (current > *peak) {
+            *peak = current;
+        }
+        if (current_used > peak_tot) {
+            peak_tot = current_used;
+        }
+        MarkPointerFilter(new_ptr);
     }
-    size_t* peak = info.mem_type == DMA ? &peak_dma : &peak_host;
-    size_t current = info.mem_type == DMA ? current_dma : current_host;
-    if (current > *peak) {
-        *peak = current;
+    if (displaced_hash_index > kBacktraceEmptyIndex) {
+        RemoveBacktrace(displaced_hash_index);
     }
-    if (current_used > peak_tot) {
-        peak_tot = current_used;
-    }
-    MarkPointerFilter(new_ptr);
 }
 
 size_t PointerData::AddBacktrace(size_t num_frames, size_t size_bytes) {
@@ -792,11 +870,16 @@ void PointerData::RemoveBacktrace(size_t hash_index) {
 }
 
 void PointerData::GetList(
-        std::vector<ListInfoType>* list, bool only_with_backtrace, Pred pred) {
+        std::vector<ListInfoType>* list, bool only_with_backtrace, Pred pred,
+        OmittedStats* omitted) {
     for (auto& entry : pointers_) {
         // 舍弃没有堆栈的 pointer
         size_t hash_index = entry.second.hash_index;
         if (hash_index <= kBacktraceEmptyIndex && only_with_backtrace) {
+            if (omitted != nullptr) {
+                ++omitted->count;
+                omitted->bytes += entry.second.RealSize();
+            }
             continue;
         }
 
@@ -880,6 +963,7 @@ void PointerData::DumpLiveToFile(int fd, bool dump_peak) {
 
     std::vector<ListInfoType> list;
     size_t host_use = 0, dma_use = 0;
+    OmittedStats omitted;
     const bool dumping_peak =
             (g_debug->config().options() & RECORD_MEMORY_PEAK) && dump_peak;
     if (dumping_peak) {
@@ -889,10 +973,15 @@ void PointerData::DumpLiveToFile(int fd, bool dump_peak) {
         host_use = peak_list_host;
         dma_use = peak_list_dma;
     } else {
-        // Sort by the time of the allocation.
-        GetList(&list, false, [](const ListInfoType& a, const ListInfoType& b) {
+        // Only allocations that carry a stack. Listing stack-less ones emitted a
+        // two-line block per live pointer through unbuffered dprintf while
+        // pointer_mutex_, frame_mutex_ and the concurrent read lock were all
+        // held, so a process with many small live allocations blocked every
+        // allocation for a multi-megabyte write. They are summarised in one line
+        // below instead; exact totals come from the counters, not from the list.
+        GetList(&list, true, [](const ListInfoType& a, const ListInfoType& b) {
             return a.alloc_time < b.alloc_time;
-        });
+        }, &omitted);
         host_use = current_host;
         dma_use = current_dma;
     }
@@ -921,6 +1010,15 @@ void PointerData::DumpLiveToFile(int fd, bool dump_peak) {
             "used: %fMB\n",
             host_use / 1024.0 / 1024.0, dma_use / 1024.0 / 1024.0,
             (host_use + dma_use) / 1024.0 / 1024.0);
+    // Stack-less live allocations are counted in the totals above but not
+    // listed. Kept as one line so a capture failure is still visible without
+    // paying a block per allocation.
+    if (omitted.count != 0) {
+        dprintf(fd,
+                "omitted_without_stack: count=%zu bytes=%fMB "
+                "(size-filtered or capture suppressed/failed)\n",
+                omitted.count, omitted.bytes / 1024.0 / 1024.0);
+    }
     // Accounting reference: tracked host bytes can only ever explain the
     // anonymous part of RSS. rss_file is code/data pages of the loaded ELFs and
     // is unreachable by allocator interposition; rss_anon minus tracked host is
