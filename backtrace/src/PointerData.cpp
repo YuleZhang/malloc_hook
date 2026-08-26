@@ -26,6 +26,9 @@
 constexpr size_t kBacktraceExitIndex = 0;
 constexpr size_t kBacktraceEmptyIndex = 1;
 constexpr size_t kDefaultPeakRecordStepBytes = 12 * 1024 * 1024;
+// Floor for the scaled snapshot interval, so a very small peak cannot make the
+// snapshot refresh on essentially every allocation.
+constexpr size_t kMinPeakRecordStepBytes = 64 * 1024;
 // The first frames belong to the capture plumbing itself.  Keep this policy
 // at the hook boundary so reports start at the allocation caller while both
 // Fast and Accurate backends retain the same neutral contract.
@@ -559,6 +562,69 @@ void PointerData::MarkPointerFilter(const void* ptr) {
             1ULL << ((hash >> 22) & 63), std::memory_order_relaxed);
 }
 
+// Caller holds pointer_mutex_. Takes frame_mutex_ (pointer -> frame is the only
+// order used anywhere in this file).
+void PointerData::MaybeRecordPeakSnapshotLocked() {
+    if (!(g_debug->config().options() & RECORD_MEMORY_PEAK) ||
+        peak_tot <= next_peak_record_threshold_) {
+        return;
+    }
+    std::lock_guard<std::mutex> frame_guard(frame_mutex_);
+    std::vector<ListInfoType> next_peak_list;
+    // Snapshot only allocations that actually carry a stack. Including
+    // stack-less records here walked every live pointer -- with the default
+    // size filter that is >99% of them -- on every step of the peak, while
+    // holding both mutexes. Exact live/peak totals come from the counters, not
+    // from this list, so accounting stays exact without paying for the walk.
+    GetUniqueList(&next_peak_list, true);
+    if (next_peak_list.empty()) {
+        return;
+    }
+    peak_list = std::move(next_peak_list);
+    peak_list_host = current_host;
+    peak_list_dma = current_dma;
+    peak_list_tot = current_used;
+    const RssBreakdown rss = ReadSelfRss();
+    if (rss.valid) {
+        peak_rss_kb = rss.vm_rss_kb;
+        peak_rss_anon_kb = rss.anon_kb;
+        peak_rss_file_kb = rss.file_kb;
+        peak_rss_shmem_kb = rss.shmem_kb;
+        CollectMappingRss(&peak_mappings, &peak_map_totals, 12);
+    }
+    peak_live_pointers = pointers_.size();
+    peak_pointer_buckets = pointers_.bucket_count();
+    peak_unique_stacks = frames_.size();
+    peak_stack_pc_bytes = 0;
+    for (const auto& frame : frames_) {
+        if (frame.second.frames != nullptr) {
+            peak_stack_pc_bytes += frame.second.frames->size() * sizeof(uintptr_t);
+        }
+    }
+    if (peak_record_step_bytes_ == 0) {
+        next_peak_record_threshold_ = peak_tot;
+    } else {
+        // Scale the refresh interval to the peak reached so far. A fixed step
+        // means a process whose peak never grows by another whole step keeps its
+        // first, much lower snapshot: with the 12MB default, a 6.5MB peak was
+        // snapshotted once at 1MB and never again, and a peak reached by mremap
+        // growth was missed entirely. On a large peak this still evaluates to
+        // the configured step, so snapshot cost there is unchanged. The divisor
+        // trades snapshot proximity to the peak against how often the walk runs:
+        // /4 keeps the snapshot within ~20% of the peak, which is representative
+        // for attribution, while process_peak below always carries the exact
+        // numbers.
+        size_t increment = peak_tot / 4;
+        if (increment > peak_record_step_bytes_) {
+            increment = peak_record_step_bytes_;
+        }
+        if (increment < kMinPeakRecordStepBytes) {
+            increment = kMinPeakRecordStepBytes;
+        }
+        next_peak_record_threshold_ = peak_tot + increment;
+    }
+}
+
 void PointerData::Add(
         const void* ptr, size_t pointer_size, size_t tracked_size, MemType type) {
     size_t hash_index = 0;
@@ -583,48 +649,12 @@ void PointerData::Add(
     }
     if (peak_tot < current_used) {
         peak_tot = current_used;
-
-        if ((g_debug->config().options() & RECORD_MEMORY_PEAK) &&
-            hash_index > kBacktraceEmptyIndex &&
-            peak_tot > next_peak_record_threshold_) {
-            std::lock_guard<std::mutex> frame_guard(frame_mutex_);
-            std::vector<ListInfoType> next_peak_list;
-            // Snapshot only allocations that actually carry a stack. Including
-            // stack-less records here walked every live pointer -- with the
-            // default size filter that is >99% of them -- on every 12MB step of
-            // a ~1.7GB peak, while holding both mutexes. Exact live/peak totals
-            // come from the counters below, not from this list, so accounting
-            // stays exact without paying for the walk.
-            GetUniqueList(&next_peak_list, true);
-            if (!next_peak_list.empty()) {
-                peak_list = std::move(next_peak_list);
-                peak_list_host = current_host;
-                peak_list_dma = current_dma;
-                const RssBreakdown rss = ReadSelfRss();
-                if (rss.valid) {
-                    peak_rss_kb = rss.vm_rss_kb;
-                    peak_rss_anon_kb = rss.anon_kb;
-                    peak_rss_file_kb = rss.file_kb;
-                    peak_rss_shmem_kb = rss.shmem_kb;
-                    CollectMappingRss(&peak_mappings, &peak_map_totals, 12);
-                }
-                peak_live_pointers = pointers_.size();
-                peak_pointer_buckets = pointers_.bucket_count();
-                peak_unique_stacks = frames_.size();
-                peak_stack_pc_bytes = 0;
-                for (const auto& frame : frames_) {
-                    if (frame.second.frames != nullptr) {
-                        peak_stack_pc_bytes +=
-                                frame.second.frames->size() * sizeof(uintptr_t);
-                    }
-                }
-                if (peak_record_step_bytes_ == 0) {
-                    next_peak_record_threshold_ = peak_tot;
-                } else {
-                    next_peak_record_threshold_ = peak_tot + peak_record_step_bytes_;
-                }
-            }
-        }
+        // Deliberately not gated on this allocation having captured a stack.
+        // Requiring that made the snapshot depend on which allocation happened
+        // to cross the threshold, so with capture sampling enabled it almost
+        // never refreshed and the report's headline total stayed at an early,
+        // much lower moment.
+        MaybeRecordPeakSnapshotLocked();
     }
 }
 
@@ -689,6 +719,10 @@ void PointerData::Remap(const void* old_ptr, const void* new_ptr, size_t new_siz
         }
         if (current_used > peak_tot) {
             peak_tot = current_used;
+            // Growing a mapping is the usual reason to call mremap, so a peak
+            // reached this way must be snapshotted too; otherwise the report
+            // keeps the pre-mremap mapping and understates the peak.
+            MaybeRecordPeakSnapshotLocked();
         }
         MarkPointerFilter(new_ptr);
     }
@@ -1018,6 +1052,19 @@ void PointerData::DumpLiveToFile(int fd, bool dump_peak) {
                 "omitted_without_stack: count=%zu bytes=%fMB "
                 "(size-filtered or capture suppressed/failed)\n",
                 omitted.count, omitted.bytes / 1024.0 / 1024.0);
+    }
+    // The line above reports the instant the listed snapshot was taken. The
+    // process peak can be higher: a snapshot only refreshes once the peak grows
+    // past DUMP_PEAK_STEP_MB again, so a run whose peak never grows that much
+    // more keeps an earlier snapshot. Print the exact peak counters next to it
+    // so the headline total can never understate what the process reached.
+    if (dumping_peak) {
+        dprintf(fd,
+                "process_peak: host=%fMB dma=%fMB total=%fMB "
+                "(snapshot_total=%fMB, step=%fMB)\n",
+                peak_host / 1024.0 / 1024.0, peak_dma / 1024.0 / 1024.0,
+                peak_tot / 1024.0 / 1024.0, peak_list_tot / 1024.0 / 1024.0,
+                peak_record_step_bytes_ / 1024.0 / 1024.0);
     }
     // Accounting reference: tracked host bytes can only ever explain the
     // anonymous part of RSS. rss_file is code/data pages of the loaded ELFs and

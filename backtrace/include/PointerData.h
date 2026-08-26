@@ -191,6 +191,9 @@ private:
             std::vector<ListInfoType>* list, bool only_with_backtrace, Pred pred,
             OmittedStats* omitted = nullptr);
     void GetUniqueList(std::vector<ListInfoType>* list, bool only_with_backtrace);
+    // Records a peak snapshot if the new peak has passed the next threshold.
+    // Caller must hold pointer_mutex_; this takes frame_mutex_.
+    void MaybeRecordPeakSnapshotLocked();
     // Records `ptr` in the probabilistic membership filter. Caller holds
     // pointer_mutex_; the words themselves are atomic so lookups stay lock-free.
     void MarkPointerFilter(const void* ptr);
@@ -216,6 +219,7 @@ private:
     // these counters rather than from summing the list.
     size_t peak_list_host = 0;
     size_t peak_list_dma = 0;
+    size_t peak_list_tot = 0;
     // This process's own RSS breakdown at that same moment, so a reader can see
     // how much of RSS tracked allocations could possibly account for.
     size_t peak_rss_kb = 0;
