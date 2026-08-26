@@ -4,13 +4,12 @@ project(malloc_hook LANGUAGES C CXX ASM)
 
 option(MALLOC_HOOK_BUILD_TESTS "Build malloc_hook test binaries" ON)
 option(MALLOC_HOOK_OHOS_MMAP_HOOK "Export mmap/munmap hooks in OHOS builds" OFF)
-set(_malloc_hook_default_resource_tracking OFF)
-if(ANDROID OR OHOS)
-  set(_malloc_hook_default_resource_tracking ON)
-endif()
-option(MALLOC_HOOK_ENABLE_RESOURCE_TRACKING
-  "Build DMA/ION/GPU resource tracking"
-  ${_malloc_hook_default_resource_tracking})
+# DMA/ION/GPU buffer capture is part of what this tool measures, not an add-on:
+# on every supported target the majority of a camera/NN pipeline's memory is
+# DMA-BUF, so it is on by default. Turn it off only for host smoke builds that
+# have no driver UAPI at all.
+option(MALLOC_HOOK_ENABLE_DMA_CAPTURE
+  "Capture DMA-BUF/ION/GPU buffer allocations in addition to malloc/mmap" ON)
 option(MALLOC_HOOK_BUILD_GL_TESTS
   "Build the Android OpenGL integration test fixture"
   ${ANDROID})
@@ -59,19 +58,26 @@ else()
     "Unsupported target OS '${CMAKE_SYSTEM_NAME}'; expected Android, OHOS, or Linux")
 endif()
 
-if(NOT MALLOC_HOOK_ENABLE_RESOURCE_TRACKING)
+if(NOT MALLOC_HOOK_ENABLE_DMA_CAPTURE)
   set(MALLOC_HOOK_EXPORT_RESOURCE_HOOKS 0)
 endif()
 
-if(MALLOC_HOOK_ENABLE_RESOURCE_TRACKING AND
+if(MALLOC_HOOK_ENABLE_DMA_CAPTURE AND
    MALLOC_HOOK_TARGET_OS STREQUAL "linux")
   include(CheckIncludeFileCXX)
   check_include_file_cxx("linux/dma-heap.h" MALLOC_HOOK_HAVE_DMA_HEAP_UAPI)
   if(NOT MALLOC_HOOK_HAVE_DMA_HEAP_UAPI)
-    message(FATAL_ERROR
-      "Resource tracking requires linux/dma-heap.h; disable "
-      "MALLOC_HOOK_ENABLE_RESOURCE_TRACKING for generic Linux builds")
+    # Not fatal: a vendored copy of the dma-heap UAPI ships with the driver
+    # headers, because cross toolchains routinely omit it from the sysroot even
+    # when the target kernel exports /dev/dma_heap.
+    message(STATUS
+      "linux/dma-heap.h not in sysroot; using vendored dma-heap UAPI")
   endif()
+endif()
+if(MALLOC_HOOK_HAVE_DMA_HEAP_UAPI)
+  set(_malloc_hook_dma_heap_uapi 1)
+else()
+  set(_malloc_hook_dma_heap_uapi 0)
 endif()
 
 if(ANDROID_ABI)
@@ -131,6 +137,7 @@ target_compile_definitions(malloc_hook_platform_contract INTERFACE
   "MALLOC_HOOK_TARGET_OS_${_malloc_hook_os_define}=1"
   "MALLOC_HOOK_TARGET_LIBC_${_malloc_hook_libc_define}=1"
   "MALLOC_HOOK_TARGET_ARCH_${_malloc_hook_arch_define}=1"
+  "MALLOC_HOOK_HAVE_DMA_HEAP_UAPI=${_malloc_hook_dma_heap_uapi}"
   "MALLOC_HOOK_HAVE_COMPILER_UNWIND=${_malloc_hook_compiler_unwind}")
 
 if(MALLOC_HOOK_TARGET_OS STREQUAL "android")
@@ -161,7 +168,7 @@ else()
     "No hook export policy for target OS '${MALLOC_HOOK_TARGET_OS}'")
 endif()
 
-if(NOT MALLOC_HOOK_ENABLE_RESOURCE_TRACKING)
+if(NOT MALLOC_HOOK_ENABLE_DMA_CAPTURE)
   set(MALLOC_HOOK_EXPORT_RESOURCE_HOOKS 0)
 endif()
 
@@ -252,7 +259,7 @@ message(STATUS
   "malloc_hook export policy: name=${MALLOC_HOOK_EXPORT_POLICY}, "
   "mmap=${MALLOC_HOOK_EXPORT_MMAP_HOOK}, "
   "resource=${MALLOC_HOOK_EXPORT_RESOURCE_HOOKS}, "
-  "resource_tracking=${MALLOC_HOOK_ENABLE_RESOURCE_TRACKING}, "
+  "resource_tracking=${MALLOC_HOOK_ENABLE_DMA_CAPTURE}, "
   "cpp_new=${MALLOC_HOOK_EXPORT_CPP_NEW_HOOK}")
 
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -g -O3 -fPIC")

@@ -11,11 +11,11 @@
 #include <mutex>
 #include <string>
 #include <unordered_map>
-#ifndef MALLOC_HOOK_ENABLE_RESOURCE_TRACKING
-#define MALLOC_HOOK_ENABLE_RESOURCE_TRACKING 0
+#ifndef MALLOC_HOOK_ENABLE_DMA_CAPTURE
+#define MALLOC_HOOK_ENABLE_DMA_CAPTURE 0
 #endif
 
-#if MALLOC_HOOK_ENABLE_RESOURCE_TRACKING
+#if MALLOC_HOOK_ENABLE_DMA_CAPTURE
 #include "LinuxResourceBackend.h"
 #endif
 
@@ -26,7 +26,7 @@
 #include "debug_disable.h"
 #include "malloc_debug.h"
 
-#if MALLOC_HOOK_ENABLE_RESOURCE_TRACKING
+#if MALLOC_HOOK_ENABLE_DMA_CAPTURE
 #ifndef __user
 #define __user
 #define MALLOC_HOOK_DEFINED_KERNEL_USER_ANNOTATION
@@ -152,8 +152,8 @@ static void* signal_dump_thread(void*) {
 
         char file_name[256];
         snprintf(
-                file_name, sizeof(file_name), "%s.time.%ld.txt",
-                g_debug->config().backtrace_dump_prefix(), time(NULL));
+                file_name, sizeof(file_name), "%s.signal.pid_%d.time_%ld.txt",
+                g_debug->config().backtrace_dump_prefix(), getpid(), time(NULL));
         SignalDebugLog("alloc_hook: signal thread dumping heap\n");
         debug_dump_heap(file_name);
         SignalDebugLog("alloc_hook: signal thread finished heap dump\n");
@@ -162,7 +162,7 @@ static void* signal_dump_thread(void*) {
 }
 
 static bool StartSignalDumpThread() {
-    g_signal_debug_enabled = getenv("ALLOC_HOOK_DEBUG_SIGNAL") != nullptr;
+    g_signal_debug_enabled = getenv("ALLOC_HOOK_DEBUG") != nullptr;
     if (g_signal_thread_started) {
         return true;
     }
@@ -245,9 +245,12 @@ void debug_finalize() {
     if ((g_debug->config().options() & BACKTRACE) &&
         g_debug->config().backtrace_dump_on_exit()) {
         char file_name[512];
+        // The PID is part of the name so a report can be tied back to the
+        // process that produced it; a hook injected process-wide may write
+        // several.
         snprintf(
-                file_name, sizeof(file_name), "%s.exit.%ld.txt",
-                g_debug->config().backtrace_dump_prefix(), time(NULL));
+                file_name, sizeof(file_name), "%s.exit.pid_%d.time_%ld.txt",
+                g_debug->config().backtrace_dump_prefix(), getpid(), time(NULL));
         DumpHeapToFileUnlocked(file_name, true);
     }
 
@@ -521,7 +524,7 @@ int debug_posix_memalign(void** memptr, size_t alignment, size_t size) {
     return result;
 }
 
-#if MALLOC_HOOK_ENABLE_RESOURCE_TRACKING
+#if MALLOC_HOOK_ENABLE_DMA_CAPTURE
 namespace DMA_BUF {
 
 static thread_local hook_source::PendingIoctlAllocation pending_gpu_allocation;
@@ -707,7 +710,7 @@ static bool is_dma_buf(int fd, size_t* size) {
 }
 
 static void IonPathLog(const char* tag, unsigned long request, size_t sz) {
-    static bool enabled = getenv("ALLOC_HOOK_DEBUG_ION") != nullptr;
+    static bool enabled = getenv("ALLOC_HOOK_DEBUG") != nullptr;
     if (!enabled) {
         return;
     }
@@ -851,7 +854,7 @@ static void* CallMmap64(void* addr, size_t size, int prot, int flags, int fd, of
 #endif
 
 int debug_ioctl(int fd, unsigned long request, void* arg) {
-#if !MALLOC_HOOK_ENABLE_RESOURCE_TRACKING
+#if !MALLOC_HOOK_ENABLE_DMA_CAPTURE
     return (int)syscall(SYS_ioctl, fd, request, arg);
 #else
     if (DebugCallsDisabledOrAsyncWorker()) {
@@ -894,7 +897,7 @@ int debug_ioctl(int fd, unsigned long request, void* arg) {
 }
 
 int debug_close(int fd) {
-#if !MALLOC_HOOK_ENABLE_RESOURCE_TRACKING
+#if !MALLOC_HOOK_ENABLE_DMA_CAPTURE
     return (int)syscall(SYS_close, fd);
 #else
     if (DebugCallsDisabledOrAsyncWorker()) {
@@ -933,7 +936,7 @@ static void TrackMmapResult(
         case hook_source::MmapCaptureKind::None:
             break;
     }
-#if MALLOC_HOOK_ENABLE_RESOURCE_TRACKING
+#if MALLOC_HOOK_ENABLE_DMA_CAPTURE
     if (result != MAP_FAILED) {
         size_t dma_size = 0;
         if (DMA_BUF::ShouldTrackDmaMapping(fd, flags, &dma_size)) {
@@ -956,7 +959,7 @@ void* debug_mmap64(void* addr, size_t size, int prot, int flags, int fd, off_t o
     ScopedConcurrentLock lock;
     ScopedDisableDebugCalls disable;
 
-#if MALLOC_HOOK_ENABLE_RESOURCE_TRACKING
+#if MALLOC_HOOK_ENABLE_DMA_CAPTURE
     const bool pending_ioctl = DMA_BUF::pending_gpu_allocation.Take() != 0;
 #else
     const bool pending_ioctl = false;
@@ -986,7 +989,7 @@ void* debug_mmap(void* addr, size_t size, int prot, int flags, int fd, off_t off
     ScopedConcurrentLock lock;
     ScopedDisableDebugCalls disable;
 
-#if MALLOC_HOOK_ENABLE_RESOURCE_TRACKING
+#if MALLOC_HOOK_ENABLE_DMA_CAPTURE
     const bool pending_ioctl = DMA_BUF::pending_gpu_allocation.Take() != 0;
 #else
     const bool pending_ioctl = false;

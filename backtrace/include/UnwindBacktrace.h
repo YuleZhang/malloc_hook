@@ -43,6 +43,11 @@ enum class StackCaptureBackend : uint8_t {
     LinuxNative,
     OhosNative,
     Fallback,
+    // aarch64 frame-pointer (x29) chain walk. Parses no CFI and authenticates
+    // no return address, so it is both cheaper than the compiler unwinder and
+    // immune to third-party libraries whose unwind tables drive libgcc's
+    // pointer-authentication path into a fault.
+    FramePointer,
 };
 
 constexpr size_t kMaxAsyncRawFrames = 256;
@@ -55,7 +60,11 @@ struct RawStackRecord {
     uint16_t skipped_frames = 0;
     uint64_t module_generation = 0;
     uint16_t frame_count = 0;
-    std::array<uintptr_t, kMaxAsyncRawFrames> pcs{};
+    // Deliberately left uninitialized: zero-initializing 2KB on every
+    // allocation dominated the Fast hot path and evicted the traced
+    // application's own working set from L1. Only the first `frame_count`
+    // entries are ever defined, and every reader is bounded by it.
+    std::array<uintptr_t, kMaxAsyncRawFrames> pcs;
 
     bool operator==(const RawStackRecord& other) const;
     bool HasFrames() const { return frame_count != 0; }
@@ -80,6 +89,13 @@ struct SymbolizedFrame {
 // Capture a bounded raw stack without module or symbol lookup. Fast uses the
 // compiler unwinder when the configure-time capability probe succeeds;
 // Accurate selects an explicit OS backend and preserves useful partial frames.
+//
+// CaptureStackInto() is the allocation-hot-path entry point: it fills a record
+// the caller already owns so no 2KB record is copied or returned by value.
+void CaptureStackInto(
+        RawStackRecord* record, StackCaptureMode mode = StackCaptureMode::Fast,
+        size_t max_frames = 128, size_t skipped_frames = 0);
+
 RawStackRecord CaptureStack(
         StackCaptureMode mode = StackCaptureMode::Fast, size_t max_frames = 128,
         size_t skipped_frames = 0);

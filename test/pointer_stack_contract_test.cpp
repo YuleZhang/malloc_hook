@@ -6,22 +6,33 @@
 #include "PointerData.h"
 
 int main() {
+    // FrameKeyType borrows the PC array rather than owning a fixed-size copy,
+    // so callers supply the storage the key points at.
+    const uintptr_t first_pcs[2] = {0x1000, 0x2000};
+    const uintptr_t other_pcs[2] = {0x1000, 0x3000};
+
     FrameKeyType first;
     first.frame_count = 2;
-    first.pcs[0] = 0x1000;
-    first.pcs[1] = 0x2000;
+    first.pcs = first_pcs;
     first.module_generation = 7;
     FrameKeyType duplicate = first;
     FrameKeyType other_generation = first;
     other_generation.module_generation = 8;
     FrameKeyType other_frames = first;
-    other_frames.pcs[1] = 0x3000;
+    other_frames.pcs = other_pcs;
 
     assert(first == duplicate);
     assert(!(first == other_generation));
     assert(!(first == other_frames));
     assert(std::hash<FrameKeyType>{}(first) ==
            std::hash<FrameKeyType>{}(duplicate));
+    // A key comparing equal must do so through the borrowed contents, not the
+    // pointer identity.
+    FrameKeyType aliased = first;
+    const uintptr_t copied_pcs[2] = {first_pcs[0], first_pcs[1]};
+    aliased.pcs = copied_pcs;
+    assert(aliased.pcs != first.pcs);
+    assert(first == aliased);
 
     RawStackRecord partial;
     partial.capture_state = StackCaptureState::Partial;
@@ -48,9 +59,11 @@ int main() {
             .module_name = "libsample.so",
             .function_name = "sample"});
 
+    auto raw_frames = std::make_shared<const std::vector<uintptr_t>>(
+            std::vector<uintptr_t>{first_pcs[0], first_pcs[1]});
     FrameInfoType frame_info{
             .references = 1,
-            .frames = {first.pcs[0], first.pcs[1]},
+            .frames = raw_frames,
             .module_generation = 7,
             .capture_state = partial.capture_state,
             .terminal_error = partial.terminal_error};
@@ -60,6 +73,7 @@ int main() {
             .size = 64,
             .mem_type = HOST,
             .frame_info = &frame_info,
+            .raw_frames = raw_frames,
             .backtrace_info = symbols,
             .capture_state = partial.capture_state,
             .terminal_error = partial.terminal_error};
@@ -67,5 +81,9 @@ int main() {
     assert(report.backtrace_info->front().module_name == "libsample.so");
     assert(report.capture_state == StackCaptureState::Partial);
     assert(report.terminal_error == 5);
+    // A peak snapshot must share the PC array with the live entry instead of
+    // deep-copying it.
+    assert(report.raw_frames.get() == frame_info.frames.get());
+    assert(report.raw_frames->size() == 2);
     return 0;
 }

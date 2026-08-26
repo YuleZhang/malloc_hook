@@ -15,7 +15,7 @@ if(MALLOC_HOOK_TARGET_OS STREQUAL "android")
     target_link_libraries(helper PRIVATE unwindstack)
 endif()
 target_compile_definitions(helper PRIVATE
-                            "MALLOC_HOOK_ENABLE_RESOURCE_TRACKING=$<BOOL:${MALLOC_HOOK_ENABLE_RESOURCE_TRACKING}>")
+                            "MALLOC_HOOK_ENABLE_DMA_CAPTURE=$<BOOL:${MALLOC_HOOK_ENABLE_DMA_CAPTURE}>")
 if (CMAKE_CXX_COMPILER_ID STREQUAL Clang)
     target_compile_options(helper PRIVATE -fno-c++-static-destructors)
 endif ()

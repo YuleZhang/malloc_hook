@@ -21,7 +21,7 @@
 ```sh
 cmake -S . -B build-host \
   -DCMAKE_BUILD_TYPE=Release \
-  -DMALLOC_HOOK_ENABLE_RESOURCE_TRACKING=OFF
+  -DMALLOC_HOOK_ENABLE_DMA_CAPTURE=OFF
 cmake --build build-host --target alloc_hook
 ctest --test-dir build-host --output-on-failure
 cmake --install build-host --prefix "$PWD"

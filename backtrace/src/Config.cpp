@@ -18,8 +18,6 @@ static constexpr const char DEFAULT_BACKTRACE_DUMP_PREFIX[] =
 static constexpr size_t DEFAULT_OHOS_BACKTRACE_MIN_SIZE_BYTES = 40960;
 static constexpr char kSamplingIntervalBytesEnv[] =
         "ALLOC_HOOK_SAMPLING_INTERVAL_BYTES";
-static constexpr char kSamplingIntervalCompatEnv[] =
-        "ALLOC_HOOK_SAMPLING_INTERVAL";
 static constexpr char kFastCaptureIntervalEnv[] =
         "ALLOC_HOOK_FAST_CAPTURE_INTERVAL_BYTES";
 static constexpr char kDumpPrefixEnv[] = "ALLOC_HOOK_DUMP_PREFIX";
@@ -90,9 +88,6 @@ bool Config::Init() {
         fast_capture_interval_bytes_ = fast_capture_interval;
     }
     const char* sampling_interval_env = getenv(kSamplingIntervalBytesEnv);
-    if (sampling_interval_env == nullptr) {
-        sampling_interval_env = getenv(kSamplingIntervalCompatEnv);
-    }
     size_t sampling_interval = 0;
     if (ParseValue(sampling_interval_env, &sampling_interval) &&
         sampling_interval > 1) {

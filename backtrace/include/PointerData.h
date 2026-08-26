@@ -23,10 +23,16 @@
 
 enum MemType { HOST, MMAP, DMA };
 
+// Dedup key for a captured raw stack. It deliberately *borrows* the PC array
+// rather than owning a fixed-size copy: an inline std::array<uintptr_t, 256>
+// made this a 2KB object that was zero-initialized on every allocation and
+// stored at 2KB per unique-stack map node. Lookups point `pcs` at the
+// freshly captured record on the stack; stored keys point at the PC vector
+// owned by the matching frames_ entry, which outlives the key.
 struct FrameKeyType {
     uint16_t frame_count = 0;
     uint64_t module_generation = 0;
-    std::array<uintptr_t, kMaxAsyncRawFrames> pcs{};
+    const uintptr_t* pcs = nullptr;
 
     bool operator==(const FrameKeyType& comp) const {
         if (frame_count != comp.frame_count ||
@@ -63,9 +69,10 @@ struct hash<FrameKeyType> {
 
 struct FrameInfoType {
     size_t references = 0;
-    std::vector<uintptr_t> frames;
-    std::vector<uintptr_t> relative_pcs;
-    std::vector<std::string> module_names;
+    // Shared so a peak snapshot can retain the PCs with a refcount bump
+    // instead of a deep copy, and so a snapshot stays valid after the live
+    // stack is released.
+    std::shared_ptr<const std::vector<uintptr_t>> frames;
     uint64_t module_generation = 0;
     StackCaptureState capture_state = StackCaptureState::Empty;
     uint8_t terminal_error = 0;
@@ -96,9 +103,9 @@ struct ListInfoType {
     size_t size;
     MemType mem_type;
     FrameInfoType* frame_info;
-    std::vector<uintptr_t> raw_frames;
-    std::vector<uintptr_t> relative_pcs;
-    std::vector<std::string> module_names;
+    // Refcount bump, not a deep copy: a peak snapshot must not duplicate the
+    // PC array (or per-frame module strings) for every live allocation.
+    std::shared_ptr<const std::vector<uintptr_t>> raw_frames;
     std::shared_ptr<std::vector<SymbolizedFrame>> backtrace_info;
     StackCaptureState capture_state = StackCaptureState::Empty;
     uint8_t terminal_error = 0;
@@ -174,6 +181,11 @@ private:
     size_t next_peak_record_threshold_;
     size_t peak_record_step_bytes_;
     std::vector<ListInfoType> peak_list;
+    // Exact live totals at the moment peak_list was taken. The snapshot only
+    // holds allocations that carry a stack, so report totals must come from
+    // these counters rather than from summing the list.
+    size_t peak_list_host = 0;
+    size_t peak_list_dma = 0;
     static constexpr size_t kPointerFilterWords = 1 << 13;
     std::array<std::atomic<uint64_t>, kPointerFilterWords> pointer_filter_{};
 
