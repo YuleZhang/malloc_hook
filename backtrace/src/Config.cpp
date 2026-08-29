@@ -11,6 +11,9 @@
 #endif
 
 #include "Config.h"
+#include "ObservedMemory.h"
+
+extern "C" char** environ;
 
 static constexpr size_t DEFAULT_BACKTRACE_FRAMES = 128;
 static constexpr const char DEFAULT_BACKTRACE_DUMP_PREFIX[] =
@@ -21,6 +24,17 @@ static constexpr char kSamplingIntervalBytesEnv[] =
 static constexpr char kFastCaptureIntervalEnv[] =
         "ALLOC_HOOK_FAST_CAPTURE_INTERVAL_BYTES";
 static constexpr char kDumpPrefixEnv[] = "ALLOC_HOOK_DUMP_PREFIX";
+static constexpr char kPeakSampleIntervalEnv[] = "ALLOC_HOOK_PEAK_SAMPLE_MS";
+// A host framework that samples this process's memory publishes the interval it
+// uses under a variable whose name ends in this suffix. Adopting that interval
+// makes the hook snapshot the stacks at the same instant such a framework calls
+// the peak, which is the only way the two numbers describe the same moment.
+//
+// Matched by suffix rather than by full name so that no downstream framework or
+// product name is embedded in this repository, and so that every prefix variant
+// of the same variable is picked up.
+static constexpr char kExternalSampleIntervalSuffix[] =
+        "AUTO_SHOW_MEM_USE_DURATION_MS";
 
 static int DefaultBacktraceSignal() {
 #if defined(__BIONIC__)
@@ -67,6 +81,34 @@ static bool ParseValue(const char* value, size_t* parsed_value) {
     }
     *parsed_value = static_cast<size_t>(long_value);
     return true;
+}
+
+// Finds the sampling interval published by a host framework, if any. Only a
+// strictly positive value counts: such frameworks use 0 to mean "not sampling",
+// in which case there is no external instant to align with.
+static bool FindExternalSampleIntervalMs(size_t* interval_ms) {
+    if (environ == nullptr) {
+        return false;
+    }
+    const size_t suffix_length = strlen(kExternalSampleIntervalSuffix);
+    for (char** entry = environ; *entry != nullptr; ++entry) {
+        const char* equals = strchr(*entry, '=');
+        if (equals == nullptr) {
+            continue;
+        }
+        const size_t name_length = static_cast<size_t>(equals - *entry);
+        if (name_length < suffix_length) {
+            continue;
+        }
+        if (strncmp(*entry + name_length - suffix_length,
+                    kExternalSampleIntervalSuffix, suffix_length) != 0) {
+            continue;
+        }
+        if (ParseValue(equals + 1, interval_ms) && *interval_ms > 0) {
+            return true;
+        }
+    }
+    return false;
 }
 
 bool Config::Init() {
@@ -118,6 +160,22 @@ bool Config::Init() {
     }
     // 单位是 MB
     backtrace_dump_peak_val_ *= 1024 * 1024;
+
+    peak_record_step_bytes_ = DefaultPeakStepBytes();
+    size_t peak_step_mb = 0;
+    if (ParseValue(getenv("DUMP_PEAK_STEP_MB"), &peak_step_mb)) {
+        peak_record_step_bytes_ = peak_step_mb * 1024 * 1024;
+    }
+
+    // Peak criterion. Left on tracked allocation bytes unless something is
+    // sampling this process's real footprint, because only then is there an
+    // external instant worth aligning the snapshot with.
+    observed_peak_sample_ms_ = 0;
+    size_t peak_sample_ms = 0;
+    if (ParseValue(getenv(kPeakSampleIntervalEnv), &peak_sample_ms) ||
+        FindExternalSampleIntervalMs(&peak_sample_ms)) {
+        observed_peak_sample_ms_ = static_cast<unsigned>(peak_sample_ms);
+    }
 
     // 通过信号插入 check point
     options_ |= DUMP_ON_SINGAL;

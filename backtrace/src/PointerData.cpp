@@ -25,10 +25,6 @@
 
 constexpr size_t kBacktraceExitIndex = 0;
 constexpr size_t kBacktraceEmptyIndex = 1;
-constexpr size_t kDefaultPeakRecordStepBytes = 12 * 1024 * 1024;
-// Floor for the scaled snapshot interval, so a very small peak cannot make the
-// snapshot refresh on essentially every allocation.
-constexpr size_t kMinPeakRecordStepBytes = 64 * 1024;
 // The first frames belong to the capture plumbing itself.  Keep this policy
 // at the hook boundary so reports start at the allocation caller while both
 // Fast and Accurate backends retain the same neutral contract.
@@ -42,19 +38,6 @@ void AsyncStackComplete(void* opaque, const StackResult& result) {
     }
 }
 }  // namespace
-
-static size_t ParsePeakStepBytes() {
-    const char* value = getenv("DUMP_PEAK_STEP_MB");
-    if (value == nullptr) {
-        return kDefaultPeakRecordStepBytes;
-    }
-    char* end = nullptr;
-    long step_mb = strtol(value, &end, 10);
-    if (end == value || *end != '\0' || step_mb < 0) {
-        return kDefaultPeakRecordStepBytes;
-    }
-    return static_cast<size_t>(step_mb) * 1024 * 1024;
-}
 
 static inline bool ShouldBacktraceAllocSize(size_t size_bytes) {
     static bool only_backtrace_specific_sizes =
@@ -284,61 +267,6 @@ private:
 // frames that survive inlining.
 void SelfModuleProbe() {}
 
-// Reads this process's own resident-set breakdown.
-//
-// Tracked allocation bytes can only ever explain the anonymous part of RSS.
-// Recording the split next to the tracked totals makes the difference
-// attributable instead of leaving the reader to guess whether the hook missed
-// allocations or is simply being compared against file-backed pages it can
-// never see.
-struct RssBreakdown {
-    size_t vm_rss_kb = 0;
-    size_t anon_kb = 0;
-    size_t file_kb = 0;
-    size_t shmem_kb = 0;
-    bool valid = false;
-};
-
-size_t ReadStatusField(const char* text, const char* key) {
-    const char* found = strstr(text, key);
-    if (found == nullptr) {
-        return 0;
-    }
-    found += strlen(key);
-    while (*found == ' ' || *found == '\t') {
-        ++found;
-    }
-    size_t value = 0;
-    while (*found >= '0' && *found <= '9') {
-        value = value * 10 + static_cast<size_t>(*found - '0');
-        ++found;
-    }
-    return value;
-}
-
-RssBreakdown ReadSelfRss() {
-    RssBreakdown rss;
-    const int fd = open("/proc/self/status", O_RDONLY | O_CLOEXEC);
-    if (fd < 0) {
-        return rss;
-    }
-    char buffer[8192];
-    size_t used = 0;
-    ssize_t bytes;
-    while (used + 1 < sizeof(buffer) &&
-           (bytes = read(fd, buffer + used, sizeof(buffer) - used - 1)) > 0) {
-        used += static_cast<size_t>(bytes);
-    }
-    close(fd);
-    buffer[used] = '\0';
-    rss.vm_rss_kb = ReadStatusField(buffer, "VmRSS:");
-    rss.anon_kb = ReadStatusField(buffer, "RssAnon:");
-    rss.file_kb = ReadStatusField(buffer, "RssFile:");
-    rss.shmem_kb = ReadStatusField(buffer, "RssShmem:");
-    rss.valid = rss.vm_rss_kb != 0;
-    return rss;
-}
-
 // Resident bytes grouped by backing mapping, read from /proc/self/smaps.
 //
 // This is the only meaningful attribution for the parts of RSS that allocation
@@ -484,7 +412,12 @@ bool PointerData::Initialize(const Config& config) {
         word.store(0, std::memory_order_relaxed);
     }
     next_peak_record_threshold_ = config.backtrace_dump_peak_val();
-    peak_record_step_bytes_ = ParsePeakStepBytes();
+    peak_record_step_bytes_ = config.peak_record_step_bytes();
+    peak_snapshot_source_ = PeakSnapshotSource::None;
+    peak_observed_rss_ = 0;
+    peak_observed_dma_ = 0;
+    peak_observed_gpu_ = 0;
+    observed_peak_active_.store(false, std::memory_order_relaxed);
     // No in-process symbol/module resolver is started on any platform. Module
     // identity and relative PCs are recovered at report time from
     // /proc/self/maps, which is uniform across targets, costs one pass per
@@ -569,6 +502,30 @@ void PointerData::MaybeRecordPeakSnapshotLocked() {
         peak_tot <= next_peak_record_threshold_) {
         return;
     }
+    // Once the evaluator-visible footprint has produced a snapshot, it owns the
+    // criterion. Overwriting it here would move the snapshot back to an instant
+    // that only the hook's own counters call a peak.
+    if (observed_peak_active_.load(std::memory_order_relaxed)) {
+        return;
+    }
+    TakePeakSnapshotLocked(PeakSnapshotSource::Tracked, nullptr, nullptr);
+    if (peak_record_step_bytes_ == 0) {
+        next_peak_record_threshold_ = peak_tot;
+    } else {
+        next_peak_record_threshold_ =
+                NextPeakThreshold(peak_tot, peak_record_step_bytes_);
+    }
+}
+
+// Caller holds pointer_mutex_.
+void PointerData::TakePeakSnapshotLocked(
+        PeakSnapshotSource source, const ObservedMemSample* observed,
+        PeakProcContext* proc) {
+    PeakProcContext collected;
+    if (proc == nullptr) {
+        CollectPeakProcContext(&collected);
+        proc = &collected;
+    }
     std::lock_guard<std::mutex> frame_guard(frame_mutex_);
     std::vector<ListInfoType> next_peak_list;
     // Snapshot only allocations that actually carry a stack. Including
@@ -584,13 +541,23 @@ void PointerData::MaybeRecordPeakSnapshotLocked() {
     peak_list_host = current_host;
     peak_list_dma = current_dma;
     peak_list_tot = current_used;
-    const RssBreakdown rss = ReadSelfRss();
-    if (rss.valid) {
-        peak_rss_kb = rss.vm_rss_kb;
-        peak_rss_anon_kb = rss.anon_kb;
-        peak_rss_file_kb = rss.file_kb;
-        peak_rss_shmem_kb = rss.shmem_kb;
-        CollectMappingRss(&peak_mappings, &peak_map_totals, 12);
+    peak_snapshot_source_ = source;
+    if (observed != nullptr) {
+        peak_observed_rss_ = observed->rss_bytes;
+        peak_observed_dma_ = observed->dma_bytes;
+        peak_observed_gpu_ = observed->gpu_bytes;
+    } else {
+        peak_observed_rss_ = 0;
+        peak_observed_dma_ = 0;
+        peak_observed_gpu_ = 0;
+    }
+    if (proc->rss.valid) {
+        peak_rss_kb = proc->rss.vm_rss_kb;
+        peak_rss_anon_kb = proc->rss.anon_kb;
+        peak_rss_file_kb = proc->rss.file_kb;
+        peak_rss_shmem_kb = proc->rss.shmem_kb;
+        peak_mappings = std::move(proc->mappings);
+        peak_map_totals = proc->totals;
     }
     peak_live_pointers = pointers_.size();
     peak_pointer_buckets = pointers_.bucket_count();
@@ -601,28 +568,32 @@ void PointerData::MaybeRecordPeakSnapshotLocked() {
             peak_stack_pc_bytes += frame.second.frames->size() * sizeof(uintptr_t);
         }
     }
-    if (peak_record_step_bytes_ == 0) {
-        next_peak_record_threshold_ = peak_tot;
-    } else {
-        // Scale the refresh interval to the peak reached so far. A fixed step
-        // means a process whose peak never grows by another whole step keeps its
-        // first, much lower snapshot: with the 12MB default, a 6.5MB peak was
-        // snapshotted once at 1MB and never again, and a peak reached by mremap
-        // growth was missed entirely. On a large peak this still evaluates to
-        // the configured step, so snapshot cost there is unchanged. The divisor
-        // trades snapshot proximity to the peak against how often the walk runs:
-        // /4 keeps the snapshot within ~20% of the peak, which is representative
-        // for attribution, while process_peak below always carries the exact
-        // numbers.
-        size_t increment = peak_tot / 4;
-        if (increment > peak_record_step_bytes_) {
-            increment = peak_record_step_bytes_;
-        }
-        if (increment < kMinPeakRecordStepBytes) {
-            increment = kMinPeakRecordStepBytes;
-        }
-        next_peak_record_threshold_ = peak_tot + increment;
+}
+
+void PointerData::CollectPeakProcContext(PeakProcContext* out) {
+    out->rss = ReadSelfRss();
+    if (out->rss.valid) {
+        CollectMappingRss(&out->mappings, &out->totals, 12);
     }
+    out->filled = true;
+}
+
+void PointerData::RecordObservedPeak(const ObservedMemSample& sample) {
+    if (g_debug == nullptr || !(g_debug->config().options() & RECORD_MEMORY_PEAK)) {
+        return;
+    }
+    // Read before the locks are taken. This runs on the sampler thread, so the
+    // page-table walk costs the sampler its cadence rather than costing every
+    // allocating thread a stall.
+    PeakProcContext proc;
+    CollectPeakProcContext(&proc);
+    std::lock_guard<std::mutex> pointer_guard(pointer_mutex_);
+    // Claimed before the snapshot is attempted, not after: a snapshot skipped
+    // because nothing carries a stack yet must still stop the allocation path
+    // from installing a tracked-bytes peak that the report would then present
+    // as if it were the observed one.
+    observed_peak_active_.store(true, std::memory_order_relaxed);
+    TakePeakSnapshotLocked(PeakSnapshotSource::Observed, &sample, &proc);
 }
 
 void PointerData::Add(
@@ -1065,6 +1036,90 @@ void PointerData::DumpLiveToFile(int fd, bool dump_peak) {
                 peak_host / 1024.0 / 1024.0, peak_dma / 1024.0 / 1024.0,
                 peak_tot / 1024.0 / 1024.0, peak_list_tot / 1024.0 / 1024.0,
                 peak_record_step_bytes_ / 1024.0 / 1024.0);
+        // Which instant the stack list above actually describes.
+        //
+        // Without this the report cannot be lined up against an external
+        // sampler's series: two peaks measured on different criteria are
+        // routinely hundreds of milliseconds and tens of MB apart, and a reader
+        // comparing them would attribute the gap to missed allocations.
+        const ObservedSamplerStats sampler = ObservedPeakSamplerInstance().stats();
+        dprintf(fd, "peak_criterion: %s\n",
+                peak_snapshot_source_ == PeakSnapshotSource::Observed
+                        ? "observed_host_rss_plus_dma_plus_gpu (from /proc, aligned "
+                          "with an external sampler)"
+                        : "tracked_allocation_bytes");
+        if (peak_snapshot_source_ == PeakSnapshotSource::Observed) {
+            dprintf(fd,
+                    "observed_peak(at_snapshot): rss=%fMB dma=%fMB gpu=%fMB "
+                    "total=%fMB\n",
+                    peak_observed_rss_ / 1024.0 / 1024.0,
+                    peak_observed_dma_ / 1024.0 / 1024.0,
+                    peak_observed_gpu_ / 1024.0 / 1024.0,
+                    (peak_observed_rss_ + peak_observed_dma_ + peak_observed_gpu_) /
+                            1024.0 / 1024.0);
+        }
+        if (sampler.samples != 0) {
+            // The maximum of the sum, with every part as it stood at that
+            // instant, is the figure an external sampler reports as the process
+            // peak. The independent maxima are printed next to it because each
+            // part also peaks on its own, at a different moment.
+            dprintf(fd,
+                    "observed_peak(max_of_sum): rss=%fMB dma=%fMB gpu=%fMB "
+                    "total=%fMB (dma_by_fd=%fMB dma_by_mapping_only=%fMB)\n",
+                    sampler.peak_total_rss_bytes / 1024.0 / 1024.0,
+                    sampler.peak_total_dma_bytes / 1024.0 / 1024.0,
+                    sampler.peak_total_gpu_bytes / 1024.0 / 1024.0,
+                    sampler.peak_total_bytes / 1024.0 / 1024.0,
+                    sampler.peak_total_dma_fd_bytes / 1024.0 / 1024.0,
+                    sampler.peak_total_dma_map_bytes / 1024.0 / 1024.0);
+            dprintf(fd,
+                    "observed_peak(independent_max): rss=%fMB dma=%fMB gpu=%fMB\n",
+                    sampler.max_rss_bytes / 1024.0 / 1024.0,
+                    sampler.max_dma_bytes / 1024.0 / 1024.0,
+                    sampler.max_gpu_bytes / 1024.0 / 1024.0);
+            // Sampling cost and snapshot cost are reported apart: the first
+            // bounds how much the sampler perturbs the run, the second is paid
+            // only when the peak actually grows. achieved_ms is the cadence the
+            // run really got, which is what the requested interval degrades to
+            // once the reads cost more than the interval.
+            dprintf(fd,
+                    "observed_sampler: interval_ms=%u achieved_ms=%f "
+                    "dma_source=%s gpu_source=%s samples=%zu valid=%zu "
+                    "snapshots=%zu "
+                    "read_mean_us=%llu read_max_us=%llu status_mean_us=%llu "
+                    "fd_mean_us=%llu maps_mean_us=%llu maps_passes=%zu "
+                    "maps_only_max=%fMB gpu_mean_us=%llu gpu_passes=%zu "
+                    "gpu_max=%fMB snapshot_mean_us=%llu "
+                    "snapshot_max_us=%llu dedup_overflow=%s\n",
+                    sampler.interval_ms,
+                    sampler.samples > 1
+                            ? sampler.span_us / 1000.0 / (sampler.samples - 1)
+                            : 0.0,
+                    DmaSourceName(sampler.dma_source),
+                    GpuMmapSourceName(sampler.gpu_source), sampler.samples,
+                    sampler.valid_samples, sampler.snapshots,
+                    static_cast<unsigned long long>(
+                            sampler.total_sample_us / sampler.samples),
+                    static_cast<unsigned long long>(sampler.max_sample_us),
+                    static_cast<unsigned long long>(
+                            sampler.total_status_us / sampler.samples),
+                    static_cast<unsigned long long>(
+                            sampler.total_fd_us / sampler.samples),
+                    static_cast<unsigned long long>(
+                            sampler.total_map_us / sampler.samples),
+                    sampler.map_passes,
+                    sampler.max_map_only_bytes / 1024.0 / 1024.0,
+                    static_cast<unsigned long long>(
+                            sampler.total_gpu_us / sampler.samples),
+                    sampler.gpu_passes,
+                    sampler.max_gpu_bytes_seen / 1024.0 / 1024.0,
+                    static_cast<unsigned long long>(
+                            sampler.snapshots != 0
+                                    ? sampler.total_snapshot_us / sampler.snapshots
+                                    : 0),
+                    static_cast<unsigned long long>(sampler.max_snapshot_us),
+                    sampler.dedup_overflowed ? "yes" : "no");
+        }
     }
     // Accounting reference: tracked host bytes can only ever explain the
     // anonymous part of RSS. rss_file is code/data pages of the loaded ELFs and
@@ -1296,6 +1351,18 @@ void PointerData::DumpPeakInfo() {
     printf("host peak used: %fMB, dma peak used %fMB, total peak used: %fMB\n\n",
            peak_host / 1024.0 / 1024.0, peak_dma / 1024.0 / 1024.0,
            peak_tot / 1024.0 / 1024.0);
+    const ObservedSamplerStats sampler = ObservedPeakSamplerInstance().stats();
+    if (sampler.samples != 0) {
+        // Printed next to the tracked totals because they are different
+        // quantities: the line above is bytes this process asked for, this one
+        // is what the kernel says it holds.
+        printf("observed peak (host rss + dma, from /proc every %ums): "
+               "rss %fMB + dma %fMB = %fMB\n\n",
+               sampler.interval_ms,
+               sampler.peak_total_rss_bytes / 1024.0 / 1024.0,
+               sampler.peak_total_dma_bytes / 1024.0 / 1024.0,
+               sampler.peak_total_bytes / 1024.0 / 1024.0);
+    }
     printf("async_stack_stats: %s\n",
            FormatAsyncStackStats(AsyncStats()).c_str());
 }
