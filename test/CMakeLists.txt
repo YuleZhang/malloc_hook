@@ -17,6 +17,14 @@ target_compile_features(hook_source_policy_test PRIVATE cxx_std_17)
 target_include_directories(hook_source_policy_test PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../backtrace/include)
 
+# Config.cpp reaches for <bionic/reserved_signals.h> to pick the default dump
+# signal. That header is AOSP-internal and is not in the NDK sysroot; the
+# library target resolves it through the vendored copy under unwindstack/. Any
+# target that compiles Config.cpp for Bionic needs the same path, otherwise a
+# cross build fails on a header rather than on anything under test.
+set(MALLOC_HOOK_VENDORED_BIONIC_INCLUDE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../unwindstack)
+
 add_executable(config_capture_mode_test
     config_capture_mode_test.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../backtrace/src/Config.cpp
@@ -25,6 +33,10 @@ add_executable(config_capture_mode_test
 target_compile_features(config_capture_mode_test PRIVATE cxx_std_17)
 target_include_directories(config_capture_mode_test PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../backtrace/include)
+if(ANDROID)
+    target_include_directories(config_capture_mode_test PRIVATE
+        ${MALLOC_HOOK_VENDORED_BIONIC_INCLUDE})
+endif()
 target_link_libraries(config_capture_mode_test PRIVATE
     ${CMAKE_DL_LIBS} Threads::Threads)
 
@@ -39,6 +51,10 @@ add_executable(observed_memory_test
 target_compile_features(observed_memory_test PRIVATE cxx_std_17)
 target_include_directories(observed_memory_test PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../backtrace/include)
+if(ANDROID)
+    target_include_directories(observed_memory_test PRIVATE
+        ${MALLOC_HOOK_VENDORED_BIONIC_INCLUDE})
+endif()
 target_link_libraries(observed_memory_test PRIVATE
     ${CMAKE_DL_LIBS} Threads::Threads)
 add_test(NAME observed_memory COMMAND observed_memory_test)
@@ -206,21 +222,28 @@ if(MALLOC_HOOK_HAVE_GTEST)
         target_link_libraries(capture_routing_test PRIVATE unwindstack)
     endif()
 
-    add_executable(capture_fallback_test
-        capture_routing_test.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/../backtrace/src/UnwindBacktrace.cpp)
-    target_compile_features(capture_fallback_test PRIVATE cxx_std_17)
-    target_include_directories(capture_fallback_test PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/../backtrace/include
-        ${CMAKE_CURRENT_SOURCE_DIR}/../unwindstack/include)
-    target_compile_definitions(capture_fallback_test PRIVATE
-        MALLOC_HOOK_HAVE_COMPILER_UNWIND=0
-        MALLOC_HOOK_TARGET_OS_LINUX=1
-        MALLOC_HOOK_STACK_CAPTURE_TESTING=1)
-    target_link_libraries(capture_fallback_test PRIVATE
-        gtest_main ${CMAKE_DL_LIBS} Threads::Threads)
+    # Compiles the Linux capture path on purpose (MALLOC_HOOK_TARGET_OS_LINUX=1)
+    # to exercise the no-compiler-unwind fallback. That path calls backtrace()
+    # from <execinfo.h>, which neither Bionic nor musl provides, so this gate is
+    # host-only by construction: cross-building it for a device target fails to
+    # compile without saying anything about the code under test.
+    if(NOT ANDROID AND NOT OHOS)
+        add_executable(capture_fallback_test
+            capture_routing_test.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/../backtrace/src/UnwindBacktrace.cpp)
+        target_compile_features(capture_fallback_test PRIVATE cxx_std_17)
+        target_include_directories(capture_fallback_test PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/../backtrace/include
+            ${CMAKE_CURRENT_SOURCE_DIR}/../unwindstack/include)
+        target_compile_definitions(capture_fallback_test PRIVATE
+            MALLOC_HOOK_HAVE_COMPILER_UNWIND=0
+            MALLOC_HOOK_TARGET_OS_LINUX=1
+            MALLOC_HOOK_STACK_CAPTURE_TESTING=1)
+        target_link_libraries(capture_fallback_test PRIVATE
+            gtest_main ${CMAKE_DL_LIBS} Threads::Threads)
+        add_test(NAME capture_fallback COMMAND capture_fallback_test)
+    endif()
 
     add_test(NAME async_stack_pipeline COMMAND async_stack_pipeline_test)
     add_test(NAME capture_routing COMMAND capture_routing_test)
-    add_test(NAME capture_fallback COMMAND capture_fallback_test)
 endif()
