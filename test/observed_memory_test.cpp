@@ -533,6 +533,96 @@ void TestMapPassGate() {
     assert(cache.refreshes - before <= 8);
 }
 
+void TestGpuNodePathMatching() {
+    // The path is matched as the region's whole sixth field, not as a substring
+    // of the line, because a substring test accepts regions that are not the
+    // device at all.
+
+    // An anonymous region named through PR_SET_VMA_ANON_NAME. The name is chosen
+    // by whoever mapped it and lands verbatim in the header line, so a substring
+    // test counts it -- and being a sparse reservation with Rss 0, it is counted
+    // in full. 512 MB of pure fiction, which is precisely the over-report the
+    // scan excludes Mali to avoid.
+    char anon_named[] =
+            "7000000000-7020000000 rw-p 00000000 00:00 0 "
+            "[anon:/dev/kgsl-3d0 shadow]\n"
+            "Rss:                   0 kB\n";
+    assert(GpuMmapBytesFromSmapsText(anon_named) == 0);
+
+    // An ordinary file whose name merely starts like the node.
+    char shim[] =
+            "7a1c000000-7a1c0f0000 r--p 00000000 fe:0b 4242 "
+            "/dev/kgsl-3d0-shim.bin\n"
+            "Rss:                   0 kB\n";
+    assert(GpuMmapBytesFromSmapsText(shim) == 0);
+
+    // A directory of that name, the case the earlier prefix match already
+    // rejected; kept so a future loosening cannot reintroduce it silently.
+    char kgsl_dir[] =
+            "72cba64000-72cbb64000 r--p 00000000 fe:0b 41709180 "
+            "/vendor/lib64/kgsl/libfoo.so\n"
+            "Rss:                  64 kB\n";
+    assert(GpuMmapBytesFromSmapsText(kgsl_dir) == 0);
+
+    // The real node still counts, in both spellings and with the suffix the
+    // kernel appends once the node has been unlinked.
+    char node[] =
+            "7a1c000000-7a1c800000 rw-s 00000000 00:0d 12345 /dev/kgsl-3d0\n"
+            "Rss:                   0 kB\n";
+    assert(GpuMmapBytesFromSmapsText(node) == 8u * 1024 * 1024);
+    char parent_node[] =
+            "7a1c000000-7a1c800000 rw-s 00000000 00:0d 12345 /dev/kgsl\n"
+            "Rss:                   0 kB\n";
+    assert(GpuMmapBytesFromSmapsText(parent_node) == 8u * 1024 * 1024);
+    char deleted[] =
+            "7a1c000000-7a1c800000 rw-s 00000000 00:0d 12345 "
+            "/dev/kgsl-3d0 (deleted)\n"
+            "Rss:                   0 kB\n";
+    assert(GpuMmapBytesFromSmapsText(deleted) == 8u * 1024 * 1024);
+
+    // A malformed Rss value drops the region. Counting it in full instead would
+    // read a parse failure as "nothing is resident", which is the most
+    // inflationary reading available.
+    char bad_rss[] =
+            "7a1c000000-7a1c800000 rw-s 00000000 00:0d 12345 /dev/kgsl-3d0\n"
+            "Rss:                  ?? kB\n";
+    assert(GpuMmapBytesFromSmapsText(bad_rss) == 0);
+    // ...and the dropped region must not leave the scan open, or the *next*
+    // field line would be taken for its residency.
+    char bad_rss_then_field[] =
+            "7a1c000000-7a1c800000 rw-s 00000000 00:0d 12345 /dev/kgsl-3d0\n"
+            "Rss:                  ?? kB\n"
+            "Rss:                   0 kB\n";
+    assert(GpuMmapBytesFromSmapsText(bad_rss_then_field) == 0);
+}
+
+void TestGpuReadFailurePath() {
+    // A path that cannot be opened is how a run reaches the read-failure branch
+    // without a device.
+    size_t bytes = 12345;
+    assert(!ReadGpuMmapBytesFrom("/nonexistent/smaps", &bytes));
+
+    // Reading a file that exists but holds no GPU region is a measured zero, and
+    // must be reported as success rather than as "no accounting available".
+    const std::string path = WriteTempFile(
+            "observed_gpu_probe",
+            "5566000000-5566100000 rw-p 00000000 00:00 0 \n"
+            "Rss:                1024 kB\n");
+    bytes = 999;
+    assert(ReadGpuMmapBytesFrom(path.c_str(), &bytes));
+    assert(bytes == 0);
+
+    // With a device region present the same reader returns it.
+    const std::string gpu_path = WriteTempFile(
+            "observed_gpu_probe_node",
+            "7a1c000000-7a1c800000 rw-s 00000000 00:0d 12345 /dev/kgsl-3d0\n"
+            "Rss:                   0 kB\n");
+    assert(ReadGpuMmapBytesFrom(gpu_path.c_str(), &bytes));
+    assert(bytes == 8u * 1024 * 1024);
+    unlink(path.c_str());
+    unlink(gpu_path.c_str());
+}
+
 void TestGpuMmapAccounting() {
     // Verbatim region shape from a Qualcomm/Adreno device: the OpenCL driver
     // mmaps device memory from the kgsl node, and the kernel reports Rss 0 for it
@@ -839,6 +929,8 @@ int main() {
     TestSelfRss();
     TestMapsDmaBufAccounting();
     TestGpuMmapAccounting();
+    TestGpuNodePathMatching();
+    TestGpuReadFailurePath();
     TestGpuPassGate();
     TestIonProcInfoAccounting();
     TestObservedSample();

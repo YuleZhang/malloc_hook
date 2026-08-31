@@ -110,14 +110,23 @@ struct GpuRegionScan {
     size_t region_size = 0;
 };
 
-// Bytes one /proc/self/smaps line contributes. `line` is modified in place and
-// `scan` carries region state between calls. Exposed for the same reason as
-// DmaBytesFromMapsLine: so the exact region text a device emits is covered by a
-// test rather than by inspection.
-size_t GpuMmapBytesFromSmapsLine(char* line, GpuRegionScan* scan);
+// Bytes one /proc/self/smaps line contributes. `scan` carries region state
+// between calls; `line` is only read, never written. Exposed for the same reason
+// as DmaBytesFromMapsLine: so the exact region text a device emits is covered by
+// a test rather than by inspection.
+size_t GpuMmapBytesFromSmapsLine(const char* line, GpuRegionScan* scan);
 
-// The whole-buffer form of the above, for text that is already contiguous.
+// The whole-buffer form of the above. Takes a mutable buffer because it splits
+// `text` on newlines in place.
 size_t GpuMmapBytesFromSmapsText(char* text);
+
+// Sums the GPU regions in a smaps-format file. Returns false only when the file
+// could not be opened, so "opened and found nothing" stays distinguishable from
+// "no accounting available". Exposed with an explicit path for the same reason as
+// ReadIonProcInfoBytesFrom: the kernels that emit these regions are not the
+// kernels a host test runs on, and an unreadable path is how a test reaches the
+// read-failure path at all.
+bool ReadGpuMmapBytesFrom(const char* path, size_t* bytes);
 
 // Carried state for the GPU pass, the same shape and for the same reason as
 // DmaMapCache below: the pass is expensive, so it runs only when it can move the
@@ -139,6 +148,11 @@ struct GpuMmapCache {
     size_t bytes = 0;
     size_t max_bytes = 0;
     size_t refreshes = 0;
+    // Reads that were attempted and failed. Surfaced rather than folded into the
+    // source label: a carried figure stays a real smaps measurement, so the
+    // failure has to be reported as its own fact instead of by downgrading a
+    // number that is still valid.
+    size_t read_failures = 0;
     unsigned samples_since_refresh = 0;
     bool ever_ran = false;
     bool probed_absent = false;
@@ -341,6 +355,9 @@ struct ObservedSamplerStats {
     // cadence is below the requested one.
     size_t gpu_passes = 0;
     size_t max_gpu_bytes_seen = 0;
+    // Attempted reads that failed. A carried figure stays labelled as the smaps
+    // measurement it is, so this is the only place a failure becomes visible.
+    size_t gpu_read_failures = 0;
     // Wall time from the first sample to the last, so the cadence actually
     // achieved is visible next to the one requested.
     uint64_t span_us = 0;
