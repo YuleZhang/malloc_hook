@@ -502,6 +502,134 @@ void TestGpuPassGate() {
 
 }  // namespace
 
+
+// ---------------------------------------------------------------------------
+// Sampler cadence. These pin the properties the fixed-rate scheduler exists to
+// provide; a fixed-delay loop (sleep interval *after* the work) fails all of
+// them, which is what made the cadence drift with process size.
+// ---------------------------------------------------------------------------
+
+void TestCadenceAbsorbsWorkTime() {
+    constexpr uint64_t kInterval = 1000;  // 1ms
+    // The whole point: a sample that took 400us still advances the deadline by
+    // exactly one interval. A fixed-delay loop would produce 1400us here, and
+    // that error is what accumulates without bound.
+    // Up to half the interval, which is exactly the range in which the duty cap
+    // below is satisfiable at the requested cadence.
+    for (uint64_t work : {uint64_t{0}, uint64_t{1}, uint64_t{400}, uint64_t{500}}) {
+        const uint64_t deadline = 10000;
+        const SampleSchedule schedule =
+                NextSampleSchedule(deadline, deadline + work, work, kInterval);
+        assert(schedule.next_deadline_us == deadline + kInterval);
+        assert(schedule.skipped_slots == 0);
+        assert(!schedule.throttled);
+    }
+}
+
+void TestCadenceDoesNotAccumulateDrift() {
+    constexpr uint64_t kInterval = 5000;
+    constexpr uint64_t kAnchor = 1234567;
+    // Work time varies per sample, as it does in a real run. After N samples the
+    // grid must be exactly N intervals on from the anchor, with no residue.
+    const uint64_t work_pattern[] = {10, 900, 2500, 3, 1200, 1};
+    uint64_t deadline = kAnchor;
+    unsigned served = 0;
+    for (unsigned round = 0; round < 60; ++round) {
+        const uint64_t work = work_pattern[round % 6];
+        const SampleSchedule schedule =
+                NextSampleSchedule(deadline, deadline + work, work, kInterval);
+        assert(schedule.skipped_slots == 0);
+        deadline = schedule.next_deadline_us;
+        ++served;
+    }
+    assert(deadline == kAnchor + static_cast<uint64_t>(served) * kInterval);
+}
+
+void TestSlowSampleSkipsSlotsInsteadOfBursting() {
+    constexpr uint64_t kInterval = 1000;
+    const uint64_t deadline = 50000;
+    // The read took 3.5 intervals. The slots that elapsed are skipped, and the
+    // next deadline is in the *future*: firing them back to back would land the
+    // sampler's own cost on a process already failing to absorb it.
+    const uint64_t work = 3500;
+    const uint64_t now = deadline + work;
+    const SampleSchedule schedule =
+            NextSampleSchedule(deadline, now, work, kInterval);
+    assert(schedule.next_deadline_us > now);
+    assert(schedule.skipped_slots > 0);
+}
+
+void TestSchedulerStarvationIsNotReportedAsThrottling() {
+    constexpr uint64_t kInterval = 1000;
+    const uint64_t deadline = 50000;
+    // A cheap sample -- 100us against a 1ms interval -- that nonetheless
+    // finished 3.5 intervals late, because the thread was descheduled rather
+    // than because the read was slow. The elapsed slots are still skipped, but
+    // the duty cap did not decide this wait, and saying it did would blame the
+    // sampler's own cost for a scheduler problem. The two have different fixes,
+    // so the report has to tell them apart.
+    const uint64_t work = 100;
+    const uint64_t now = deadline + 3500;
+    const SampleSchedule schedule =
+            NextSampleSchedule(deadline, now, work, kInterval);
+    assert(schedule.skipped_slots == 3);
+    assert(!schedule.throttled);
+    assert(schedule.next_deadline_us > now);
+}
+
+void TestDutyCapBoundsSamplerCost() {
+    constexpr uint64_t kInterval = 1000;
+    const uint64_t deadline = 20000;
+    // A 25ms read against a 1ms interval: the measured smaps cost on a ~460MB
+    // arm64 process. The next sample must not start before the last one's cost
+    // has been matched by idle time, so the sampler stays under half a core.
+    const uint64_t work = 25000;
+    const uint64_t now = deadline + work;
+    const SampleSchedule schedule =
+            NextSampleSchedule(deadline, now, work, kInterval);
+    assert(schedule.throttled);
+    assert(schedule.next_deadline_us >= now + work);
+    // Still on the original grid, so throttling shifts which slot is served
+    // rather than shifting the grid itself.
+    assert((schedule.next_deadline_us - deadline) % kInterval == 0);
+}
+
+void TestDutyCapBoundaryIsHalfTheInterval() {
+    constexpr uint64_t kInterval = 1000;
+    const uint64_t deadline = 30000;
+    // At exactly half the interval the requested cadence is still met: the
+    // sample and the idle time are equal, which is the half-core limit.
+    const SampleSchedule at_limit =
+            NextSampleSchedule(deadline, deadline + 500, 500, kInterval);
+    assert(!at_limit.throttled);
+    assert(at_limit.next_deadline_us == deadline + kInterval);
+    // One microsecond past it the cadence can no longer be honoured, and the
+    // scheduler says so instead of quietly running at half rate.
+    const SampleSchedule past_limit =
+            NextSampleSchedule(deadline, deadline + 501, 501, kInterval);
+    assert(past_limit.throttled);
+    assert(past_limit.next_deadline_us == deadline + 2 * kInterval);
+}
+
+void TestSubMillisecondWorkIsNotTruncated() {
+    // The previous loop computed its throttle from read_us / 1000, so anything
+    // under a millisecond truncated to zero. Sub-ms costs must still be visible
+    // to the duty cap when the interval is itself sub-ms.
+    constexpr uint64_t kInterval = 100;  // 100us
+    const uint64_t deadline = 7000;
+    const uint64_t work = 250;           // 0.25ms -> would truncate to 0ms
+    const uint64_t now = deadline + work;
+    const SampleSchedule schedule =
+            NextSampleSchedule(deadline, now, work, kInterval);
+    assert(schedule.throttled);
+    assert(schedule.next_deadline_us >= now + work);
+}
+
+void TestZeroIntervalDoesNotDivideByZero() {
+    const SampleSchedule schedule = NextSampleSchedule(1000, 1000, 0, 0);
+    assert(schedule.next_deadline_us > 1000);
+}
+
 int main() {
     TestStatusFieldParsing();
     TestSelfRss();
@@ -514,5 +642,13 @@ int main() {
     TestPeakThresholdPolicy();
     TestIntervalResolution();
     TestSamplerLifecycle();
+    TestCadenceAbsorbsWorkTime();
+    TestCadenceDoesNotAccumulateDrift();
+    TestSlowSampleSkipsSlotsInsteadOfBursting();
+    TestSchedulerStarvationIsNotReportedAsThrottling();
+    TestDutyCapBoundsSamplerCost();
+    TestDutyCapBoundaryIsHalfTheInterval();
+    TestSubMillisecondWorkIsNotTruncated();
+    TestZeroIntervalDoesNotDivideByZero();
     return 0;
 }

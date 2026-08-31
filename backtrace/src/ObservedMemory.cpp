@@ -139,7 +139,7 @@ bool LinkNamesDmaBuf(const char* target) {
 // reports every inode as new, which over-counts rather than under-counts, and
 // sets the overflow flag so the report can say so.
 bool InsertInode(DmaInodeSet* set, uint64_t inode) {
-    if (set->count * 2 >= DmaInodeSet::kSlots) {
+    if (set->count >= DmaInodeSet::kMaxDedupedBuffers) {
         set->overflowed = true;
         return true;
     }
@@ -295,10 +295,10 @@ uint64_t MonotonicMicros() {
            static_cast<uint64_t>(now.tv_nsec) / 1000ULL;
 }
 
-void SleepMillis(unsigned millis) {
+void SleepMicros(uint64_t micros) {
     struct timespec request;
-    request.tv_sec = static_cast<time_t>(millis / 1000);
-    request.tv_nsec = static_cast<long>(millis % 1000) * 1000000L;
+    request.tv_sec = static_cast<time_t>(micros / 1000000ULL);
+    request.tv_nsec = static_cast<long>(micros % 1000000ULL) * 1000L;
     while (nanosleep(&request, &request) != 0 && errno == EINTR) {
     }
 }
@@ -481,6 +481,47 @@ size_t ReadSelfGpuMmapBytesGated(
         }
     }
     return bytes;
+}
+
+SampleSchedule NextSampleSchedule(
+        uint64_t previous_deadline_us, uint64_t now_us, uint64_t work_us,
+        uint64_t interval_us) {
+    SampleSchedule schedule;
+    if (interval_us == 0) {
+        // Start() rejects a zero interval; treat it as the smallest grid rather
+        // than dividing by it.
+        interval_us = 1;
+    }
+
+    uint64_t next = previous_deadline_us + interval_us;
+
+    // Slots that elapsed while this sample was being taken are skipped, never
+    // fired back to back. Catching up would concentrate the sampler's own cost
+    // on a process that has just demonstrated it cannot absorb it -- and each
+    // catch-up read holds mmap_lock, so the burst lands on the allocation path.
+    if (next < now_us) {
+        const uint64_t advance = (now_us - next) / interval_us + 1;
+        next += advance * interval_us;
+        schedule.skipped_slots += advance;
+    }
+
+    // Duty cap: the next sample never starts sooner than this one took, so the
+    // sampler cannot exceed half a core however expensive /proc becomes. Kept
+    // separate from the cadence above so a throttled run is reported as
+    // throttled instead of silently redefining the requested interval.
+    const uint64_t earliest_us = now_us + work_us;
+    if (next < earliest_us) {
+        schedule.throttled = true;
+        // Advance in whole intervals so a slow sample shifts which grid slot is
+        // served without shifting the grid itself.
+        const uint64_t advance =
+                (earliest_us - next + interval_us - 1) / interval_us;
+        next += advance * interval_us;
+        schedule.skipped_slots += advance;
+    }
+
+    schedule.next_deadline_us = next;
+    return schedule;
 }
 
 void ResetDmaInodeSet(DmaInodeSet* set) {
@@ -701,6 +742,40 @@ void ObservedPeakSampler::Stop() {
     started_.store(false, std::memory_order_release);
 }
 
+void ObservedPeakSampler::ResetAfterForkInChild() {
+    // No join: thread_ names a thread that fork() did not clone. Clearing the
+    // flags makes a later Start() in the child legal and keeps Stop() from
+    // blocking on a thread id that was never valid here.
+    running_.store(false, std::memory_order_release);
+    started_.store(false, std::memory_order_release);
+    thread_ = pthread_t{};
+}
+
+bool ObservedPeakSampler::Stalled() const {
+    // Never started, or Stop() shut it down: not a stall. See the header for why
+    // a deliberate stop must not release the observed-peak latch.
+    if (!started_.load(std::memory_order_acquire) ||
+        !running_.load(std::memory_order_acquire)) {
+        return false;
+    }
+    const uint64_t last = last_sample_us_.load(std::memory_order_relaxed);
+    if (last == 0) {
+        // Running, but the first read has not completed yet.
+        return false;
+    }
+    // Deliberately generous. Run() treats the requested interval as a floor and
+    // sleeps at least as long as the read took, so on a large process the real
+    // period can be many times interval_ms; a tight bound here would call a
+    // merely slow sampler dead and hand the peak back to the tracked criterion
+    // mid-run.
+    uint64_t stale_us = static_cast<uint64_t>(interval_ms_) * 1000ULL * 20ULL;
+    static constexpr uint64_t kMinStaleUs = 2ULL * 1000ULL * 1000ULL;
+    if (stale_us < kMinStaleUs) {
+        stale_us = kMinStaleUs;
+    }
+    return MonotonicMicros() > last + stale_us;
+}
+
 ObservedSamplerStats ObservedPeakSampler::stats() const {
     ObservedSamplerStats out;
     out.interval_ms = interval_ms_;
@@ -727,6 +802,8 @@ ObservedSamplerStats ObservedPeakSampler::stats() const {
     const uint64_t last = last_sample_us_.load(std::memory_order_relaxed);
     out.span_us = last > first ? last - first : 0;
     out.dedup_overflowed = dedup_overflowed_.load(std::memory_order_relaxed);
+    out.skipped_slots = skipped_slots_.load(std::memory_order_relaxed);
+    out.throttled_samples = throttled_samples_.load(std::memory_order_relaxed);
     out.peak_total_bytes = peak_total_bytes_.load(std::memory_order_relaxed);
     out.peak_total_rss_bytes = peak_total_rss_bytes_.load(std::memory_order_relaxed);
     out.peak_total_dma_bytes = peak_total_dma_bytes_.load(std::memory_order_relaxed);
@@ -753,6 +830,11 @@ void ObservedPeakSampler::Run() {
     DebugDisableSet(true);
 
     size_t next_threshold = floor_bytes_;
+    // The grid the cadence is measured against. Anchored once here so every
+    // later deadline derives from this instant rather than from whenever the
+    // previous sample happened to finish.
+    const uint64_t interval_us = static_cast<uint64_t>(interval_ms_) * 1000ULL;
+    uint64_t next_deadline_us = MonotonicMicros();
     while (running_.load(std::memory_order_acquire)) {
         const uint64_t begin_us = MonotonicMicros();
         const ObservedMemSample sample = ReadObservedMemoryGated(
@@ -821,22 +903,36 @@ void ObservedPeakSampler::Run() {
                 }
             }
         }
-        // Sleep at least as long as reading /proc took, so the sampler can never
-        // exceed half a core no matter how many descriptors or mappings the
-        // process holds. A run whose reads are cheap keeps the requested cadence
-        // exactly; one whose reads are not would otherwise perturb the very peak
-        // it is measuring. The achieved cadence is reported, so a throttled run
-        // is visible rather than silently assumed to be on cadence.
-        unsigned sleep_ms = interval_ms_;
-        const unsigned read_ms = static_cast<unsigned>(read_us / 1000);
-        if (read_ms > sleep_ms) {
-            sleep_ms = read_ms;
+        // Schedule the next sample against the interval grid rather than
+        // against "now". work_us covers the snapshot as well as the read: both
+        // are cost this sampler imposes on the process it is measuring.
+        const uint64_t work_done_us = MonotonicMicros();
+        const SampleSchedule schedule = NextSampleSchedule(
+                next_deadline_us, work_done_us, work_done_us - begin_us,
+                interval_us);
+        next_deadline_us = schedule.next_deadline_us;
+        if (schedule.skipped_slots != 0) {
+            skipped_slots_.fetch_add(
+                    schedule.skipped_slots, std::memory_order_relaxed);
         }
-        // Bounded so Stop() does not wait a whole interval on a slow cadence.
-        while (sleep_ms > 0 && running_.load(std::memory_order_acquire)) {
-            const unsigned slice = sleep_ms > 10 ? 10 : sleep_ms;
-            SleepMillis(slice);
-            sleep_ms -= slice;
+        if (schedule.throttled) {
+            throttled_samples_.fetch_add(1, std::memory_order_relaxed);
+        }
+
+        // Sliced so Stop() stays responsive on a slow cadence. The remaining
+        // time is recomputed from the deadline on every slice instead of
+        // decrementing a precomputed budget: each nanosleep overshoots a little,
+        // and a decremented budget would accumulate one overshoot per slice
+        // (ten of them for a 100ms interval) into the very drift this loop
+        // exists to avoid.
+        while (running_.load(std::memory_order_acquire)) {
+            const uint64_t now_us = MonotonicMicros();
+            if (now_us >= next_deadline_us) {
+                break;
+            }
+            const uint64_t remaining_us = next_deadline_us - now_us;
+            static constexpr uint64_t kMaxSliceUs = 10000;
+            SleepMicros(remaining_us > kMaxSliceUs ? kMaxSliceUs : remaining_us);
         }
     }
 }
