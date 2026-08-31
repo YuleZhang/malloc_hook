@@ -394,12 +394,19 @@ void TestSamplerLifecycle() {
     assert(stats.valid_samples >= 1);
     assert(stats.snapshots >= 1);
     assert(stats.peak_total_bytes > 0);
+    // Every part of the sum, not just the first two. This assertion is the only
+    // thing that ties ObservedMemSample::total() to what the sampler records, so
+    // omitting a term here lets that term be silently dropped from the peak
+    // criterion on the one platform where it is non-zero -- and pass on every
+    // platform where it is not.
     assert(stats.peak_total_bytes ==
-           stats.peak_total_rss_bytes + stats.peak_total_dma_bytes);
-    // The maximum of the sum can only be reached with each half at or below its
+           stats.peak_total_rss_bytes + stats.peak_total_dma_bytes +
+                   stats.peak_total_gpu_bytes);
+    // The maximum of the sum can only be reached with each part at or below its
     // own maximum.
     assert(stats.peak_total_rss_bytes <= stats.max_rss_bytes);
     assert(stats.peak_total_dma_bytes <= stats.max_dma_bytes);
+    assert(stats.peak_total_gpu_bytes <= stats.max_gpu_bytes);
     assert(!stats.dedup_overflowed);
 
     // Stop() is idempotent; finalization calls it on paths that may never have

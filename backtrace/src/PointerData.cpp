@@ -1550,11 +1550,12 @@ void PointerData::DumpPeakInfo() {
         // Printed next to the tracked totals because they are different
         // quantities: the line above is bytes this process asked for, this one
         // is what the kernel says it holds.
-        printf("observed peak (host rss + dma, from /proc every %ums): "
-               "rss %fMB + dma %fMB = %fMB\n\n",
+        printf("observed peak (host rss + dma + gpu, from /proc every %ums): "
+               "rss %fMB + dma %fMB + gpu %fMB = %fMB\n\n",
                sampler.interval_ms,
                sampler.peak_total_rss_bytes / 1024.0 / 1024.0,
                sampler.peak_total_dma_bytes / 1024.0 / 1024.0,
+               sampler.peak_total_gpu_bytes / 1024.0 / 1024.0,
                sampler.peak_total_bytes / 1024.0 / 1024.0);
     }
 }
