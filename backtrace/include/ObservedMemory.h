@@ -72,8 +72,10 @@ enum class GpuMmapSource : uint8_t {
     // No GPU device node whose mappings escape both other signals exists here,
     // so the figure is structurally zero and nothing is read.
     NotApplicable,
-    // /proc/self/smaps, per-region Size minus Rss.
-    Smaps,
+    // Region sizes from /proc/self/maps every sample, corrected by a residency
+    // figure calibrated from /proc/self/smaps far less often. See
+    // GpuMmapBytesFromSmapsText for why the two files are split this way.
+    MapsAndSmaps,
 };
 
 const char* GpuMmapSourceName(GpuMmapSource source);
@@ -128,33 +130,68 @@ size_t GpuMmapBytesFromSmapsText(char* text);
 // read-failure path at all.
 bool ReadGpuMmapBytesFrom(const char* path, size_t* bytes);
 
-// Carried state for the GPU pass, the same shape and for the same reason as
-// DmaMapCache below: the pass is expensive, so it runs only when it can move the
-// peak, and how stale the carried figure may get is bounded and reported.
+// The size one /proc/self/maps line contributes: the region's full mapped size
+// if it is one of the device nodes, else 0.
 //
-// The cost here is worse than the mapping pass, and structurally so.
+// maps carries the same header lines as smaps, with the same paths and the same
+// address ranges, and costs ~240x less to read because the kernel does not walk
+// page tables to produce it. What it does not carry is per-region residency,
+// which is the only thing smaps is needed for -- and residency is exactly the
+// part that barely moves. See GpuMmapCache.
+size_t GpuMappedBytesFromMapsLine(const char* line);
+
+// Sums the device regions' mapped sizes in a maps-format file.
+bool ReadGpuMappedBytesFrom(const char* path, size_t* bytes);
+
+// Carried state for the GPU pass.
+//
+// The quantity is read from two files with very different costs, so it is split
+// along the axis where the cost lives rather than sampled as one thing.
+//
 // /proc/self/smaps is the most expensive file in procfs: the kernel walks every
-// PTE of every VMA in the process to produce the per-region Rss this needs, and
-// holds mmap_lock for the walk. Measured at ~25 ms per read for a ~460 MB
-// arm64 process, against ~240 us for a small one -- it scales with the mapped
-// footprint, so it is cheapest exactly where it matters least.
+// PTE of every VMA to produce the per-region Rss, holding mmap_lock throughout.
+// Measured on one process at 460 MB resident: smaps 10.2 ms, against 17 us for
+// /proc/self/maps and 14 us for /proc/self/status -- and the gap widens with
+// footprint (~25 ms at 1 GB), so it is cheapest exactly where it matters least.
+// A second measurement on a different process put maps at 42 us for the same
+// ~10 ms of smaps; either way the ratio is two to three orders of magnitude.
 //
-// Which is why `probed_absent` exists. The per-region name filter inside the
-// parse can only reject regions the kernel has already been made to produce, so
-// on a platform with no such device node the entire walk is paid to return zero.
-// The device node is therefore checked before the file is opened, once, and a
-// negative answer disables the pass for the life of the process.
+// The first version gated that read on "could this sample move the peak". That
+// gate does not gate the phase it exists for: the comparison is against the
+// running maximum, so during any monotonic growth -- the whole ramp to the peak,
+// the only stretch where the snapshot instant matters -- it is true on every
+// sample and the walk ran 100% of the time. Measured 200/200 while growing,
+// against 7/200 below the peak.
+//
+// So the split: region *sizes* come from maps every sample, and smaps is read
+// only to calibrate `resident_correction`, the part of those regions the kernel
+// already counts in VmRSS. That part is what `Size - Rss` was subtracting, and
+// it is near-static -- a PFN/IO region has Rss 0 for its whole life, and a
+// cacheable heap's residency changes when the driver grows the heap, not per
+// sample. Sizes, which do move, are now sampled at full rate for 42 us.
+//
+// This also removes the reason the peak gate existed. Because every sample now
+// carries a fresh size, a GPU allocation that grows while host RSS falls is
+// visible immediately instead of up to kGpuCalibrateSamples later.
 struct GpuMmapCache {
+    // Last figure reported, and the largest ever reported.
     size_t bytes = 0;
     size_t max_bytes = 0;
-    size_t refreshes = 0;
+    // Bytes of device mapping the kernel already counts in VmRSS, so that
+    // rss_bytes + gpu_bytes never holds the same page twice. Calibrated from
+    // smaps; 0 on the PFN/IO mappings this dimension exists for.
+    size_t resident_correction = 0;
+    // Mapped total at the instant the correction was calibrated. A large move
+    // away from it means the region set changed and the correction is stale.
+    size_t mapped_at_calibration = 0;
+    size_t calibrations = 0;
     // Reads that were attempted and failed. Surfaced rather than folded into the
-    // source label: a carried figure stays a real smaps measurement, so the
-    // failure has to be reported as its own fact instead of by downgrading a
-    // number that is still valid.
+    // source label: a carried figure stays a real measurement, so the failure
+    // has to be reported as its own fact instead of by downgrading a number that
+    // is still valid.
     size_t read_failures = 0;
-    unsigned samples_since_refresh = 0;
-    bool ever_ran = false;
+    unsigned samples_since_calibration = 0;
+    bool calibrated = false;
     bool probed_absent = false;
 };
 
@@ -266,6 +303,21 @@ struct ObservedMemSample {
 
 ObservedMemSample ReadObservedMemory(DmaInodeSet* set);
 
+// Whether this sample must pay for a residency calibration, given the mapped
+// total it just read. Pure, so the policy that decides how often the expensive
+// read happens can be tested exhaustively -- the surrounding pass cannot be,
+// because on any machine without the device node it returns before reaching it,
+// which is every host CI runner.
+bool GpuSampleNeedsCalibration(const GpuMmapCache& cache, size_t mapped);
+
+// Folds a completed calibration into the cache. `unaccounted` is what smaps
+// reported for the same regions whose mapped total is `mapped`, so the residency
+// the kernel already counts in VmRSS is their difference.
+void ApplyGpuCalibration(GpuMmapCache* cache, size_t mapped, size_t unaccounted);
+
+// The figure a sample reports for a mapped total, given the carried correction.
+size_t GpuBytesForMapped(const GpuMmapCache& cache, size_t mapped);
+
 // Reads the GPU mapping figure, honouring the GpuMmapCache gate. A null cache
 // forces the read, which is what a one-shot sample and every test wants.
 size_t ReadSelfGpuMmapBytes(ObservedMemSample* into);
@@ -350,9 +402,10 @@ struct ObservedSamplerStats {
     // the gate above can be judged rather than trusted.
     size_t map_passes = 0;
     size_t max_map_only_bytes = 0;
-    // The same two figures for the GPU pass. It is the most expensive of the
-    // three, so how often it ran is the first thing to check when the achieved
-    // cadence is below the requested one.
+    // How often the GPU residency correction was measured, i.e. how many smaps
+    // reads the run paid. The per-sample maps read is not counted here: it is
+    // unconditional and cheap, and conflating the two would hide the only GPU
+    // cost worth watching.
     size_t gpu_passes = 0;
     size_t max_gpu_bytes_seen = 0;
     // Attempted reads that failed. A carried figure stays labelled as the smaps

@@ -23,12 +23,14 @@ constexpr size_t kMinPeakStepBytes = 64 * 1024;
 // How many samples the carried mapping-pass figure may be reused for before it
 // is refreshed regardless of the peak gate.
 constexpr unsigned kMapRefreshSamples = 8;
-// The same bound for the GPU pass. Larger because that pass costs an order of
-// magnitude more than the mapping pass and the quantity it reads moves in a few
-// large steps rather than continuously: a driver maps its working set once and
-// holds it. The bound is what makes the staleness visible instead of unbounded --
-// GpuMmapCache::max_bytes reports how much was ever at stake.
-constexpr unsigned kGpuRefreshSamples = 32;
+// How many samples the GPU residency correction may be reused for before it is
+// measured again. Far larger than the mapping bound above because the read it
+// bounds is ~233x more expensive and the quantity it reads barely moves: a
+// PFN/IO region has Rss 0 for its whole life, and a cacheable heap's residency
+// changes when the driver grows the heap, not per sample. The fast-moving half
+// -- the region sizes -- is read every sample from maps and is not bounded by
+// this at all.
+constexpr unsigned kGpuCalibrateSamples = 64;
 
 // Device nodes whose mappings escape both other signals. Only kgsl qualifies;
 // see GpuMmapBytesFromSmapsText for why adding Mali here would inflate rather
@@ -362,8 +364,8 @@ const char* GpuMmapSourceName(GpuMmapSource source) {
     switch (source) {
         case GpuMmapSource::NotApplicable:
             return "not_applicable";
-        case GpuMmapSource::Smaps:
-            return "smaps";
+        case GpuMmapSource::MapsAndSmaps:
+            return "maps+smaps";
         case GpuMmapSource::Unprobed:
             break;
     }
@@ -474,6 +476,100 @@ bool ReadGpuMmapBytesFrom(const char* path, size_t* bytes) {
     return true;
 }
 
+size_t GpuMappedBytesFromMapsLine(const char* line) {
+    if (line == nullptr) {
+        return 0;
+    }
+    uintptr_t start = 0;
+    uintptr_t end = 0;
+    if (sscanf(line, "%" SCNxPTR "-%" SCNxPTR, &start, &end) != 2 || end <= start) {
+        return 0;
+    }
+    const char* path = MapsLinePath(line);
+    if (path == nullptr || !IsGpuNodePath(path)) {
+        return 0;
+    }
+    return static_cast<size_t>(end - start);
+}
+
+bool ReadGpuMappedBytesFrom(const char* path, size_t* bytes) {
+    const int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        return false;
+    }
+    size_t total = 0;
+    char buffer[16384];
+    size_t held = 0;
+    for (;;) {
+        const ssize_t bytes_read = read(fd, buffer + held, sizeof(buffer) - held - 1);
+        if (bytes_read <= 0) {
+            break;
+        }
+        const size_t available = held + static_cast<size_t>(bytes_read);
+        buffer[available] = '\0';
+        size_t start = 0;
+        for (;;) {
+            char* newline = static_cast<char*>(
+                    memchr(buffer + start, '\n', available - start));
+            if (newline == nullptr) {
+                break;
+            }
+            *newline = '\0';
+            total += GpuMappedBytesFromMapsLine(buffer + start);
+            start = static_cast<size_t>(newline - buffer) + 1;
+        }
+        held = available - start;
+        if (held >= sizeof(buffer) - 1) {
+            // A single line longer than the buffer. Dropping it is preferable to
+            // parsing a fragment as if it were a whole region header.
+            held = 0;
+        } else if (held > 0) {
+            memmove(buffer, buffer + start, held);
+        }
+    }
+    close(fd);
+    *bytes = total;
+    return true;
+}
+
+bool GpuSampleNeedsCalibration(const GpuMmapCache& cache, size_t mapped) {
+    // Nothing mapped means there is no residency for a correction to correct.
+    // This is what keeps a process that merely has the device node -- on a
+    // Qualcomm target, nearly every process -- from paying for a dimension it
+    // never uses.
+    if (mapped == 0) {
+        return false;
+    }
+    if (!cache.calibrated) {
+        return true;
+    }
+    if (cache.samples_since_calibration >= kGpuCalibrateSamples) {
+        return true;
+    }
+    // The correction was measured against a particular set of regions. A large
+    // move in the mapped total means that set has changed, so the correction no
+    // longer describes it.
+    const size_t drift = mapped > cache.mapped_at_calibration
+            ? mapped - cache.mapped_at_calibration
+            : cache.mapped_at_calibration - mapped;
+    return drift > cache.mapped_at_calibration / 4;
+}
+
+void ApplyGpuCalibration(GpuMmapCache* cache, size_t mapped, size_t unaccounted) {
+    // smaps reported the part of these regions VmRSS does *not* hold, so the
+    // remainder is the part it does.
+    cache->resident_correction = mapped > unaccounted ? mapped - unaccounted : 0;
+    cache->mapped_at_calibration = mapped;
+    cache->samples_since_calibration = 0;
+    cache->calibrated = true;
+    ++cache->calibrations;
+}
+
+size_t GpuBytesForMapped(const GpuMmapCache& cache, size_t mapped) {
+    return mapped > cache.resident_correction ? mapped - cache.resident_correction
+                                              : 0;
+}
+
 size_t ReadSelfGpuMmapBytes(ObservedMemSample* into) {
     if (into == nullptr) {
         return 0;
@@ -483,9 +579,16 @@ size_t ReadSelfGpuMmapBytes(ObservedMemSample* into) {
 
 size_t ReadSelfGpuMmapBytesGated(
         ObservedMemSample* into, GpuMmapCache* cache, size_t peak_total_bytes) {
-    // Every gate below is checked before the clock is read: on a platform without
-    // the device node this pass must cost nothing at all, and a clock_gettime per
-    // sample to time a no-op is exactly the kind of cost that accumulates unseen.
+    // peak_total_bytes is no longer consulted. It used to gate the smaps read on
+    // "could this sample move the peak", which is true on every sample of a
+    // growing run -- so the most expensive read in the sampler ran at full rate
+    // throughout the ramp, the one stretch where the cadence has to hold. The
+    // cost is now split by what actually moves instead; see GpuMmapCache.
+    (void)peak_total_bytes;
+
+    // Checked before the clock is read: on a platform without the device node
+    // this pass must cost nothing at all, and a clock_gettime per sample to time
+    // a no-op is exactly the kind of cost that accumulates unseen.
     if (cache != nullptr && cache->probed_absent) {
         into->gpu_source = GpuMmapSource::NotApplicable;
         into->gpu_bytes = 0;
@@ -499,44 +602,21 @@ size_t ReadSelfGpuMmapBytesGated(
         into->gpu_bytes = 0;
         return 0;
     }
-    if (cache != nullptr) {
-        // Compared against the peak *including* the carried figure, so the gate
-        // can only skip samples that stay below the peak even when credited with
-        // the last known GPU contribution.
-        const size_t provisional =
-                into->rss_bytes + into->dma_bytes + cache->bytes;
-        const bool run = !cache->ever_ran || provisional >= peak_total_bytes ||
-                         cache->samples_since_refresh >= kGpuRefreshSamples;
-        if (!run) {
-            into->gpu_bytes = cache->bytes;
-            into->gpu_source = GpuMmapSource::Smaps;
-            ++cache->samples_since_refresh;
-            return into->gpu_bytes;
-        }
-    }
+
     const uint64_t begin_us = MonotonicMicros();
-    size_t bytes = 0;
-    if (!ReadGpuMmapBytesFromSmaps(&bytes)) {
+    size_t mapped = 0;
+    if (!ReadGpuMappedBytesFrom("/proc/self/maps", &mapped)) {
         into->gpu_us = static_cast<uint32_t>(MonotonicMicros() - begin_us);
         if (cache != nullptr) {
             ++cache->read_failures;
-            // The pass was attempted and the attempt is what consumed this
-            // sample's slot, so the staleness counter has to advance. Leaving it
-            // pinned at the bound -- as returning early once did -- means every
-            // later sample re-enters the read, and the bound the field exists to
-            // provide stops bounding anything.
-            if (cache->samples_since_refresh < kGpuRefreshSamples) {
-                ++cache->samples_since_refresh;
-            }
-            if (cache->ever_ran) {
-                // A figure carried from an earlier successful read is still a
-                // smaps measurement; labelling it Unprobed would report a real
+            if (cache->calibrated) {
+                // A figure carried from an earlier successful read is still the
+                // measurement it was; labelling it Unprobed would report a real
                 // number as "nothing was measured", and because the sampler
                 // stores the source last-sample-wins, one transient failure
-                // would relabel the whole run. The failure is surfaced through
-                // gpu_read_failures instead.
+                // would relabel the whole run.
                 into->gpu_bytes = cache->bytes;
-                into->gpu_source = GpuMmapSource::Smaps;
+                into->gpu_source = GpuMmapSource::MapsAndSmaps;
                 return into->gpu_bytes;
             }
         }
@@ -546,17 +626,53 @@ size_t ReadSelfGpuMmapBytesGated(
         into->gpu_source = GpuMmapSource::Unprobed;
         return 0;
     }
-    into->gpu_bytes = bytes;
-    into->gpu_source = GpuMmapSource::Smaps;
-    into->gpu_us = static_cast<uint32_t>(MonotonicMicros() - begin_us);
-    if (cache != nullptr) {
-        cache->bytes = bytes;
-        cache->ever_ran = true;
-        cache->samples_since_refresh = 0;
-        ++cache->refreshes;
-        if (bytes > cache->max_bytes) {
-            cache->max_bytes = bytes;
+
+    if (cache == nullptr) {
+        // One-shot read: no state to carry a correction in, so pay smaps once
+        // and answer exactly.
+        size_t unaccounted = 0;
+        if (!ReadGpuMmapBytesFromSmaps(&unaccounted)) {
+            into->gpu_bytes = 0;
+            into->gpu_source = GpuMmapSource::Unprobed;
+            into->gpu_us = static_cast<uint32_t>(MonotonicMicros() - begin_us);
+            return 0;
         }
+        into->gpu_bytes = unaccounted;
+        into->gpu_source = GpuMmapSource::MapsAndSmaps;
+        into->gpu_us = static_cast<uint32_t>(MonotonicMicros() - begin_us);
+        return unaccounted;
+    }
+
+    // Recalibrate when there is no correction yet, when the bound has elapsed,
+    // or when the mapped total has moved far enough that the region set is
+    // likely different from the one the correction was measured on. Skipped
+    // entirely while nothing is mapped: with no device region there is nothing
+    // for a residency correction to correct, which is what keeps a process that
+    // merely has the node -- on a Qualcomm target, nearly every process -- from
+    // paying for a dimension it does not use.
+    if (GpuSampleNeedsCalibration(*cache, mapped)) {
+        size_t unaccounted = 0;
+        if (ReadGpuMmapBytesFromSmaps(&unaccounted)) {
+            ApplyGpuCalibration(cache, mapped, unaccounted);
+        } else {
+            ++cache->read_failures;
+            if (cache->samples_since_calibration < kGpuCalibrateSamples) {
+                ++cache->samples_since_calibration;
+            }
+        }
+    } else if (cache->samples_since_calibration < kGpuCalibrateSamples) {
+        ++cache->samples_since_calibration;
+    }
+
+    const size_t bytes = GpuBytesForMapped(*cache, mapped);
+    into->gpu_bytes = bytes;
+    into->gpu_source = cache->calibrated || mapped == 0
+            ? GpuMmapSource::MapsAndSmaps
+            : GpuMmapSource::Unprobed;
+    into->gpu_us = static_cast<uint32_t>(MonotonicMicros() - begin_us);
+    cache->bytes = bytes;
+    if (bytes > cache->max_bytes) {
+        cache->max_bytes = bytes;
     }
     return bytes;
 }
@@ -873,7 +989,7 @@ ObservedSamplerStats ObservedPeakSampler::stats() const {
     out.total_gpu_us = total_gpu_us_.load(std::memory_order_relaxed);
     out.map_passes = map_cache_.refreshes;
     out.max_map_only_bytes = map_cache_.max_bytes;
-    out.gpu_passes = gpu_cache_.refreshes;
+    out.gpu_passes = gpu_cache_.calibrations;
     out.max_gpu_bytes_seen = gpu_cache_.max_bytes;
     out.gpu_read_failures = gpu_cache_.read_failures;
     out.gpu_source =
