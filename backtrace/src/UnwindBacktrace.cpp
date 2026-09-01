@@ -62,6 +62,13 @@ thread_local bool g_capture_active = false;
 thread_local StackCaptureReentryHook g_capture_reentry_hook = nullptr;
 #endif
 
+constexpr bool FrameRecordFitsStack(
+        uintptr_t fp, uintptr_t stack_low, uintptr_t stack_high) {
+    constexpr uintptr_t kFrameRecordSize = 2 * sizeof(uintptr_t);
+    return (fp & 7) == 0 && fp >= stack_low && fp <= stack_high &&
+            stack_high - fp >= kFrameRecordSize;
+}
+
 struct CaptureActiveGuard {
     ~CaptureActiveGuard() { g_capture_active = false; }
 };
@@ -289,8 +296,7 @@ void CaptureWithFramePointer(
     while (true) {
         // Every frame record must be 8-byte aligned and lie inside this
         // thread's stack, with room for both saved words.
-        if ((fp & 7) != 0 || fp < bounds.low ||
-            fp + 2 * sizeof(uintptr_t) > bounds.high) {
+        if (!FrameRecordFitsStack(fp, bounds.low, bounds.high)) {
             break;
         }
         const uintptr_t next_fp = reinterpret_cast<const uintptr_t*>(fp)[0];
@@ -341,6 +347,11 @@ bool ForceCompilerUnwindForFast() {
 #if defined(MALLOC_HOOK_STACK_CAPTURE_TESTING)
 void SetStackCaptureReentryHookForTest(StackCaptureReentryHook hook) {
     g_capture_reentry_hook = hook;
+}
+
+bool FrameRecordFitsStackForTest(
+        uintptr_t fp, uintptr_t stack_low, uintptr_t stack_high) {
+    return FrameRecordFitsStack(fp, stack_low, stack_high);
 }
 
 RawStackRecord BuildCapturedRecordForTest(

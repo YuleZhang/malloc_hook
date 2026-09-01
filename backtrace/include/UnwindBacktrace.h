@@ -103,6 +103,8 @@ RawStackRecord CaptureStack(
 #if defined(MALLOC_HOOK_STACK_CAPTURE_TESTING)
 using StackCaptureReentryHook = void (*)();
 void SetStackCaptureReentryHookForTest(StackCaptureReentryHook hook);
+bool FrameRecordFitsStackForTest(
+        uintptr_t fp, uintptr_t stack_low, uintptr_t stack_high);
 RawStackRecord BuildCapturedRecordForTest(
         StackCaptureMode mode, StackCaptureBackend backend, uint8_t terminal_error,
         const std::vector<uintptr_t>& frames, size_t max_frames, size_t skipped_frames);
