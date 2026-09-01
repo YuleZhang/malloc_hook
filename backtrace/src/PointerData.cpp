@@ -187,37 +187,48 @@ private:
         std::string name;
     };
 
-    // Reads the first PT_LOAD's p_vaddr out of the ELF header mapped at
-    // `mapping.start`. Every access is bounded by the mapping itself and the
-    // ELF magic is checked first, so a non-ELF or truncated mapping is rejected
-    // rather than dereferenced blindly.
+    // Reads the first PT_LOAD's p_vaddr from the module *file*.
+    //
+    // Not from the mapping: reading it there faults if the mapping goes away
+    // between parsing /proc/self/maps and the read, and that window is real --
+    // a workload that dlclose()s between iterations unmaps libraries routinely,
+    // and this now runs on the hook's worker thread with no allocation lock
+    // serialising anything. Observed as a SIGSEGV inside Build() on a pipeline
+    // that dlclose()s once per iteration. Reading the file cannot fault, and
+    // does not assume the first mapping happens to cover the ELF header.
     static bool FirstLoadVaddr(const RawMapping& mapping, uintptr_t* vaddr) {
-        const size_t length = mapping.end - mapping.start;
-        if (!mapping.readable || length < sizeof(ElfW(Ehdr))) {
+        const int fd = open(mapping.name.c_str(), O_RDONLY | O_CLOEXEC);
+        if (fd == -1) {
             return false;
         }
-        const auto* base = reinterpret_cast<const unsigned char*>(mapping.start);
-        if (memcmp(base, ELFMAG, SELFMAG) != 0) {
-            return false;
-        }
-        const auto* header = reinterpret_cast<const ElfW(Ehdr)*>(base);
-        if (header->e_phentsize != sizeof(ElfW(Phdr)) || header->e_phnum == 0) {
-            return false;
-        }
-        const size_t table_bytes =
-                static_cast<size_t>(header->e_phnum) * sizeof(ElfW(Phdr));
-        if (header->e_phoff > length || table_bytes > length - header->e_phoff) {
-            return false;
-        }
-        const auto* headers =
-                reinterpret_cast<const ElfW(Phdr)*>(base + header->e_phoff);
-        for (ElfW(Half) i = 0; i < header->e_phnum; ++i) {
-            if (headers[i].p_type == PT_LOAD) {
-                *vaddr = static_cast<uintptr_t>(headers[i].p_vaddr);
-                return true;
+        bool found = false;
+        ElfW(Ehdr) header;
+        if (pread(fd, &header, sizeof(header), 0) ==
+                    static_cast<ssize_t>(sizeof(header)) &&
+            memcmp(header.e_ident, ELFMAG, SELFMAG) == 0 &&
+            header.e_phentsize == sizeof(ElfW(Phdr)) && header.e_phnum != 0) {
+            // Bounded so a corrupt or hostile e_phnum cannot turn into a long
+            // scan.
+            constexpr unsigned kMaxProgramHeaders = 256;
+            const unsigned count =
+                    header.e_phnum < kMaxProgramHeaders ? header.e_phnum
+                                                        : kMaxProgramHeaders;
+            for (unsigned i = 0; i < count && !found; ++i) {
+                ElfW(Phdr) program_header;
+                const off_t at = static_cast<off_t>(header.e_phoff) +
+                        static_cast<off_t>(i) * sizeof(program_header);
+                if (pread(fd, &program_header, sizeof(program_header), at) !=
+                    static_cast<ssize_t>(sizeof(program_header))) {
+                    break;
+                }
+                if (program_header.p_type == PT_LOAD) {
+                    *vaddr = static_cast<uintptr_t>(program_header.p_vaddr);
+                    found = true;
+                }
             }
         }
-        return false;
+        close(fd);
+        return found;
     }
 
     static void ParseLine(
@@ -952,6 +963,251 @@ void PointerData::GetUniqueList(
             iter->num_allocations++;
         }
         iter = list->erase(iter + 1, dup_iter);
+    }
+}
+
+// Aggregation key for a checkpoint snapshot: the same key the report
+// deduplicates on, so a snapshot reproduces the report's entries exactly.
+struct CheckpointKey {
+    size_t hash_index;
+    size_t size;
+    uint8_t mem_type;
+
+    bool operator==(const CheckpointKey& other) const {
+        return hash_index == other.hash_index && size == other.size &&
+               mem_type == other.mem_type;
+    }
+};
+
+struct CheckpointKeyHash {
+    size_t operator()(const CheckpointKey& key) const {
+        size_t hash = key.hash_index * 0x9e3779b97f4a7c15ULL;
+        hash ^= key.size + 0x9e3779b9U + (hash << 6) + (hash >> 2);
+        hash ^= key.mem_type + 0x9e3779b9U + (hash << 6) + (hash >> 2);
+        return hash;
+    }
+};
+
+bool EarlierThan(const timeval& left, const timeval& right) {
+    if (left.tv_sec != right.tv_sec) {
+        return left.tv_sec < right.tv_sec;
+    }
+    return left.tv_usec < right.tv_usec;
+}
+
+void PointerData::TakeCheckpointSnapshot(CheckpointSnapshot* out) {
+    // Everything in this function runs with both allocation locks held, so
+    // everything that does not have to be here is somewhere else: no sort, no
+    // /proc, no symbol work, no formatting, no I/O. A single pass over the live
+    // table, aggregating into a hash, is the whole cost. Doing less would mean
+    // maintaining these tallies on every malloc and free instead, which moves
+    // the cost onto the hot path -- a worse trade for a diagnostic taken a
+    // handful of times per run.
+    std::lock_guard<std::mutex> pointer_guard(pointer_mutex_);
+    std::lock_guard<std::mutex> frame_guard(frame_mutex_);
+
+    std::unordered_map<CheckpointKey, size_t, CheckpointKeyHash> index;
+    // Real runs settle at a few hundred distinct (stack, size) buckets even with
+    // tens of thousands of live allocations, so this is the whole allocation.
+    index.reserve(1024);
+    out->stacks.reserve(1024);
+
+    for (auto& entry : pointers_) {
+        const size_t hash_index = entry.second.hash_index;
+        const size_t size = entry.second.RealSize();
+        if (hash_index <= kBacktraceEmptyIndex) {
+            // Same rule the report uses: allocations without a stack are
+            // counted, not listed.
+            ++out->omitted.count;
+            out->omitted.bytes += size;
+            continue;
+        }
+
+        const CheckpointKey key{
+                hash_index, size, static_cast<uint8_t>(entry.second.mem_type)};
+        auto found = index.find(key);
+        if (found != index.end()) {
+            CheckpointStack& stack = out->stacks[found->second];
+            ++stack.num_allocations;
+            if (EarlierThan(entry.second.alloc_time, stack.alloc_time)) {
+                stack.alloc_time = entry.second.alloc_time;
+            }
+            continue;
+        }
+
+        auto frame_entry = frames_.find(hash_index);
+        FrameInfoType* frame_info =
+                frame_entry == frames_.end() ? nullptr : &frame_entry->second;
+        CheckpointStack stack;
+        stack.size = size;
+        stack.num_allocations = 1;
+        stack.mem_type = entry.second.mem_type;
+        stack.alloc_time = entry.second.alloc_time;
+        if (frame_info != nullptr) {
+            // One refcount bump per bucket rather than per live allocation:
+            // with 74k live allocations behind a few hundred stacks that is the
+            // difference between a few hundred atomics and 74k of them.
+            stack.raw_frames = frame_info->frames;
+            stack.capture_state = frame_info->capture_state;
+            stack.terminal_error = static_cast<uint8_t>(frame_info->terminal_error);
+        }
+        index.emplace(key, out->stacks.size());
+        out->stacks.push_back(std::move(stack));
+    }
+
+    out->host_used = current_host;
+    out->dma_used = current_dma;
+    out->total_used = current_used;
+    out->live_pointers = pointers_.size();
+    out->unique_stacks = frames_.size();
+}
+
+void PointerData::ResolveCheckpointSnapshot(CheckpointSnapshot* snapshot) {
+    // No allocation lock is held here, which is the point: this reads
+    // /proc/self/maps and /proc/self/smaps, and the latter walks this process's
+    // page tables. The cost is real, it is just no longer charged to every
+    // allocation in the process. The /proc read lands a few milliseconds after
+    // the snapshot instant, which is why the report labels it separately.
+    CollectPeakProcContext(&snapshot->proc);
+
+    ModuleTable modules;
+    modules.Build();
+    const char* self_module = nullptr;
+    {
+        uintptr_t unused_rel_pc = 0;
+        if (!modules.Resolve(
+                    reinterpret_cast<uintptr_t>(&SelfModuleProbe), &unused_rel_pc,
+                    &self_module)) {
+            self_module = nullptr;
+        }
+    }
+
+    char line[256];
+    for (CheckpointStack& stack : snapshot->stacks) {
+        if (stack.raw_frames == nullptr || stack.raw_frames->empty()) {
+            continue;
+        }
+        const std::vector<uintptr_t>& raw = *stack.raw_frames;
+        // Capture-time frame skipping is a fixed count, so inlining decides how
+        // many of this library's own frames survive it. Drop the leading run,
+        // exactly as the synchronous report does.
+        size_t first = 0;
+        if (self_module != nullptr) {
+            while (first < raw.size()) {
+                uintptr_t rel_pc = 0;
+                const char* module_name = nullptr;
+                if (!modules.Resolve(raw[first], &rel_pc, &module_name) ||
+                    strcmp(module_name, self_module) != 0) {
+                    break;
+                }
+                ++first;
+            }
+            if (first == raw.size()) {
+                first = 0;
+            }
+        }
+        for (size_t i = first; i < raw.size(); ++i) {
+            uintptr_t rel_pc = raw[i];
+            const char* module_name = "<unknown>";
+            modules.Resolve(raw[i], &rel_pc, &module_name);
+            const int written = snprintf(
+                    line, sizeof(line), "#%0zu %" PRIxPTR " %s\n", i - first,
+                    rel_pc, module_name);
+            if (written > 0) {
+                stack.frame_block.append(line, static_cast<size_t>(written));
+            }
+        }
+        // The PCs have been turned into text, so stop pinning them: a snapshot
+        // must not keep a stack alive for the rest of the run.
+        stack.raw_frames.reset();
+    }
+
+    // Ordered by when each bucket first appeared, which is what makes the
+    // report readable back-to-front: the newest arrivals are the ones a later
+    // checkpoint added.
+    std::sort(
+            snapshot->stacks.begin(), snapshot->stacks.end(),
+            [](const CheckpointStack& a, const CheckpointStack& b) {
+                return EarlierThan(a.alloc_time, b.alloc_time);
+            });
+}
+
+void PointerData::WriteCheckpointSnapshot(
+        int fd, const CheckpointSnapshot& snapshot) {
+    dprintf(fd,
+            "current host used: %fMB, current dma used %fMB, current total peak "
+            "used: %fMB\n",
+            snapshot.host_used / 1024.0 / 1024.0,
+            snapshot.dma_used / 1024.0 / 1024.0,
+            (snapshot.host_used + snapshot.dma_used) / 1024.0 / 1024.0);
+    if (snapshot.omitted.count != 0) {
+        dprintf(fd,
+                "omitted_without_stack: count=%zu bytes=%fMB "
+                "(size-filtered or capture suppressed/failed)\n",
+                snapshot.omitted.count, snapshot.omitted.bytes / 1024.0 / 1024.0);
+    }
+    // Labelled at_checkpoint, not at_exit: these were read moments after the
+    // snapshot, not at shutdown. The synchronous path used to print at_exit
+    // here regardless, which mislabelled every checkpoint report.
+    if (snapshot.proc.rss.valid) {
+        dprintf(fd,
+                "rss_breakdown(at_checkpoint): rss_total=%fMB rss_anon=%fMB "
+                "rss_file=%fMB rss_shmem=%fMB tracked_host=%fMB "
+                "unattributed_anon=%fMB\n",
+                snapshot.proc.rss.vm_rss_kb / 1024.0,
+                snapshot.proc.rss.anon_kb / 1024.0,
+                snapshot.proc.rss.file_kb / 1024.0,
+                snapshot.proc.rss.shmem_kb / 1024.0,
+                snapshot.host_used / 1024.0 / 1024.0,
+                snapshot.proc.rss.anon_kb / 1024.0 -
+                        snapshot.host_used / 1024.0 / 1024.0);
+    }
+    if (!snapshot.proc.mappings.empty()) {
+        dprintf(fd,
+                "rss_by_mapping(at_checkpoint): file_rss=%fMB file_size=%fMB "
+                "anon_rss=%fMB anon_size=%fMB top=%zu\n",
+                snapshot.proc.totals.file_rss_kb / 1024.0,
+                snapshot.proc.totals.file_size_kb / 1024.0,
+                snapshot.proc.totals.anon_rss_kb / 1024.0,
+                snapshot.proc.totals.anon_size_kb / 1024.0,
+                snapshot.proc.mappings.size());
+        for (const MappingRss& mapping : snapshot.proc.mappings) {
+            dprintf(fd, "rss_mapping(at_checkpoint): rss=%fMB size=%fMB %s\n",
+                    mapping.rss_kb / 1024.0, mapping.size_kb / 1024.0,
+                    mapping.name.c_str());
+        }
+    }
+    dprintf(fd,
+            "hook_overhead(at_checkpoint): live_pointers=%zu unique_stacks=%zu "
+            "checkpoint_buckets=%zu\n",
+            snapshot.live_pointers, snapshot.unique_stacks,
+            snapshot.stacks.size());
+    dprintf(fd,
+            "++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++"
+            "+++++++++++++++\n\n");
+
+    for (const CheckpointStack& stack : snapshot.stacks) {
+        struct tm* local_time = localtime(&stack.alloc_time.tv_sec);
+        char formatted_time[20];
+        strftime(
+                formatted_time, sizeof(formatted_time), "%Y-%m-%d %H:%M:%S",
+                local_time);
+        dprintf(fd,
+                "alloc_size:%fKB \t alloc_type:%s \t alloc_num:%zu \t "
+                "alloc_time:%s.%zu\n",
+                stack.size / 1024.0, mtype[stack.mem_type],
+                stack.num_allocations, formatted_time,
+                stack.alloc_time.tv_usec / 1000);
+        if (stack.frame_block.empty()) {
+            dprintf(fd, "<no stack: capture_state=%u capture_error=%u>\n\n",
+                    static_cast<unsigned>(stack.capture_state),
+                    static_cast<unsigned>(stack.terminal_error));
+            continue;
+        }
+        // One write for the whole stack instead of one per frame: the
+        // synchronous path's line-at-a-time dprintf was a large part of what
+        // made a checkpoint expensive.
+        dprintf(fd, "%s\n", stack.frame_block.c_str());
     }
 }
 

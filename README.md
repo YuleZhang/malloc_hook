@@ -58,10 +58,16 @@ limitations:
 
 [`docs/USAGE.md`](docs/USAGE.md)
 
+**Chasing a leak?** The step-by-step workflow — where to put the checkpoint, how
+to read the reports, and how to tell a leak from the workload working — is here:
+
+[`docs/MEMORY_LEAK.md`](docs/MEMORY_LEAK.md)
+
 The Chinese entry points remain entirely in Chinese:
 [`README.zh-CN.md`](README.zh-CN.md),
-[`docs/ARCHITECTURE.zh-CN.md`](docs/ARCHITECTURE.zh-CN.md), and
-[`docs/USAGE.zh-CN.md`](docs/USAGE.zh-CN.md).
+[`docs/ARCHITECTURE.zh-CN.md`](docs/ARCHITECTURE.zh-CN.md),
+[`docs/USAGE.zh-CN.md`](docs/USAGE.zh-CN.md), and
+[`docs/MEMORY_LEAK.zh-CN.md`](docs/MEMORY_LEAK.zh-CN.md).
 
 ## Configuration
 
@@ -86,7 +92,7 @@ DMA capture. Nothing needs to be set for this.
 | Variable | Default | Effect |
 | --- | --- | --- |
 | `DUMP_PEAK_VALUE_MB` | unset | **Required to get a report.** Enables peak recording and the dump-on-exit report, and starts snapshotting once the tracked peak exceeds this many MB. Setting it also lowers the default minimum allocation size to 1 KB. |
-| `ALLOC_HOOK_DUMP_PREFIX` | `/data/local/tmp/trace/backtrace_heap` | Path prefix for reports. Files are named `<prefix>.exit.pid_<pid>.time_<t>.txt`, so a report can always be tied to the process that produced it. |
+| `ALLOC_HOOK_DUMP_PREFIX` | `/data/local/tmp/trace/backtrace_heap` | Path prefix for reports. Files are named `<prefix>.<kind>.pid_<pid>.seq_<n>.time_<t>.txt`, where kind is `signal` (checkpoint) or `exit` (peak snapshot), so a report can always be tied to the process that produced it, and `seq_` orders a process's reports and keeps two taken in the same second apart. |
 | `DUMP_PEAK_STEP_MB` | `12` | Re-snapshot the peak every this many MB of growth. `0` snapshots on every new peak (much more expensive). Applies to whichever peak criterion is in use. |
 | `ALLOC_HOOK_PEAK_SAMPLE_MS` | the interval published by a host framework, else off | Interval at which the process's *observed* footprint — `VmRSS` from `/proc/self/status`, its dmabuf bytes, and GPU device mappings that neither of those covers — is sampled on a dedicated thread, and the peak snapshot is taken at the maximum of their sum instead of at the maximum of tracked allocation bytes. Those maxima are different instants: on one measured run the resident peak led the device-buffer peak by 167 ms. Use this whenever the number you are optimising against comes from an external sampler, so the stacks describe the moment that sampler calls the peak. `0` forces it off. |
 | `BACKTRACE_MIN_SIZE` | `1024` when `DUMP_PEAK_VALUE_MB` is set, else `0` | Skip stack capture for allocations smaller than this. This is the main cost control: in a typical pipeline it filters >99% of allocations. |

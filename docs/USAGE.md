@@ -5,6 +5,8 @@
 ## 1. Prerequisites
 
 - CMake 3.23 or newer and a C++17 compiler for host builds.
+- An `aarch64-none-linux-gnu` toolchain for aarch64 Linux builds, supplied
+  through `ARM_GNU_TOOLCHAIN_PATH`.
 - A matching Android NDK for Android builds, supplied through `NDK_ROOT`.
 - An OpenHarmony native SDK for OHOS builds, supplied through `OHOS_NDK_ROOT`
   (or `NDK_ROOT`).
@@ -16,18 +18,34 @@ explicit toolchain identity and is not inferred from a generic musl build.
 
 ## 2. Build
 
-### Host Linux
+### Linux
 
 ```sh
-cmake -S . -B build-host \
-  -DCMAKE_BUILD_TYPE=Release \
-  -DMALLOC_HOOK_ENABLE_DMA_CAPTURE=OFF
-cmake --build build-host --target alloc_hook
-ctest --test-dir build-host --output-on-failure
-cmake --install build-host --prefix "$PWD"
+./build_linux.sh host                 # native, plus the test suite
 ```
 
-The resulting library is `out/lib/liballoc_hook.so`.
+For an aarch64 Linux device, point `ARM_GNU_TOOLCHAIN_PATH` at an
+`aarch64-none-linux-gnu` toolchain:
+
+```sh
+export ARM_GNU_TOOLCHAIN_PATH=/path/to/gcc-arm-aarch64-none-linux-gnu
+./build_linux.sh arm64
+```
+
+The artifacts are `out/linux-host/lib/liballoc_hook.so` and
+`out/linux-arm64/lib/liballoc_hook.so`. They are kept apart from `out/lib`, which
+the Android and OHOS scripts both install into and where the last build therefore
+wins: preloading a Bionic build on a glibc target fails with
+`libm.so: cannot open shared object file`, because Bionic's sonames are
+unversioned. The script verifies the machine and the libc soname of what it built
+so that mistake is caught here rather than by the target's loader.
+
+DMA capture is on by default and should stay on for a real device: most of a
+pipeline's memory is DMA, and with it off the reports look almost empty. Set
+`ALLOC_HOOK_DMA_CAPTURE=OFF` only for a host smoke build with no driver UAPI.
+Cross builds skip the tests by default because they cannot run here; set
+`ALLOC_HOOK_BUILD_TESTS=ON` to get device-runnable test binaries under
+`build_linux/test/`.
 
 ### Android
 
@@ -74,7 +92,7 @@ Additional public controls:
 | `DUMP_PEAK_VALUE_MB` | Enable a peak snapshot after the configured live total is exceeded. |
 | `DUMP_PEAK_STEP_MB` | Minimum additional growth before another peak snapshot is built. |
 | `BACKTRACE_DUMP_SIGNAL` | Override the platform-selected checkpoint signal. |
-| `ALLOC_HOOK_DEBUG_SIGNAL` | Enable signal-worker diagnostics on stderr. |
+| `ALLOC_HOOK_DEBUG` | Enable hook diagnostics (signal worker, unwind, ION/DMA) on stderr. |
 
 Sampling affects host allocation attribution only. mmap, DMA, and ioctl
 resource accounting remains exact for events that pass the platform export and
@@ -86,8 +104,8 @@ resource filters.
 mkdir -p ./trace
 ALLOC_HOOK_CAPTURE_MODE=fast \
 BACKTRACE_MIN_SIZE=4096 \
-LD_LIBRARY_PATH="$PWD/out/lib" \
-LD_PRELOAD="$PWD/out/lib/liballoc_hook.so" \
+LD_LIBRARY_PATH="$PWD/out/linux-host/lib" \
+LD_PRELOAD="$PWD/out/linux-host/lib/liballoc_hook.so" \
 ./your_program arg1 arg2
 ```
 
@@ -103,19 +121,55 @@ capture failures.
 
 ## 5. Checkpoints and output
 
-The exported C function `checkpoint(const char*)` writes a live-allocation
-report to the requested path. A configured signal queues the same work onto a
-dedicated worker:
+Two ways to make the hook report what is live.
+
+The configured signal takes a **snapshot** and returns; the report is written at
+shutdown. That keeps the workload's allocations blocked for the length of a
+snapshot (~2 ms with 20k live allocations) rather than the length of a report
+(~400 ms), because a checkpoint that stalls the process perturbs what it is
+measuring:
 
 ```sh
 kill -<BACKTRACE_DUMP_SIGNAL> <pid>
 ```
+
+The exported C function `checkpoint(const char*)` instead writes a
+live-allocation report to the requested path **synchronously** — when it returns,
+the file is there — and so pays the full cost at the call site.
+
+Signal-driven reports are named
+
+```
+<ALLOC_HOOK_DUMP_PREFIX>.signal.pid_<pid>.seq_<n>.time_<unix_seconds>.txt
+```
+
+Shutdown writes the same form with `.exit.` (the peak snapshot).
+`seq_` counts up per process across all kinds, so reports sort into the order
+they were taken and two checkpoints inside the same wall-clock second cannot
+overwrite each other. Each process gets its own sequence: with the hook preloaded
+process-wide, short-lived children write their own `seq_0`, so always select by
+`pid_` first.
 
 The report contains host/resource totals, allocation sizes and types, timestamps,
 capture state/error, resolution state, and symbolized frames when the module
 snapshot and symbolizer can resolve them. A normal shutdown flushes pending
 unique stacks before the report is emitted. `_exit`, fatal signals, and
 `SIGKILL` cannot provide a normal worker flush.
+
+A checkpoint the process asked for is not abandoned because the process is on its
+way out: shutdown waits (up to 5s) for reports already requested before it blocks
+allocator operations. Both ways in — the signal and `checkpoint()` — go through
+the same guards, and every refusal is announced on stderr rather than left silent:
+
+| stderr line | Meaning |
+| --- | --- |
+| `checkpoint ignored, the process is already exiting` | The request arrived after shutdown passed the point where a report can still be written. Raise it from inside the workload instead of from outside, so it lands in program order. |
+| `checkpoint ignored, the hook is not initialized` | Called before the hook came up, so there is no allocation state to report. |
+| `checkpoint ignored, this thread is already inside the hook` | Re-entered from within the hook. Do not call `checkpoint()` from an allocator callback or a `pthread_atfork` prepare handler. |
+| `checkpoint ignored, no report path given` | `checkpoint()` was called with a null or empty path. |
+| `checkpoint dropped, dump worker queue is full` | Signals arrived faster than reports could be written. |
+| `cannot write report to <path>` | The prefix directory is not writable. |
+| `gave up waiting for N checkpoint report(s)` | A report was still unfinished after 5s; exit proceeded rather than hanging. If the report fd itself wedges — a full or hung filesystem — shutdown can still block behind it afterwards. |
 
 Interpret the values carefully:
 
@@ -126,6 +180,14 @@ Interpret the values carefully:
   time-consistent combined peak rather than adding independent maxima.
 - A `partial` capture, unresolved module, dropped queue item, or symbolizer
   failure is explicit report metadata, not a fabricated frame.
+
+### Locating a per-iteration leak
+
+Comparing two checkpoints of the same process is how a per-iteration leak gets
+found. That workflow has its own guide, including where in the workload the
+checkpoint has to go for the result to mean anything:
+
+[`MEMORY_LEAK.md`](MEMORY_LEAK.md)
 
 ## 6. Troubleshooting
 

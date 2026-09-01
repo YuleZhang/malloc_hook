@@ -53,8 +53,13 @@ C/C++ 和当前线程；托管运行时栈、远程线程上下文和完整离�
 
 [`docs/USAGE.zh-CN.md`](docs/USAGE.zh-CN.md)
 
-英文入口仍为 [`README.md`](README.md)、[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
-和 [`docs/USAGE.md`](docs/USAGE.md)。
+**要查内存泄漏？** 完整步骤 —— 检查点该打在哪、报告怎么读、怎么区分泄漏和业务
+正常占用 —— 在这里：
+
+[`docs/MEMORY_LEAK.zh-CN.md`](docs/MEMORY_LEAK.zh-CN.md)
+
+英文入口仍为 [`README.md`](README.md)、[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)、
+[`docs/USAGE.md`](docs/USAGE.md) 和 [`docs/MEMORY_LEAK.md`](docs/MEMORY_LEAK.md)。
 
 ## 配置项
 
@@ -78,7 +83,7 @@ UAPI，因此缺少该头文件的交叉工具链依然可以抓取 DMA。这一
 | 变量 | 默认值 | 作用 |
 | --- | --- | --- |
 | `DUMP_PEAK_VALUE_MB` | 未设置 | **不设置就不会产生报告。** 打开峰值记录和退出时导出报告，并在跟踪峰值超过该 MB 数后开始抓取快照。设置它同时会把默认最小分配尺寸降到 1 KB。 |
-| `ALLOC_HOOK_DUMP_PREFIX` | `/data/local/tmp/trace/backtrace_heap` | 报告路径前缀。文件名为 `<prefix>.exit.pid_<pid>.time_<t>.txt`，因此报告始终能对应到产生它的进程。 |
+| `ALLOC_HOOK_DUMP_PREFIX` | `/data/local/tmp/trace/backtrace_heap` | 报告路径前缀。文件名为 `<prefix>.<kind>.pid_<pid>.seq_<n>.time_<t>.txt`，其中 kind 为 `signal`（检查点）或 `exit`（峰值快照），因此报告始终能对应到产生它的进程；`seq_` 给同一进程的报告排序，也让同一秒内的两份报告不会互相覆盖。 |
 | `DUMP_PEAK_STEP_MB` | `12` | 峰值每增长这么多 MB 重新抓一次快照。`0` 表示每次新峰值都抓（开销大得多）。对两种峰值判据都生效。 |
 | `ALLOC_HOOK_PEAK_SAMPLE_MS` | 宿主框架公布的采样间隔，否则关闭 | 以该间隔在独立线程上采样进程的**实测**占用——`/proc/self/status` 的 `VmRSS`、dmabuf 字节数，以及这两者都覆盖不到的 GPU 设备映射——并在三者之和取得最大值的那一刻抓快照，而不是在跟踪到的分配字节数最大时抓。这些最大值不在同一时刻：实测中曾出现驻留峰值比设备缓冲峰值早 167 ms。当你要对齐的数字来自外部采样器时就应该开启它，这样堆栈描述的就是那个采样器所称的峰值时刻。`0` 表示强制关闭。 |
 | `BACKTRACE_MIN_SIZE` | 设置了 `DUMP_PEAK_VALUE_MB` 时为 `1024`，否则为 `0` | 小于该尺寸的分配不抓堆栈。这是最主要的开销控制项：典型流水线里它会过滤掉 99% 以上的分配。 |

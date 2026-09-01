@@ -9,9 +9,11 @@
 #include <cstring>
 #include <cstdlib>
 #include <cstdint>
+#include <atomic>
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <vector>
 #ifndef MALLOC_HOOK_ENABLE_DMA_CAPTURE
 #define MALLOC_HOOK_ENABLE_DMA_CAPTURE 0
 #endif
@@ -86,6 +88,23 @@ static int g_signal_pipe[2] = {-1, -1};
 static pthread_t g_signal_thread;
 static bool g_signal_thread_started = false;
 static bool g_signal_debug_enabled = false;
+// Checkpoint accounting. The signal handler may only do async-signal-safe work,
+// so it takes responsibility for a request by bumping `requests` and waking the
+// worker; whoever finishes with that request -- the worker after writing the
+// report, or either side after deciding it cannot be honoured -- bumps
+// `settled`. Finalization compares the two so a checkpoint asked for just before
+// the process exits still produces its report.
+static std::atomic<unsigned> g_checkpoint_requests{0};
+static std::atomic<unsigned> g_checkpoint_settled{0};
+static std::atomic<unsigned> g_checkpoint_dropped{0};
+// Set once finalization has decided no further checkpoint can be served, and
+// always before it blocks allocator operations. See DrainPendingCheckpoints().
+static std::atomic<bool> g_checkpoints_closed{false};
+// How many requests were already outstanding when finalization closed the door.
+// Closing alone is not a usable admission rule: the worker often only reaches a
+// request after finalization has started, and refusing it there would throw away
+// the very checkpoint the run asked for at the end of its last iteration.
+static std::atomic<unsigned> g_checkpoint_admit_upto{0};
 static bool SignalDebugEnabled() {
     return g_signal_debug_enabled;
 }
@@ -137,7 +156,10 @@ static void EnsureParentDirectory(const char* path) {
     mkdir(buffer, 0755);
 }
 
-static void DumpHeapToFileUnlocked(const char* file_name, bool dump_peak) {
+// Returns false when the report could not be written, so a caller can tell the
+// difference between "no report because nothing to say" and "no report because
+// the path was unusable".
+static bool DumpHeapToFileUnlocked(const char* file_name, bool dump_peak) {
     ScopedDisableDebugCalls disable;
 
     EnsureParentDirectory(file_name);
@@ -153,11 +175,12 @@ static void DumpHeapToFileUnlocked(const char* file_name, bool dump_peak) {
         if (written > 0) {
             write(STDERR_FILENO, message, static_cast<size_t>(written));
         }
-        return;
+        return false;
     }
 
     g_debug->pointer->DumpLiveToFile(fd, dump_peak);
     close(fd);
+    return true;
 }
 
 static bool ShouldTrackAllocation(
@@ -170,19 +193,201 @@ static bool ShouldTrackAllocation(
 }
 
 static void singal_dump_heap(int) {
-    if (g_signal_pipe[1] != -1) {
-        const char command = 'd';
-        ssize_t bytes = write(g_signal_pipe[1], &command, sizeof(command));
-        if (g_signal_debug_enabled) {
-            if (bytes == sizeof(command)) {
-                static const char message[] = "alloc_hook: signal handler queued dump\n";
-                write(STDERR_FILENO, message, sizeof(message) - 1);
-            } else {
-                static const char message[] = "alloc_hook: signal handler write failed\n";
-                write(STDERR_FILENO, message, sizeof(message) - 1);
+    if (g_signal_pipe[1] == -1) {
+        g_checkpoint_dropped.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    // Counted before the write so that a worker which consumes the byte
+    // immediately can never settle a request that has not been counted yet --
+    // the drain below would otherwise conclude there is nothing to wait for.
+    g_checkpoint_requests.fetch_add(1, std::memory_order_release);
+    const char command = 'd';
+    ssize_t bytes = write(g_signal_pipe[1], &command, sizeof(command));
+    if (bytes == sizeof(command)) {
+        SignalDebugLog("alloc_hook: signal handler queued dump\n");
+        return;
+    }
+    // Nothing will consume this request, so settle it here or the drain would
+    // wait out its whole timeout at exit.
+    g_checkpoint_dropped.fetch_add(1, std::memory_order_relaxed);
+    g_checkpoint_settled.fetch_add(1, std::memory_order_release);
+    // Reported unconditionally: a checkpoint whose report never appears is
+    // otherwise indistinguishable from one that was never asked for.
+    static const char message[] =
+            "alloc_hook: checkpoint dropped, dump worker queue is full\n";
+    write(STDERR_FILENO, message, sizeof(message) - 1);
+}
+
+// Reports are named with a per-process sequence number as well as the wall
+// clock. time() has one-second granularity, so two checkpoints inside the same
+// second produced identical names and the second silently truncated the first --
+// precisely the case a repeated-checkpoint leak comparison depends on. The
+// sequence is shared with the exit report so one run's reports carry a single
+// total order.
+static unsigned NextReportSequence() {
+    static std::atomic<unsigned> next{0};
+    return next.fetch_add(1, std::memory_order_relaxed);
+}
+
+// Builds "<prefix>.<kind>.pid_<pid>.seq_<n>.time_<t>.txt". Returns false when the
+// configured prefix is long enough to truncate the name, because a truncated
+// name can drop the very field that keeps two reports apart.
+//
+// The sequence and wall clock are parameters so a deferred report can be named
+// for the instant it was captured rather than the instant it was written.
+static bool FormatReportNameAt(
+        char* buffer, size_t size, const char* kind, unsigned sequence,
+        long wall_time) {
+    const int written = snprintf(
+            buffer, size, "%s.%s.pid_%d.seq_%u.time_%ld.txt",
+            g_debug->config().backtrace_dump_prefix(), kind, getpid(), sequence,
+            wall_time);
+    if (written > 0 && static_cast<size_t>(written) < size) {
+        return true;
+    }
+    static const char message[] =
+            "alloc_hook: cannot name report, ALLOC_HOOK_DUMP_PREFIX is too long\n";
+    write(STDERR_FILENO, message, sizeof(message) - 1);
+    return false;
+}
+
+static bool FormatReportName(char* buffer, size_t size, const char* kind) {
+    return FormatReportNameAt(
+            buffer, size, kind, NextReportSequence(),
+            static_cast<long>(time(NULL)));
+}
+
+// Snapshots the signal path captured, written out at shutdown.
+//
+// Deliberately leaked, like the rest of the hook's state: finalization runs
+// while the C++ runtime is being torn down, and a static destructor racing that
+// is how a diagnostic tool turns into a crash.
+static std::vector<CheckpointSnapshot>& RetainedCheckpoints() {
+    static std::vector<CheckpointSnapshot>* snapshots =
+            new std::vector<CheckpointSnapshot>();
+    return *snapshots;
+}
+static std::mutex g_checkpoint_snapshot_mutex;
+// A bound, so a run that signals in a loop cannot grow this without limit. Each
+// snapshot is a few hundred (stack, size) buckets, tens of KB.
+static constexpr size_t kMaxRetainedCheckpoints = 64;
+
+// Writes a live-allocation report, refusing with a diagnostic in every state
+// where the write would crash, block forever, or produce nothing.
+//
+// This is the single implementation behind both ways in: the dump signal and the
+// exported checkpoint() entry point. They used to share nothing, so only the
+// signal path had any of these checks -- a direct call could dereference a null
+// g_debug, run strlen() on a null path, or park forever on the allocator read
+// lock after finalization took the write side for good.
+//
+// Exactly one of `kind` (report named by the hook) and `explicit_path` (name
+// chosen by the caller) is used. `preclaimed_slot` is non-zero only for the
+// signal worker: the signal handler already claimed that request's slot so the
+// drain at exit would know about a byte still sitting in the pipe. Every other
+// caller claims one here, which is what makes finalization wait for a direct
+// call's report too.
+static bool Checkpoint(
+        const char* kind, const char* explicit_path, unsigned preclaimed_slot) {
+    // Nothing below may run before the hook has state to report on. Checked
+    // first because it is the only check that does not need g_debug itself.
+    if (g_debug == nullptr) {
+        static const char message[] =
+                "alloc_hook: checkpoint ignored, the hook is not initialized\n";
+        write(STDERR_FILENO, message, sizeof(message) - 1);
+        return false;
+    }
+    if (!(g_debug->config().options() & BACKTRACE)) {
+        static const char message[] =
+                "alloc_hook: checkpoint ignored, stack capture is disabled\n";
+        write(STDERR_FILENO, message, sizeof(message) - 1);
+        return false;
+    }
+
+    const unsigned slot = preclaimed_slot != 0
+            ? preclaimed_slot
+            : g_checkpoint_requests.fetch_add(1, std::memory_order_acq_rel) + 1;
+    bool written = false;
+
+    // Checked before taking any lock. Finalization holds the allocator write
+    // lock and never releases it, so a read lock taken after that point parks
+    // the caller until the process dies -- the report would never appear and the
+    // run would not say why. A request that was already claimed before the door
+    // shut is still served; see DrainPendingCheckpoints().
+    if (g_checkpoints_closed.load(std::memory_order_acquire) &&
+        slot > g_checkpoint_admit_upto.load(std::memory_order_acquire)) {
+        static const char message[] =
+                "alloc_hook: checkpoint ignored, the process is already exiting\n";
+        write(STDERR_FILENO, message, sizeof(message) - 1);
+        g_checkpoint_dropped.fetch_add(1, std::memory_order_relaxed);
+    } else if (DebugCallsDisabled()) {
+        // Already inside the hook on this thread. DumpLiveToFile takes the two
+        // tracker mutexes, both non-recursive, so re-entering would self-lock.
+        static const char message[] =
+                "alloc_hook: checkpoint ignored, this thread is already inside "
+                "the hook\n";
+        write(STDERR_FILENO, message, sizeof(message) - 1);
+        g_checkpoint_dropped.fetch_add(1, std::memory_order_relaxed);
+    } else {
+        char generated[PATH_MAX];
+        const char* path = explicit_path;
+        bool have_path = false;
+        if (kind != nullptr) {
+            // The signal path. It must not generate the report here: doing so
+            // holds both tracker mutexes for the whole of GetUniqueList's sort,
+            // two /proc walks and one unbuffered dprintf per line, which
+            // measured 1.2s with 60k live allocations -- with every allocation
+            // in the process blocked behind it, perturbing the very thing the
+            // checkpoint is measuring. Capture a snapshot, resolve it off the
+            // locks, and let shutdown write it.
+            ScopedDisableDebugCalls disable;
+            CheckpointSnapshot snapshot;
+            snapshot.sequence = NextReportSequence();
+            snapshot.wall_time = static_cast<long>(time(NULL));
+            g_debug->pointer->TakeCheckpointSnapshot(&snapshot);
+            g_debug->pointer->ResolveCheckpointSnapshot(&snapshot);
+            if (FormatReportNameAt(
+                        generated, sizeof(generated), kind, snapshot.sequence,
+                        snapshot.wall_time)) {
+                snapshot.report_path = generated;
+                std::lock_guard<std::mutex> guard(g_checkpoint_snapshot_mutex);
+                std::vector<CheckpointSnapshot>& retained = RetainedCheckpoints();
+                if (retained.size() < kMaxRetainedCheckpoints) {
+                    retained.push_back(std::move(snapshot));
+                    written = true;
+                } else {
+                    static const char message[] =
+                            "alloc_hook: checkpoint dropped, too many retained "
+                            "snapshots\n";
+                    write(STDERR_FILENO, message, sizeof(message) - 1);
+                }
             }
+        } else if (explicit_path != nullptr && explicit_path[0] != '\0') {
+            // The exported checkpoint() entry point. Stays synchronous: the
+            // caller named a file and expects it to exist when the call
+            // returns, and having asked for it explicitly is having opted into
+            // the cost.
+            path = explicit_path;
+            have_path = true;
+        } else {
+            // A null or empty path would reach strlen() inside
+            // EnsureParentDirectory.
+            static const char message[] =
+                    "alloc_hook: checkpoint ignored, no report path given\n";
+            write(STDERR_FILENO, message, sizeof(message) - 1);
+        }
+        if (have_path) {
+            ScopedConcurrentLock lock;
+            written = DumpHeapToFileUnlocked(path, false);
+        }
+        if (!written) {
+            g_checkpoint_dropped.fetch_add(1, std::memory_order_relaxed);
         }
     }
+
+    // On every path, or the drain at exit would wait out its whole timeout.
+    g_checkpoint_settled.fetch_add(1, std::memory_order_release);
+    return written;
 }
 
 static void* signal_dump_thread(void*) {
@@ -191,6 +396,7 @@ static void* signal_dump_thread(void*) {
     sigaddset(&blocked_signals, g_debug->config().backtrace_dump_signal());
     pthread_sigmask(SIG_BLOCK, &blocked_signals, nullptr);
 
+    unsigned consumed = 0;
     while (true) {
         char command;
         ssize_t bytes = read(g_signal_pipe[0], &command, sizeof(command));
@@ -200,20 +406,85 @@ static void* signal_dump_thread(void*) {
             }
             break;
         }
-        if (command != 'd' || g_debug == nullptr ||
-            !(g_debug->config().options() & BACKTRACE)) {
+        // 1-based position of this request in the queue. Local because this is
+        // the only consumer, and passed to Checkpoint() so that "already asked
+        // for" is decided by when the signal arrived, not by when this thread
+        // happened to get scheduled.
+        ++consumed;
+        if (command != 'd') {
+            // Still settles: every consumed byte settles exactly one request,
+            // whatever the outcome, so the drain at exit always terminates.
+            g_checkpoint_settled.fetch_add(1, std::memory_order_release);
             continue;
         }
-
-        char file_name[256];
-        snprintf(
-                file_name, sizeof(file_name), "%s.signal.pid_%d.time_%ld.txt",
-                g_debug->config().backtrace_dump_prefix(), getpid(), time(NULL));
-        SignalDebugLog("alloc_hook: signal thread dumping heap\n");
-        debug_dump_heap(file_name);
-        SignalDebugLog("alloc_hook: signal thread finished heap dump\n");
+        SignalDebugLog("alloc_hook: signal thread taking checkpoint snapshot\n");
+        Checkpoint("signal", nullptr, consumed);
+        SignalDebugLog("alloc_hook: signal thread finished snapshot\n");
     }
     return nullptr;
+}
+
+// Writes every retained checkpoint snapshot. Called at shutdown, once
+// allocations are already blocked, so the formatting costs the run nothing.
+static void WriteRetainedCheckpoints() {
+    std::lock_guard<std::mutex> guard(g_checkpoint_snapshot_mutex);
+    for (CheckpointSnapshot& snapshot : RetainedCheckpoints()) {
+        EnsureParentDirectory(snapshot.report_path.c_str());
+        const int fd = open(
+                snapshot.report_path.c_str(),
+                O_RDWR | O_CREAT | O_NOFOLLOW | O_TRUNC | O_CLOEXEC, 0644);
+        if (fd == -1) {
+            char message[PATH_MAX + 64];
+            const int written = snprintf(
+                    message, sizeof(message),
+                    "alloc_hook: cannot write checkpoint report to %s: %s\n",
+                    snapshot.report_path.c_str(), strerror(errno));
+            if (written > 0) {
+                write(STDERR_FILENO, message, static_cast<size_t>(written));
+            }
+            continue;
+        }
+        g_debug->pointer->WriteCheckpointSnapshot(fd, snapshot);
+        close(fd);
+    }
+}
+
+// Lets every checkpoint that was already asked for finish before finalization
+// shuts the allocator down.
+//
+// The admission bound is published before the closed flag, so the worker can
+// only ever read a bound that is at least as large as the set of requests that
+// existed before the door shut: a request the run had already made is served,
+// and one that arrives afterwards settles without reaching for a lock nobody
+// will release. Bounded, because a wedged worker must not be able to stop the
+// process from exiting.
+static void DrainPendingCheckpoints() {
+    g_checkpoint_admit_upto.store(
+            g_checkpoint_requests.load(std::memory_order_acquire),
+            std::memory_order_release);
+    g_checkpoints_closed.store(true, std::memory_order_release);
+    // No early return on a missing signal worker: a direct checkpoint() call
+    // takes a slot in the same accounting, so its report can be in flight here
+    // whether or not the dump signal was ever configured.
+    constexpr unsigned kTimeoutMs = 5000;
+    constexpr unsigned kPollUs = 1000;
+    for (unsigned waited_ms = 0; waited_ms < kTimeoutMs; ++waited_ms) {
+        if (g_checkpoint_settled.load(std::memory_order_acquire) >=
+            g_checkpoint_requests.load(std::memory_order_acquire)) {
+            return;
+        }
+        usleep(kPollUs);
+    }
+    char message[128];
+    const int written = snprintf(
+            message, sizeof(message),
+            "alloc_hook: gave up waiting for %u checkpoint report(s) after %ums\n",
+            g_checkpoint_requests.load(std::memory_order_acquire) -
+                    g_checkpoint_settled.load(std::memory_order_acquire),
+            kTimeoutMs);
+    if (written > 0) {
+        write(STDERR_FILENO, message, static_cast<size_t>(written));
+    }
 }
 
 static bool StartSignalDumpThread() {
@@ -316,6 +587,13 @@ static void HookAtForkChild() {
     // keeps accounting allocations, it just has no signal dump or sampler until
     // something restarts them.
     g_signal_thread_started = false;
+    // A request the parent had in flight at fork time has no worker here to
+    // settle it, so the child would otherwise wait out the whole drain timeout
+    // at exit for a report that can never be written.
+    g_checkpoint_requests.store(0, std::memory_order_relaxed);
+    g_checkpoint_settled.store(0, std::memory_order_relaxed);
+    g_checkpoint_dropped.store(0, std::memory_order_relaxed);
+    g_checkpoint_admit_upto.store(0, std::memory_order_relaxed);
     ObservedPeakSamplerInstance().ResetAfterForkInChild();
 }
 
@@ -381,6 +659,11 @@ void debug_finalize() {
     // once it returns.
     ObservedPeakSamplerInstance().Stop();
 
+    // Before anything narrows what the allocator may do: a checkpoint asked for
+    // at the end of the last iteration of a run has to still produce its report,
+    // and this is the last point at which the worker can take the locks it needs.
+    DrainPendingCheckpoints();
+
     // Make sure that there are no other threads doing debug allocations
     // before we kill everything.
     ScopedConcurrentLock::BlockAllOperations();
@@ -388,16 +671,22 @@ void debug_finalize() {
     // Turn off capturing allocations calls.
     DebugDisableSet(true);
 
+    // The checkpoints this run asked for. They were captured when the signal
+    // arrived and are only written now: formatting is the expensive half, and
+    // doing it here costs the run nothing because the process is already on its
+    // way out. Each file is still named for the instant it was captured.
+    WriteRetainedCheckpoints();
+
     if ((g_debug->config().options() & BACKTRACE) &&
         g_debug->config().backtrace_dump_on_exit()) {
-        char file_name[512];
         // The PID is part of the name so a report can be tied back to the
         // process that produced it; a hook injected process-wide may write
-        // several.
-        snprintf(
-                file_name, sizeof(file_name), "%s.exit.pid_%d.time_%ld.txt",
-                g_debug->config().backtrace_dump_prefix(), getpid(), time(NULL));
-        DumpHeapToFileUnlocked(file_name, true);
+        // several. The sequence number continues the one the checkpoint reports
+        // use, so the exit report sorts after them.
+        char file_name[PATH_MAX];
+        if (FormatReportName(file_name, sizeof(file_name), "exit")) {
+            DumpHeapToFileUnlocked(file_name, true);
+        }
     }
 
     if (g_debug->TrackPointers()) {
@@ -410,8 +699,10 @@ void debug_finalize() {
 }
 
 void debug_dump_heap(const char* file_name) {
-    ScopedConcurrentLock lock;
-    DumpHeapToFileUnlocked(file_name, false);
+    // Every guard lives in Checkpoint(), so the exported checkpoint() entry
+    // point is exactly as safe as the signal path rather than being the one way
+    // in with no checks at all.
+    Checkpoint(nullptr, file_name, 0);
 }
 
 static void* InternalMalloc(size_t requested_size, size_t tracked_size) {

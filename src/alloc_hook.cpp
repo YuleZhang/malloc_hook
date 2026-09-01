@@ -624,6 +624,19 @@ void* mmap64(void* addr, size_t size, int prot, int flags, int fd, off_t offset)
 #endif
 
 void checkpoint(const char* file_name) {
+    // The same prologue the mapping/resource entry points use. Without it a
+    // caller reached during the loader's preinit window would make inst()
+    // lazily run the whole of debug_initialize() there -- installing a signal
+    // handler, creating the dump worker and registering fork handlers before
+    // the process is ready for any of it. There is no real function to forward
+    // to, so the honest answer is to produce no report.
+    //
+    // This does not shut out legitimately early app calls: mark_init_done() is
+    // a constructor in this library, and an app's own constructors run after
+    // every preloaded library's.
+    if (in_preinit_phase || InitState::allocHook_setup) {
+        return;
+    }
     AllocHook::inst().checkpoint(file_name);
 }
 }

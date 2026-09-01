@@ -172,6 +172,45 @@ if(NOT ANDROID AND NOT OHOS)
         # first hang) so a deadlock surfaces as the test's own assertion rather
         # than as an opaque ctest timeout.
         set_tests_properties(fork_lock_safety PROPERTIES TIMEOUT 60)
+
+        add_executable(checkpoint_report_test
+            checkpoint_report_test.cpp)
+        target_compile_features(checkpoint_report_test PRIVATE cxx_std_17)
+        target_include_directories(checkpoint_report_test PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/../backtrace/include)
+        target_link_libraries(checkpoint_report_test PRIVATE
+            helper Threads::Threads)
+        add_test(NAME checkpoint_report COMMAND checkpoint_report_test)
+        # Above the in-test waits (5s per report, plus finalization's own 5s
+        # checkpoint drain) so a lost report fails an assertion here rather than
+        # showing up as an opaque ctest timeout.
+        set_tests_properties(checkpoint_report PROPERTIES TIMEOUT 60)
+
+        add_executable(checkpoint_guard_test
+            checkpoint_guard_test.cpp)
+        target_compile_features(checkpoint_guard_test PRIVATE cxx_std_17)
+        target_include_directories(checkpoint_guard_test PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/../backtrace/include)
+        target_link_libraries(checkpoint_guard_test PRIVATE
+            helper Threads::Threads)
+        add_test(NAME checkpoint_guard COMMAND checkpoint_guard_test)
+        # Above the in-test per-child deadline, which the test stops at on the
+        # first hang, so a checkpoint that parks on the allocator lock after
+        # finalization surfaces as this test's own assertion rather than as an
+        # opaque ctest timeout.
+        set_tests_properties(checkpoint_guard PROPERTIES TIMEOUT 120)
+
+        add_executable(checkpoint_cost_test
+            checkpoint_cost_test.cpp)
+        target_compile_features(checkpoint_cost_test PRIVATE cxx_std_17)
+        target_include_directories(checkpoint_cost_test PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/../backtrace/include)
+        target_link_libraries(checkpoint_cost_test PRIVATE
+            helper Threads::Threads)
+        add_test(NAME checkpoint_cost COMMAND checkpoint_cost_test)
+        # The gate compares a snapshot against a full report on the same live
+        # set, so it has to be able to run both even on a slow machine.
+        set_tests_properties(checkpoint_cost PROPERTIES TIMEOUT 120)
     endif()
 endif()
 

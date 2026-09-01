@@ -64,6 +64,52 @@ struct PeakProcContext {
 
 enum MemType { HOST, MMAP, DMA };
 
+// One bucket of a checkpoint snapshot: the live allocations that share a stack,
+// a size and a type. That is exactly the key the report already deduplicates on
+// (see GetUniqueList), so a snapshot written out later reproduces the report a
+// synchronous dump would have produced at the same instant.
+struct CheckpointStack {
+    size_t size = 0;
+    size_t num_allocations = 0;
+    MemType mem_type = HOST;
+    // Earliest allocation in the bucket, so buckets can be ordered by when each
+    // first appeared -- the ordering a back-to-front comparison relies on.
+    timeval alloc_time = {};
+    StackCaptureState capture_state = StackCaptureState::Empty;
+    uint8_t terminal_error = 0;
+    // Held only between capture and resolution: a refcount bump keeps the PCs
+    // alive if the last allocation using them is freed in between. Released
+    // once frame_block has been built.
+    std::shared_ptr<const std::vector<uintptr_t>> raw_frames;
+    // The report's frame lines, already module-relative. Built off the
+    // allocation locks so writing the report is a pure copy.
+    std::string frame_block;
+};
+
+// What one checkpoint captured.
+//
+// Building this is the only work done while the allocation locks are held: one
+// pass over the live table, no sort, no /proc, no formatting, no I/O. Resolving
+// module-relative PCs, reading /proc and writing the report all happen
+// afterwards, because a checkpoint that blocks every allocation in the process
+// for the length of a report perturbs the very thing it is measuring -- measured
+// at 1.2s for 60k live allocations before the work was moved out.
+struct CheckpointSnapshot {
+    unsigned sequence = 0;
+    long wall_time = 0;
+    // Built at capture time so the file name carries the instant the checkpoint
+    // happened, not the instant shutdown got round to writing it.
+    std::string report_path;
+    size_t host_used = 0;
+    size_t dma_used = 0;
+    size_t total_used = 0;
+    size_t live_pointers = 0;
+    size_t unique_stacks = 0;
+    OmittedStats omitted;
+    std::vector<CheckpointStack> stacks;
+    PeakProcContext proc;
+};
+
 // What made the retained peak snapshot the peak.
 //
 // `Tracked` is the sum of requested bytes the hook is accounting for, which is
@@ -198,6 +244,17 @@ public:
 
     void DumpLiveToFile(int fd, bool dump_peak = true);
     void DumpPeakInfo();
+
+    // The three stages of a checkpoint, split so that only the first one runs
+    // with the allocation locks held.
+    //
+    // Capture aggregates the live table in a single pass. Resolve turns the raw
+    // PCs into module-relative frame lines and reads the /proc context, and must
+    // run with no allocation lock held. Write emits the same report format
+    // DumpLiveToFile produces, and is a pure copy.
+    void TakeCheckpointSnapshot(CheckpointSnapshot* out);
+    void ResolveCheckpointSnapshot(CheckpointSnapshot* snapshot);
+    void WriteCheckpointSnapshot(int fd, const CheckpointSnapshot& snapshot);
     // Snapshots the live allocation stacks because the evaluator-visible
     // footprint (host RSS + dmabuf bytes) has reached a new maximum. Called
     // from the sampler thread, never from the allocation path.
