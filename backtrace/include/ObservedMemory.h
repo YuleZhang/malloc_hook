@@ -378,7 +378,9 @@ struct ObservedSamplerStats {
 // peak.
 class ObservedPeakSampler {
 public:
-    using PeakCallback = void (*)(const ObservedMemSample&);
+    // Returns whether the callee retained a snapshot for this sample. A
+    // first-crossing run is only finished once one was actually retained.
+    using PeakCallback = bool (*)(const ObservedMemSample&);
 
     // Constant-initialised, so the process-wide instance below needs no dynamic
     // initialisation and is safe to reach from the interposition path.
@@ -387,9 +389,12 @@ public:
     // `interval_ms` == 0 disables sampling and returns false. `floor_bytes` is
     // the observed total a run must reach before the first snapshot;
     // `step_bytes` bounds how often the snapshot is refreshed afterwards.
+    // `one_shot` keeps only the first crossing of the floor: the snapshot is
+    // never refreshed, and `step_bytes` is unused. Sampling continues either
+    // way, so the observed-peak statistics stay complete.
     bool Start(
             unsigned interval_ms, size_t floor_bytes, size_t step_bytes,
-            PeakCallback on_new_peak);
+            bool one_shot, PeakCallback on_new_peak);
     // Idempotent. Joins the sampler thread, so after it returns the statistics
     // below are stable and no snapshot can be in flight.
     void Stop();
@@ -428,6 +433,7 @@ private:
     unsigned interval_ms_{0};
     size_t floor_bytes_{0};
     size_t step_bytes_{0};
+    bool one_shot_{false};
     PeakCallback on_new_peak_{nullptr};
 
     // Written by the sampler thread only, but read by a report that a signal

@@ -415,7 +415,15 @@ bool PointerData::Initialize(const Config& config) {
     for (auto& word : pointer_filter_) {
         word.store(0, std::memory_order_relaxed);
     }
+    // The floor gates this path too, even though it is a watermark of a
+    // different quantity. It is not a criterion here, only the point at which
+    // the fallback wakes up: tracked bytes reaching the floor means the observed
+    // total passed it earlier, so a sampler that has still not snapshotted is
+    // one that never started or wedged. Below the floor this path stays silent,
+    // which is what keeps a first-crossing run down to a single stack walk.
     next_peak_record_threshold_ = config.backtrace_dump_peak_val();
+    tracked_peak_once_ = config.peak_retention() == PeakRetention::FirstCrossing;
+    peak_snapshot_final_ = false;
     peak_record_step_bytes_ = config.peak_record_step_bytes();
     peak_snapshot_source_ = PeakSnapshotSource::None;
     peak_observed_rss_ = 0;
@@ -513,6 +521,12 @@ void PointerData::MarkPointerFilter(const void* ptr) {
 // Caller holds pointer_mutex_. Takes frame_mutex_ (pointer -> frame is the only
 // order used anywhere in this file).
 void PointerData::MaybeRecordPeakSnapshotLocked() {
+    // A final snapshot is never replaced, not even by a stalled sampler's
+    // fallback below: first-crossing retention promises exactly one stack walk
+    // for the run, and the walk is the cost the mode exists to avoid.
+    if (peak_snapshot_final_) {
+        return;
+    }
     if (!(g_debug->config().options() & RECORD_MEMORY_PEAK) ||
         peak_tot <= next_peak_record_threshold_) {
         return;
@@ -530,7 +544,22 @@ void PointerData::MaybeRecordPeakSnapshotLocked() {
         !ObservedPeakSamplerInstance().Stalled()) {
         return;
     }
-    TakePeakSnapshotLocked(PeakSnapshotSource::Tracked, nullptr, nullptr);
+    const bool retained =
+            TakePeakSnapshotLocked(PeakSnapshotSource::Tracked, nullptr, nullptr);
+    if (tracked_peak_once_) {
+        // Only a snapshot that was actually retained ends the search. Nothing
+        // carrying a stack yet means the crossing produced no report material,
+        // so the threshold stays where it is and the next new peak tries again.
+        if (retained) {
+            // Pinned out of reach so the hot path's threshold test keeps
+            // rejecting every later peak without a second check. The report
+            // describes the floor crossing from here on; the run's exact maximum
+            // still comes from the counters, which keep updating.
+            peak_snapshot_final_ = true;
+            next_peak_record_threshold_ = SIZE_MAX;
+        }
+        return;
+    }
     if (peak_record_step_bytes_ == 0) {
         next_peak_record_threshold_ = peak_tot;
     } else {
@@ -540,7 +569,7 @@ void PointerData::MaybeRecordPeakSnapshotLocked() {
 }
 
 // Caller holds pointer_mutex_.
-void PointerData::TakePeakSnapshotLocked(
+bool PointerData::TakePeakSnapshotLocked(
         PeakSnapshotSource source, const ObservedMemSample* observed,
         PeakProcContext* proc) {
     PeakProcContext collected;
@@ -557,7 +586,7 @@ void PointerData::TakePeakSnapshotLocked(
     // from this list, so accounting stays exact without paying for the walk.
     GetUniqueList(&next_peak_list, true);
     if (next_peak_list.empty()) {
-        return;
+        return false;
     }
     peak_list = std::move(next_peak_list);
     peak_list_host = current_host;
@@ -590,6 +619,7 @@ void PointerData::TakePeakSnapshotLocked(
             peak_stack_pc_bytes += frame.second.frames->size() * sizeof(uintptr_t);
         }
     }
+    return true;
 }
 
 void PointerData::CollectPeakProcContext(PeakProcContext* out) {
@@ -600,9 +630,9 @@ void PointerData::CollectPeakProcContext(PeakProcContext* out) {
     out->filled = true;
 }
 
-void PointerData::RecordObservedPeak(const ObservedMemSample& sample) {
+bool PointerData::RecordObservedPeak(const ObservedMemSample& sample) {
     if (g_debug == nullptr || !(g_debug->config().options() & RECORD_MEMORY_PEAK)) {
-        return;
+        return false;
     }
     // Read before the locks are taken. This runs on the sampler thread, so the
     // page-table walk costs the sampler its cadence rather than costing every
@@ -615,7 +645,25 @@ void PointerData::RecordObservedPeak(const ObservedMemSample& sample) {
     // from installing a tracked-bytes peak that the report would then present
     // as if it were the observed one.
     observed_peak_active_.store(true, std::memory_order_relaxed);
-    TakePeakSnapshotLocked(PeakSnapshotSource::Observed, &sample, &proc);
+    // Deliberately not gated on peak_snapshot_final_. Under first-crossing
+    // retention the allocation path may have reached the floor first -- tracked
+    // bytes can exceed the observed total when large allocations are not yet
+    // faulted in -- and that crossing is only a proxy for this one. Letting the
+    // observed criterion replace it once costs a second stack walk in that case
+    // and buys the alignment the mode is measured against.
+    const bool retained =
+            TakePeakSnapshotLocked(PeakSnapshotSource::Observed, &sample, &proc);
+    if (retained &&
+        g_debug->config().peak_retention() == PeakRetention::FirstCrossing) {
+        // Marking the snapshot final closes the allocation path's fallback as
+        // well: after the crossing there is nothing left to improve on, and a
+        // stalled sampler must not cause a second stack walk. A crossing that
+        // retained nothing -- no live allocation carried a stack yet -- leaves
+        // both paths open so the run can still produce a report.
+        peak_snapshot_final_ = true;
+        next_peak_record_threshold_ = SIZE_MAX;
+    }
+    return retained;
 }
 
 void PointerData::Add(
@@ -962,8 +1010,13 @@ void PointerData::DumpLiveToFile(int fd, bool dump_peak) {
     std::vector<ListInfoType> list;
     size_t host_use = 0, dma_use = 0;
     OmittedStats omitted;
-    const bool dumping_peak =
+    const bool peak_requested =
             (g_debug->config().options() & RECORD_MEMORY_PEAK) && dump_peak;
+    // A first-crossing run whose floor was never reached has no snapshot to
+    // report. Falling back to the live list keeps such a run useful: a report
+    // whose totals are all zero and whose stack section is empty is
+    // indistinguishable from a hook that captured nothing.
+    const bool dumping_peak = peak_requested && !peak_list.empty();
     if (dumping_peak) {
         list = peak_list;
         // The snapshot only retains allocations that carry a stack, so its
@@ -1022,13 +1075,35 @@ void PointerData::DumpLiveToFile(int fd, bool dump_peak) {
     // past DUMP_PEAK_STEP_MB again, so a run whose peak never grows that much
     // more keeps an earlier snapshot. Print the exact peak counters next to it
     // so the headline total can never understate what the process reached.
-    if (dumping_peak) {
+    if (peak_requested) {
+        const bool first_crossing = g_debug->config().peak_retention() ==
+                                    PeakRetention::FirstCrossing;
         dprintf(fd,
                 "process_peak: host=%fMB dma=%fMB total=%fMB "
                 "(snapshot_total=%fMB, step=%fMB)\n",
                 peak_host / 1024.0 / 1024.0, peak_dma / 1024.0 / 1024.0,
                 peak_tot / 1024.0 / 1024.0, peak_list_tot / 1024.0 / 1024.0,
                 peak_record_step_bytes_ / 1024.0 / 1024.0);
+        // Which watermark the stack list describes. Under first-crossing
+        // retention it is the floor, not the maximum, so process_peak above and
+        // the observed maxima below are legitimately far higher than the
+        // snapshot -- without this line that gap reads as missed allocations.
+        if (first_crossing) {
+            dprintf(fd,
+                    "peak_retention: first_crossing floor=%fMB (single snapshot; "
+                    "step unused)\n",
+                    g_debug->config().backtrace_dump_peak_val() / 1024.0 / 1024.0);
+        } else {
+            dprintf(fd, "peak_retention: chase_max (snapshot refreshed per step)\n");
+        }
+        // A floor that the run never reached leaves nothing to report at the
+        // peak, so say so explicitly next to the exit-time list that replaced
+        // it. This is the signal that the floor was set too high for this run.
+        if (!dumping_peak) {
+            dprintf(fd,
+                    "peak_snapshot: none (criterion never passed the floor; the "
+                    "list above is live at report time)\n");
+        }
         // Which instant the stack list above actually describes.
         //
         // Without this the report cannot be lined up against an external
@@ -1036,11 +1111,16 @@ void PointerData::DumpLiveToFile(int fd, bool dump_peak) {
         // routinely hundreds of milliseconds and tens of MB apart, and a reader
         // comparing them would attribute the gap to missed allocations.
         const ObservedSamplerStats sampler = ObservedPeakSamplerInstance().stats();
-        dprintf(fd, "peak_criterion: %s\n",
-                peak_snapshot_source_ == PeakSnapshotSource::Observed
-                        ? "observed_host_rss_plus_dma_plus_gpu (from /proc, aligned "
-                          "with an external sampler)"
-                        : "tracked_allocation_bytes");
+        const char* criterion = "tracked_allocation_bytes";
+        if (peak_snapshot_source_ == PeakSnapshotSource::Observed) {
+            criterion = "observed_host_rss_plus_dma_plus_gpu (from /proc, aligned "
+                        "with an external sampler)";
+        } else if (peak_snapshot_source_ == PeakSnapshotSource::None) {
+            // No snapshot means no criterion produced one. Naming a criterion
+            // here would attribute the empty snapshot to it.
+            criterion = "none (nothing was snapshotted)";
+        }
+        dprintf(fd, "peak_criterion: %s\n", criterion);
         if (peak_snapshot_source_ == PeakSnapshotSource::Observed) {
             dprintf(fd,
                     "observed_peak(at_snapshot): rss=%fMB dma=%fMB gpu=%fMB "
@@ -1050,6 +1130,23 @@ void PointerData::DumpLiveToFile(int fd, bool dump_peak) {
                     peak_observed_gpu_ / 1024.0 / 1024.0,
                     (peak_observed_rss_ + peak_observed_dma_ + peak_observed_gpu_) /
                             1024.0 / 1024.0);
+            // How much the criterion kept growing after the snapshot was taken.
+            // Under first-crossing retention this is the tuning signal for the
+            // next run: it is exactly how much higher the floor could have been
+            // set, and a large value means the stacks describe the ramp rather
+            // than the peak.
+            const size_t at_snapshot =
+                    peak_observed_rss_ + peak_observed_dma_ + peak_observed_gpu_;
+            if (sampler.peak_total_bytes > at_snapshot) {
+                dprintf(fd, "snapshot_lag: observed=+%fMB (of %fMB peak)\n",
+                        (sampler.peak_total_bytes - at_snapshot) / 1024.0 / 1024.0,
+                        sampler.peak_total_bytes / 1024.0 / 1024.0);
+            }
+        } else if (dumping_peak && peak_tot > peak_list_tot) {
+            // Same signal for the tracked criterion, whose own maximum is exact.
+            dprintf(fd, "snapshot_lag: tracked=+%fMB (of %fMB peak)\n",
+                    (peak_tot - peak_list_tot) / 1024.0 / 1024.0,
+                    peak_tot / 1024.0 / 1024.0);
         }
         if (sampler.samples != 0) {
             // The maximum of the sum, with every part as it stood at that

@@ -206,7 +206,11 @@ public:
     // observed peak has been snapshotted, the tracked-bytes trigger stops
     // overwriting it, because that trigger fires at an instant nothing outside
     // the process reports.
-    void RecordObservedPeak(const ObservedMemSample& sample);
+    //
+    // Returns whether a snapshot was retained. A crossing at a moment when no
+    // live allocation carries a stack has no report material, and the sampler
+    // uses the result to decide whether a first-crossing run is done.
+    bool RecordObservedPeak(const ObservedMemSample& sample);
     // fork() only clones the calling thread, so a mutex another thread held at
     // fork time stays locked forever in the child. These acquire and release
     // both tracker mutexes in the canonical pointer -> frame order so a
@@ -232,7 +236,9 @@ private:
     // frame_mutex_. Shared by both peak criteria so the snapshot contents can
     // never differ depending on what triggered it. `proc` is the already
     // collected /proc context, or nullptr to collect it under the locks.
-    void TakePeakSnapshotLocked(
+    // Returns false when nothing was retained because no live allocation
+    // carries a stack.
+    bool TakePeakSnapshotLocked(
             PeakSnapshotSource source, const ObservedMemSample* observed,
             PeakProcContext* proc);
     // Reads the /proc state a snapshot records. Takes no hook lock, so it can
@@ -255,6 +261,15 @@ private:
     size_t peak_tot, peak_host, peak_dma;
     size_t next_peak_record_threshold_;
     size_t peak_record_step_bytes_;
+    // Set once the retained snapshot is final, so nothing can replace it. Only
+    // first-crossing retention sets it. Guarded by pointer_mutex_, which both
+    // the allocation path and the sampler thread hold when they touch it.
+    bool peak_snapshot_final_ = false;
+    // Whether this path keeps only the first crossing of the floor, matching the
+    // configured retention. It reaches a snapshot only when the sampler never
+    // delivered one, and the floor is what it waits for, so the single walk it
+    // is then allowed lands at the same watermark the sampler would have used.
+    bool tracked_peak_once_ = false;
     std::vector<ListInfoType> peak_list;
     // Exact live totals at the moment peak_list was taken. The snapshot only
     // holds allocations that carry a stack, so report totals must come from

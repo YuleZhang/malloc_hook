@@ -25,6 +25,16 @@ static constexpr char kFastCaptureIntervalEnv[] =
         "ALLOC_HOOK_FAST_CAPTURE_INTERVAL_BYTES";
 static constexpr char kDumpPrefixEnv[] = "ALLOC_HOOK_DUMP_PREFIX";
 static constexpr char kPeakSampleIntervalEnv[] = "ALLOC_HOOK_PEAK_SAMPLE_MS";
+static constexpr char kDumpPeakValueEnv[] = "DUMP_PEAK_VALUE_MB";
+// Cadence used when peak recording is on but nothing published an interval. The
+// criterion is a watermark of the observed total, which only the sampler can
+// evaluate, so there is no "no sampler" fallback to take.
+//
+// Deliberately coarse. Under first-crossing retention exactly one snapshot is
+// taken for the whole run, so the cadence only bounds how far past the floor the
+// crossing is noticed; a fine cadence would read /proc hundreds of times a second
+// on a pipeline that is being measured precisely because its timing matters.
+static constexpr size_t kDefaultPeakSampleMs = 50;
 // A host framework that samples this process's memory publishes the interval it
 // uses under a variable whose name ends in this suffix. Adopting that interval
 // makes the hook snapshot the stacks at the same instant such a framework calls
@@ -149,17 +159,47 @@ bool Config::Init() {
     // 记录 trace
     options_ |= TRACK_ALLOCS;
 
-    // 峰值大于 backtrace_dump_peak_val_ 才记录峰值时刻的 trace
-    if (ParseValue(getenv("DUMP_PEAK_VALUE_MB"), &backtrace_dump_peak_val_)) {
-        // 记录峰值
+    // Peak criterion cadence, resolved before the peak options below because the
+    // criterion decides what the floor means: the floor is a watermark of the
+    // observed total (host RSS + dmabuf + GPU mappings), and only the sampler can
+    // evaluate that.
+    size_t peak_sample_ms = 0;
+    const bool explicit_sample_interval =
+            ParseValue(getenv(kPeakSampleIntervalEnv), &peak_sample_ms);
+    const bool adopted_sample_interval =
+            !explicit_sample_interval && FindExternalSampleIntervalMs(&peak_sample_ms);
+
+    // A floor of 0 is no floor at all -- every run passes it on its first sample
+    // -- so it selects peak-chasing instead of first-crossing. It still enables
+    // peak recording: that is what this variable has always done, and a
+    // deployment that passed 0 to mean "enable with no floor" must not silently
+    // lose its report.
+    size_t peak_floor_mb = 0;
+    const bool peak_value_set =
+            ParseValue(getenv(kDumpPeakValueEnv), &peak_floor_mb);
+    const bool has_peak_floor = peak_value_set && peak_floor_mb > 0;
+
+    // Either mode's own variable enables peak recording: a floor selects
+    // first-crossing, an explicit interval selects peak-chasing. A framework's
+    // interval only ever supplies the cadence -- letting it enable recording
+    // would hand a sampler thread and an exit report to a process that set none
+    // of these variables and asked for neither.
+    const bool record_peak =
+            peak_value_set || (explicit_sample_interval && peak_sample_ms > 0);
+
+    backtrace_dump_peak_val_ = has_peak_floor ? peak_floor_mb * 1024 * 1024 : 0;
+    peak_retention_ = has_peak_floor ? PeakRetention::FirstCrossing
+                                     : PeakRetention::ChaseMax;
+    if (record_peak) {
         options_ |= RECORD_MEMORY_PEAK;
         if (getenv("BACKTRACE_MIN_SIZE") == nullptr) {
             backtrace_min_size_bytes_ = 1024;
         }
+        // Both modes report on exit. Without this a run configured only for
+        // peak-chasing would sample the footprint for its whole lifetime and then
+        // discard the snapshot it took.
         backtrace_dump_on_exit_ = true;
     }
-    // 单位是 MB
-    backtrace_dump_peak_val_ *= 1024 * 1024;
 
     peak_record_step_bytes_ = DefaultPeakStepBytes();
     size_t peak_step_mb = 0;
@@ -167,14 +207,16 @@ bool Config::Init() {
         peak_record_step_bytes_ = peak_step_mb * 1024 * 1024;
     }
 
-    // Peak criterion. Left on tracked allocation bytes unless something is
-    // sampling this process's real footprint, because only then is there an
-    // external instant worth aligning the snapshot with.
+    // An explicit interval always wins, including an explicit 0: that is the
+    // opt-out for a caller that wants no extra thread and accepts a floor
+    // compared against tracked allocation bytes instead.
     observed_peak_sample_ms_ = 0;
-    size_t peak_sample_ms = 0;
-    if (ParseValue(getenv(kPeakSampleIntervalEnv), &peak_sample_ms) ||
-        FindExternalSampleIntervalMs(&peak_sample_ms)) {
-        observed_peak_sample_ms_ = static_cast<unsigned>(peak_sample_ms);
+    if (record_peak) {
+        if (explicit_sample_interval || adopted_sample_interval) {
+            observed_peak_sample_ms_ = static_cast<unsigned>(peak_sample_ms);
+        } else {
+            observed_peak_sample_ms_ = static_cast<unsigned>(kDefaultPeakSampleMs);
+        }
     }
 
     // 通过信号插入 check point

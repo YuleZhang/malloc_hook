@@ -81,11 +81,11 @@ UAPI，因此缺少该头文件的交叉工具链依然可以抓取 DMA。这一
 
 | 变量 | 默认值 | 作用 |
 | --- | --- | --- |
-| `DUMP_PEAK_VALUE_MB` | 未设置 | **正常退出时自动生成峰值报告必须设置它。** 打开峰值记录和退出时导出，并在当前所选峰值判据超过该 MB 数后开始抓取快照；不设置时仍可按需生成检查点报告。设置它同时会把默认最小分配尺寸降到 1 KB。 |
+| `DUMP_PEAK_VALUE_MB` | 未设置 | 选择**首次越线**模式：打开峰值记录和退出时导出，只保留峰值判据首次越过该 MB 数时的那一张快照。整个运行只做一次栈遍历，越线之后不会再阻塞任何分配线程。设为 `0` 表示没有下限，转为峰值追踪模式。 |
 | `ALLOC_HOOK_DUMP_PREFIX` | `/data/local/tmp/trace/backtrace_heap` | 报告路径前缀。文件名为 `<prefix>.exit.pid_<pid>.time_<t>.txt`，因此报告始终能对应到产生它的进程。 |
-| `DUMP_PEAK_STEP_MB` | `12` | 重新构建峰值快照所需增长量的上限。峰值较小时实际使用 25% 的增长量，下限为 64 KB；`0` 表示每次新峰值都抓（开销大得多）。对两种峰值判据都生效。 |
-| `ALLOC_HOOK_PEAK_SAMPLE_MS` | 宿主框架公布的采样间隔，否则关闭 | 正整数表示在独立线程上采样进程的**实测**占用：`/proc/self/status` 的当前 `VmRSS`、dmabuf 字节数，以及这两者都覆盖不到的 GPU 设备映射。以同一轮采样中三者之和作为峰值判据，而不是使用跟踪到的分配字节数。只有 `DUMP_PEAK_VALUE_MB` 已启用峰值记录时才生效；`0` 表示强制关闭。 |
-| `BACKTRACE_MIN_SIZE` | 设置了 `DUMP_PEAK_VALUE_MB` 时为 `1024`，否则为 `0` | 小于该尺寸的分配不抓堆栈。这是最主要的开销控制项：典型流水线里它会过滤掉 99% 以上的分配。 |
+| `DUMP_PEAK_STEP_MB` | `12` | 仅峰值追踪模式使用：重新构建峰值快照所需增长量的上限。峰值较小时实际使用 25% 的增长量，下限为 64 KB；`0` 表示每次新峰值都抓（开销大得多）。首次越线模式不会重建快照，因此该值不生效。 |
+| `ALLOC_HOOK_PEAK_SAMPLE_MS` | 宿主框架公布的采样间隔；开启峰值记录而框架未公布时为 `50` | 在独立线程上采样进程**实测**占用的间隔：`/proc/self/status` 的当前 `VmRSS`、dmabuf 字节数，以及这两者都覆盖不到的 GPU 设备映射。两种模式共用的峰值判据都是同一轮采样中三者之和。不设 `DUMP_PEAK_VALUE_MB` 而只设它，即选择**峰值追踪**模式，同样会打开峰值记录和退出时导出。`0` 表示强制不起采样线程，判据退回跟踪到的分配字节数。 |
+| `BACKTRACE_MIN_SIZE` | 开启峰值记录时为 `1024`，否则为 `0` | 小于该尺寸的分配不抓堆栈。这是最主要的开销控制项：典型流水线里它会过滤掉 99% 以上的分配。 |
 | `ALLOC_HOOK_CAPTURE_MODE` | `fast` | `fast` = 在分配线程中只抓有界原始 PC，不做符号化；worker 后续可解析动态符号。`accurate` = 使用操作系统特定后端。 |
 | `ALLOC_HOOK_SAMPLING_INTERVAL_BYTES` | `1`（关闭） | 按该字节间隔对 host 分配做 Poisson 采样。会缩放报告中的 host 尺寸，不影响 DMA 统计。 |
 | `ALLOC_HOOK_FAST_CAPTURE_INTERVAL_BYTES` | `1`（关闭） | 每分配这么多字节才抓一次堆栈。只抑制堆栈，不影响精确的尺寸统计。 |
@@ -96,13 +96,39 @@ UAPI，因此缺少该头文件的交叉工具链依然可以抓取 DMA。这一
 命名说明：`DUMP_*` 和 `BACKTRACE_*` 这些变量早于 `ALLOC_HOOK_*` 前缀，因为部署
 脚本依赖它们，所以保持原样。
 
-### 让快照时刻和外部采样器对齐
+### 两种峰值模式
+
+两种模式使用的判据完全相同——实测占用合计，即在独立线程上从 `/proc` 采样得到的
+`VmRSS` + dmabuf + GPU 映射——区别只在于保留哪一次越线时刻的分配堆栈。设置了哪个
+变量就选中哪种模式：
+
+| 设置 | 模式 | 保留的快照 | 开销 |
+| --- | --- | --- | --- |
+| `DUMP_PEAK_VALUE_MB=N` | 首次越线 | 首个超过 `N` MB 的采样点 | 整个运行一次栈遍历 |
+| `ALLOC_HOOK_PEAK_SAMPLE_MS=k` | 峰值追踪 | 运行期间最高的采样点，按 `DUMP_PEAK_STEP_MB` 刷新 | 每涨一个步长一次栈遍历 |
+
+首次越线更省、也更稳：那一次遍历之后不会再有任何分配线程被快照阻塞，这对被测流水
+线本身对时序敏感的场景很重要。代价是堆栈描述的是下限那一刻而不是峰值时刻，所以要
+回答"峰值时刻是谁占着内存"就必须把下限设到接近峰值——通常来自上一次运行的报告。
+调参看 `snapshot_lag`：它就是下限还能往上抬多少。
+
+峰值追踪不需要这种先验知识，首次运行就能拿到正确的峰值快照，代价是峰值每涨过一个
+步长就要做一次栈遍历。
+
+两种模式都会在正常退出时写报告，并在报告目录不存在时自动创建。两个变量同时设置时
+按首次越线处理，采样间隔用你给的值。
+
+#### 采样节奏
 
 常见场景下 `ALLOC_HOOK_PEAK_SAMPLE_MS` 不需要显式赋值。采样本进程内存的宿主框架
 会把自己使用的间隔写在一个名字以 `AUTO_SHOW_MEM_USE_DURATION_MS` 结尾的环境变量
-里；hook 发现它被设为正值时就直接沿用该间隔，因此不需要人工同步采样节奏。显式
-设置 `ALLOC_HOOK_PEAK_SAMPLE_MS` 会覆盖它，包括设为 `0`。如果没有同时设置
-`DUMP_PEAK_VALUE_MB`，该变量不会启动采样线程。
+里；hook 发现它被设为正值时就直接沿用该间隔，这样快照时刻就落在该框架报出峰值的
+同一瞬间，也不需要人工同步采样节奏。没有这个变量时，开启峰值记录后按 50ms 采样。
+显式设置 `ALLOC_HOOK_PEAK_SAMPLE_MS` 会覆盖以上两者，包括设为 `0`——那表示完全不
+起采样线程，改用跟踪到的分配字节数与下限比较；这是另一个量，报告会如实标注。
+
+框架的那个变量只提供节奏，永远不会单独打开峰值记录：一个什么都没设的进程，不应该
+因为环境里有它就凭空多出一个采样线程和一份退出报告。
 
 这里不会读取历史累计字段 `VmPeak` 或 `VmHWM`，因为它们无法告诉 hook 应在哪一刻
 复制存活堆栈。每一轮采样先读取当前 `VmRSS`，再读取 DMA 和 GPU 内存，并用同一轮
@@ -115,10 +141,16 @@ UAPI，因此缺少该头文件的交叉工具链依然可以抓取 DMA。这一
 如果要求每次出现新的实测最大值都保留对应快照，可以显式配置：
 
 ```sh
-export DUMP_PEAK_VALUE_MB=0          # 立即启用；也可设下限以跳过启动阶段
-export ALLOC_HOOK_PEAK_SAMPLE_MS=5   # 最好与外部采样器保持一致
+export ALLOC_HOOK_PEAK_SAMPLE_MS=5   # 峰值追踪；最好与外部采样器保持一致
 export DUMP_PEAK_STEP_MB=0           # 对齐采样到的最终最大值，但快照开销更高
 export BACKTRACE_MIN_SIZE=1024       # 只有确实需要每个小分配的栈时才设为 0
+```
+
+只要一张快照时，下限取自上一次运行报出的峰值：
+
+```sh
+export DUMP_PEAK_VALUE_MB=300        # 首次越过 300MB；整个运行一次栈遍历
+export BACKTRACE_MIN_SIZE=1024
 ```
 
 需要精确 host 归因并为每个满足尺寸条件的分配抓栈时，应让
@@ -127,10 +159,11 @@ export BACKTRACE_MIN_SIZE=1024       # 只有确实需要每个小分配的栈�
 `rss + dma + gpu`；当前没有只排除这项未被其他统计覆盖的 GPU 内存、强制改为
 `rss + dma` 的运行时开关。
 
-报告会写明保留下来的快照是哪种判据产生的；如果是实测占用，还会写明快照那一刻的实
-测值、整个 run 的最大值，以及采样器本身的开销：
+报告会写明保留下来的快照描述的是哪一次越线、由哪种判据产生；如果是实测占用，还会
+写明快照那一刻的实测值、整个 run 的最大值，以及采样器本身的开销：
 
 ```text
+peak_retention: chase_max (snapshot refreshed per step)
 peak_criterion: observed_host_rss_plus_dma_plus_gpu (from /proc, aligned with an external sampler)
 observed_peak(at_snapshot):     rss=291.75MB dma=935.12MB gpu=24.00MB total=1250.87MB
 observed_peak(max_of_sum):      rss=291.75MB dma=935.12MB gpu=24.00MB total=1250.87MB (...)
@@ -139,7 +172,22 @@ observed_sampler: interval_ms=1 achieved_ms=1.58 dma_source=fd+maps gpu_source=s
 ```
 
 `at_snapshot` 和 `max_of_sum` 相等就是目标状态：堆栈是在最大值那一刻抓的，而不是在
-爬升过程中的某一级。`achieved_ms` 大于请求的间隔说明读 `/proc` 的耗时超过了间隔，
+爬升过程中的某一级。首次越线模式下两者按设计就不相等，差值由 `snapshot_lag` 给出：
+
+```text
+peak_retention: first_crossing floor=200.000000MB (single snapshot; step unused)
+snapshot_lag: observed=+117.800781MB (of 323.628906MB peak)
+```
+
+如果整个运行都没越过下限，就没有任何快照。此时报告不会输出一段空的堆栈——那看起来
+和"hook 什么都没抓到"一样——而是退回列出报告时刻的存活分配，并写明原因：
+
+```text
+peak_snapshot: none (criterion never passed the floor; the list above is live at report time)
+peak_criterion: none (nothing was snapshotted)
+```
+
+`achieved_ms` 大于请求的间隔说明读 `/proc` 的耗时超过了间隔，
 采样器自行降频以保证不超过半个核——它不会谎报一个没达到的节奏。当 host 和设备内存
 在不同时刻见顶时，`independent_max` 会高于 `max_of_sum` 中的任一项，而这正是这套机
 制存在的理由。
