@@ -85,9 +85,9 @@ Additional public controls:
 
 | Variable | Purpose |
 | --- | --- |
-| `DUMP_PEAK_VALUE_MB` | Enable peak recording, dump on exit, and snapshots after the selected peak criterion exceeds this floor. |
-| `DUMP_PEAK_STEP_MB` | Upper bound on growth before another peak snapshot; small peaks use 25% growth with a 64 KB floor. `0` snapshots every new peak. |
-| `ALLOC_HOOK_PEAK_SAMPLE_MS` | Use the observed `VmRSS + DMA + GPU` total sampled at this positive millisecond interval as the peak criterion. Requires `DUMP_PEAK_VALUE_MB`; `0` forces it off. |
+| `DUMP_PEAK_VALUE_MB` | Select first-crossing mode: enable peak recording and dump on exit, and retain one snapshot, taken the first time the peak criterion passes this floor. `0` means no floor and selects peak chasing. |
+| `DUMP_PEAK_STEP_MB` | Peak-chasing mode only: upper bound on growth before another peak snapshot; small peaks use 25% growth with a 64 KB floor. `0` snapshots every new peak. Unused in first-crossing mode. |
+| `ALLOC_HOOK_PEAK_SAMPLE_MS` | Millisecond interval for sampling the observed `VmRSS + DMA + GPU` total, which is the peak criterion in both modes. Setting it alone selects peak-chasing mode and enables peak recording and dump on exit. Defaults to the framework-published interval, else 50 ms. `0` forces the sampler off. |
 | `ALLOC_HOOK_DUMP_PREFIX` | Set the report path prefix. |
 | `BACKTRACE_DUMP_SIGNAL` | Override the platform-selected checkpoint signal. |
 | `ALLOC_HOOK_DEBUG` | Enable hook diagnostics on stderr. |
@@ -101,13 +101,22 @@ different mechanisms. The first probabilistically reduces host stack capture.
 The second starts a dedicated observer thread and does not change which
 allocations are tracked.
 
-With no positive peak interval, snapshots follow tracked live allocation bytes.
-With a positive interval, each observer cycle reads current `VmRSS` from
-`/proc/self/status`, dmabuf bytes, and GPU device mappings covered by neither;
-the maximum of that same-cycle sum selects the peak window. A host framework's
-positive environment value whose name ends in `AUTO_SHOW_MEM_USE_DURATION_MS`
-is adopted automatically unless `ALLOC_HOOK_PEAK_SAMPLE_MS` is explicitly set,
-including to `0`.
+Peak recording has two modes over one criterion. `DUMP_PEAK_VALUE_MB` selects
+first crossing: one snapshot per run, taken the first time the criterion passes
+the floor, after which no allocating thread is stalled by a snapshot again.
+`ALLOC_HOOK_PEAK_SAMPLE_MS` alone selects peak chasing: the snapshot is refreshed
+per `DUMP_PEAK_STEP_MB` so it ends up at the run's maximum, without needing to
+know that maximum in advance. Both write a report on exit and create the report
+directory.
+
+Each observer cycle reads current `VmRSS` from `/proc/self/status`, dmabuf bytes,
+and GPU device mappings covered by neither; the maximum of that same-cycle sum is
+the criterion. A host framework's positive environment value whose name ends in
+`AUTO_SHOW_MEM_USE_DURATION_MS` is adopted as the cadence automatically unless
+`ALLOC_HOOK_PEAK_SAMPLE_MS` is explicitly set, including to `0`, which runs no
+sampler and compares the floor against tracked allocation bytes instead. That
+framework variable never enables peak recording by itself. With no sampler
+running, snapshots follow tracked live allocation bytes and the report says so.
 
 The observer does not use the historical `VmPeak` or `VmHWM` fields. When a new
 observed peak crosses the configured snapshot gates, it immediately re-reads
@@ -119,11 +128,20 @@ kernel snapshot.
 To retain a stack snapshot for every newly sampled maximum:
 
 ```sh
-export DUMP_PEAK_VALUE_MB=0
 export ALLOC_HOOK_PEAK_SAMPLE_MS=5   # use the external sampler's interval
 export DUMP_PEAK_STEP_MB=0
 export BACKTRACE_MIN_SIZE=1024
 ```
+
+To retain a single snapshot at the first crossing of a known watermark:
+
+```sh
+export DUMP_PEAK_VALUE_MB=300
+export BACKTRACE_MIN_SIZE=1024
+```
+
+`snapshot_lag` in the report is how much the criterion kept growing after that
+snapshot, which is how much higher the floor could be set next run.
 
 `DUMP_PEAK_STEP_MB=0` is the exact but more expensive mode. Keep the default
 step when a bounded gap between `at_snapshot` and `max_of_sum` is acceptable.

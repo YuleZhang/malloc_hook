@@ -16,7 +16,9 @@
 #include <cassert>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <string>
+#include <vector>
 
 #include "Config.h"
 #include "ObservedMemory.h"
@@ -42,10 +44,26 @@ std::string WriteTempFile(const char* name, const char* contents) {
 
 std::atomic<int> g_callbacks{0};
 std::atomic<size_t> g_last_total{0};
+// Whether the fake tracker claims to have retained a snapshot. The sampler uses
+// the answer to decide whether a first-crossing run is finished.
+std::atomic<bool> g_retain{true};
 
-void OnPeak(const ObservedMemSample& sample) {
+bool OnPeak(const ObservedMemSample& sample) {
     g_callbacks.fetch_add(1);
     g_last_total.store(sample.total());
+    return g_retain.load();
+}
+
+// Grows this process's resident footprint and keeps it resident, so the sampler
+// observes a new maximum of the criterion it compares against. The pages have to
+// be touched: an untouched mapping never appears in VmRSS.
+constexpr size_t kBallastBytes = 16 * 1024 * 1024;
+std::vector<std::unique_ptr<char[]>> g_ballast;
+
+void GrowResident(size_t bytes) {
+    std::unique_ptr<char[]> block(new char[bytes]);
+    memset(block.get(), 1, bytes);
+    g_ballast.push_back(std::move(block));
 }
 
 void TestStatusFieldParsing() {
@@ -188,26 +206,39 @@ void TestIntervalResolution() {
     unsetenv("ALLOC_HOOK_PEAK_SAMPLE_MS");
     unsetenv("PROBE_AUTO_SHOW_MEM_USE_DURATION_MS");
     unsetenv("DUMP_PEAK_STEP_MB");
+    unsetenv("DUMP_PEAK_VALUE_MB");
     Config config;
     bool initialized = config.Init();
     assert(initialized);
-    // Nothing is sampling this process, so there is no external instant to
-    // align with and the sampler stays off.
+    // Nothing asked for a peak report, so there is no sampler and no criterion.
     assert(config.observed_peak_sample_ms() == 0);
+    assert(!(config.options() & RECORD_MEMORY_PEAK));
     assert(config.peak_record_step_bytes() == DefaultPeakStepBytes());
 
-    // A host framework's interval is adopted automatically, matched by the
-    // suffix of the variable name rather than by any particular prefix.
+    // A host framework's interval alone must not switch peak recording on: the
+    // framework publishes it for its own sampling, and a process that asked for
+    // nothing must not gain a sampler thread and an exit report from it.
     setenv("PROBE_AUTO_SHOW_MEM_USE_DURATION_MS", "1", 1);
+    initialized = config.Init();
+    assert(initialized);
+    assert(!(config.options() & RECORD_MEMORY_PEAK));
+    assert(config.observed_peak_sample_ms() == 0);
+
+    // Once a mode is selected, that interval is adopted -- matched by the suffix
+    // of the variable name rather than by any particular prefix -- so the
+    // snapshot lands at the instant the framework calls the peak.
+    setenv("DUMP_PEAK_VALUE_MB", "200", 1);
     initialized = config.Init();
     assert(initialized);
     assert(config.observed_peak_sample_ms() == 1);
 
-    // That framework's "not sampling" value must not switch the sampler on.
+    // That framework's "not sampling" value must not be adopted as a cadence;
+    // the mode falls back to its own default instead of switching the criterion
+    // to tracked bytes, which is not what the floor is defined against.
     setenv("PROBE_AUTO_SHOW_MEM_USE_DURATION_MS", "0", 1);
     initialized = config.Init();
     assert(initialized);
-    assert(config.observed_peak_sample_ms() == 0);
+    assert(config.observed_peak_sample_ms() == 50);
 
     // An explicit interval wins over the adopted one.
     setenv("PROBE_AUTO_SHOW_MEM_USE_DURATION_MS", "5", 1);
@@ -217,11 +248,13 @@ void TestIntervalResolution() {
     assert(config.observed_peak_sample_ms() == 20);
 
     // Including an explicit 0, which has to be able to turn the sampler off
-    // even while a framework is sampling.
+    // even while a framework is sampling. Peak recording itself stays on: the
+    // floor is then compared against tracked bytes, which the report labels.
     setenv("ALLOC_HOOK_PEAK_SAMPLE_MS", "0", 1);
     initialized = config.Init();
     assert(initialized);
     assert(config.observed_peak_sample_ms() == 0);
+    assert(config.options() & RECORD_MEMORY_PEAK);
 
     setenv("DUMP_PEAK_STEP_MB", "3", 1);
     initialized = config.Init();
@@ -232,17 +265,118 @@ void TestIntervalResolution() {
     unsetenv("ALLOC_HOOK_PEAK_SAMPLE_MS");
     unsetenv("PROBE_AUTO_SHOW_MEM_USE_DURATION_MS");
     unsetenv("DUMP_PEAK_STEP_MB");
+    unsetenv("DUMP_PEAK_VALUE_MB");
+}
+
+// The minimum-size filter has three sources -- the platform default, the
+// environment, and the peak-recording default -- and they have to compose in
+// that order of authority. Written without naming any platform's number so the
+// same assertions hold wherever this runs.
+void TestMinSizeDefaults() {
+    unsetenv("BACKTRACE_MIN_SIZE");
+    unsetenv("DUMP_PEAK_VALUE_MB");
+    unsetenv("ALLOC_HOOK_PEAK_SAMPLE_MS");
+    unsetenv("PROBE_AUTO_SHOW_MEM_USE_DURATION_MS");
+    Config config;
+    assert(config.Init());
+    const size_t platform_default = config.backtrace_min_size_bytes();
+
+    setenv("BACKTRACE_MIN_SIZE", "4096", 1);
+    assert(config.Init());
+    assert(config.backtrace_min_size_bytes() == 4096);
+
+    // Re-initialising without the variable returns to the platform default
+    // instead of carrying the previous run's explicit value.
+    unsetenv("BACKTRACE_MIN_SIZE");
+    assert(config.Init());
+    assert(config.backtrace_min_size_bytes() == platform_default);
+
+    // An explicit 0 is a real request for no filter, not a parse failure.
+    setenv("BACKTRACE_MIN_SIZE", "0", 1);
+    assert(config.Init());
+    assert(config.backtrace_min_size_bytes() == 0);
+    unsetenv("BACKTRACE_MIN_SIZE");
+
+    // Peak recording supplies a filter where the platform has none, and leaves a
+    // platform default alone: enabling it must not start capturing stacks the
+    // platform had decided to skip.
+    setenv("ALLOC_HOOK_PEAK_SAMPLE_MS", "5", 1);
+    assert(config.Init());
+    assert(config.backtrace_min_size_bytes() ==
+           (platform_default != 0 ? platform_default : 1024));
+    assert(config.backtrace_min_size_bytes() >= platform_default);
+    unsetenv("ALLOC_HOOK_PEAK_SAMPLE_MS");
+}
+
+// The two peak modes are selected by which variable is set, and each has to
+// arrive complete: a criterion to compare against, a report on exit, and a
+// default size filter. A mode that samples for a whole run and then writes no
+// report is the failure this covers.
+void TestPeakModeSelection() {
+    unsetenv("ALLOC_HOOK_PEAK_SAMPLE_MS");
+    unsetenv("PROBE_AUTO_SHOW_MEM_USE_DURATION_MS");
+    unsetenv("DUMP_PEAK_VALUE_MB");
+    unsetenv("BACKTRACE_MIN_SIZE");
+    Config config;
+
+    // A floor selects first-crossing, and supplies its own cadence: the floor is
+    // a watermark of the observed total, so a run without a sampler would have
+    // nothing to compare it against.
+    setenv("DUMP_PEAK_VALUE_MB", "200", 1);
+    assert(config.Init());
+    assert(config.options() & RECORD_MEMORY_PEAK);
+    assert(config.peak_retention() == PeakRetention::FirstCrossing);
+    assert(config.backtrace_dump_peak_val() == 200ULL * 1024 * 1024);
+    assert(config.observed_peak_sample_ms() == 50);
+    assert(config.backtrace_dump_on_exit());
+
+    // A floor of 0 is no floor at all -- every run passes it on its first
+    // sample -- so it selects peak-chasing. It must still enable recording:
+    // deployments that passed 0 to mean "enable with no floor" would otherwise
+    // silently stop producing a report.
+    setenv("DUMP_PEAK_VALUE_MB", "0", 1);
+    assert(config.Init());
+    assert(config.options() & RECORD_MEMORY_PEAK);
+    assert(config.peak_retention() == PeakRetention::ChaseMax);
+    assert(config.backtrace_dump_peak_val() == 0);
+    assert(config.observed_peak_sample_ms() == 50);
+    assert(config.backtrace_dump_on_exit());
+    unsetenv("DUMP_PEAK_VALUE_MB");
+
+    // An interval on its own selects peak-chasing: no floor is needed because
+    // the maximum is discovered rather than declared. It must still report on
+    // exit, which is the only way that discovery leaves the process.
+    setenv("ALLOC_HOOK_PEAK_SAMPLE_MS", "5", 1);
+    assert(config.Init());
+    assert(config.options() & RECORD_MEMORY_PEAK);
+    assert(config.peak_retention() == PeakRetention::ChaseMax);
+    assert(config.backtrace_dump_peak_val() == 0);
+    assert(config.observed_peak_sample_ms() == 5);
+    assert(config.backtrace_dump_on_exit());
+#if !defined(MALLOC_HOOK_TARGET_OS_OHOS)
+    // The size filter that makes peak recording affordable is part of the mode,
+    // not of one variable that happens to select it.
+    assert(config.backtrace_min_size_bytes() == 1024);
+#endif
+
+    // An explicit filter is never overridden by the mode's default.
+    setenv("BACKTRACE_MIN_SIZE", "4096", 1);
+    assert(config.Init());
+    assert(config.backtrace_min_size_bytes() == 4096);
+
+    unsetenv("ALLOC_HOOK_PEAK_SAMPLE_MS");
+    unsetenv("BACKTRACE_MIN_SIZE");
 }
 
 void TestSamplerLifecycle() {
     ObservedPeakSampler& sampler = ObservedPeakSamplerInstance();
     // A disabled interval must not start a thread.
-    assert(!sampler.Start(0, 0, DefaultPeakStepBytes(), &OnPeak));
+    assert(!sampler.Start(0, 0, DefaultPeakStepBytes(), false, &OnPeak));
     assert(!sampler.started());
 
     // Floor 0 means the first sample already qualifies as a peak, so one
     // callback is guaranteed without depending on the process growing.
-    assert(sampler.Start(1, 0, DefaultPeakStepBytes(), &OnPeak));
+    assert(sampler.Start(1, 0, DefaultPeakStepBytes(), false, &OnPeak));
     assert(sampler.started());
     for (int waited_ms = 0; waited_ms < 5000 && g_callbacks.load() == 0;
          waited_ms += 10) {
@@ -270,6 +404,69 @@ void TestSamplerLifecycle() {
 
     // Stop() is idempotent; finalization calls it on paths that may never have
     // started a sampler.
+    sampler.Stop();
+}
+
+// First-crossing retention takes exactly one snapshot per run. The expensive
+// half is the callback, so this is the property the mode exists for; sampling
+// itself has to continue, or the report loses the observed maxima that say what
+// the run's real peak was and how far past the floor the snapshot sits.
+void TestFirstCrossingTakesOneSnapshot() {
+    ObservedPeakSampler& sampler = ObservedPeakSamplerInstance();
+    // The sampler only fires on a new maximum, and its statistics accumulate
+    // across runs, so the criterion has to actually grow and every count below
+    // is a delta.
+    const ObservedSamplerStats before = sampler.stats();
+    g_callbacks.store(0);
+    g_retain.store(true);
+    GrowResident(kBallastBytes);
+    assert(sampler.Start(1, 0, DefaultPeakStepBytes(), true, &OnPeak));
+    for (int waited_ms = 0; waited_ms < 5000 && g_callbacks.load() == 0;
+         waited_ms += 10) {
+        usleep(10000);
+    }
+    assert(g_callbacks.load() == 1);
+    // Keep growing well past the crossing: the pin has to hold against new
+    // maxima, not merely against a footprint that stopped moving.
+    for (int grown = 0; grown < 3; ++grown) {
+        GrowResident(kBallastBytes);
+        usleep(50000);
+    }
+    sampler.Stop();
+
+    const ObservedSamplerStats after = sampler.stats();
+    assert(g_callbacks.load() == 1);
+    assert(after.snapshots - before.snapshots == 1);
+    // Sampling continued after the snapshot, which is what keeps the observed
+    // peak in the report exact.
+    assert(after.samples > before.samples + 1);
+    assert(after.peak_total_bytes > before.peak_total_bytes);
+    sampler.Stop();
+}
+
+// A crossing at a moment when nothing carries a stack yields no snapshot. The
+// run must not be treated as finished then, otherwise a process that passed the
+// floor before its first tracked allocation would report nothing at all.
+void TestFirstCrossingRetriesWhenNothingRetained() {
+    ObservedPeakSampler& sampler = ObservedPeakSamplerInstance();
+    g_callbacks.store(0);
+    g_retain.store(false);
+    GrowResident(kBallastBytes);
+    assert(sampler.Start(1, 0, DefaultPeakStepBytes(), true, &OnPeak));
+    for (int waited_ms = 0; waited_ms < 5000 && g_callbacks.load() < 1;
+         waited_ms += 10) {
+        usleep(10000);
+    }
+    // Each later maximum has to try again, so a second attempt must arrive even
+    // though the mode is one-shot.
+    GrowResident(kBallastBytes);
+    for (int waited_ms = 0; waited_ms < 5000 && g_callbacks.load() < 2;
+         waited_ms += 10) {
+        usleep(10000);
+    }
+    sampler.Stop();
+    assert(g_callbacks.load() >= 2);
+    g_retain.store(true);
     sampler.Stop();
 }
 
@@ -641,7 +838,11 @@ int main() {
     TestMapPassGate();
     TestPeakThresholdPolicy();
     TestIntervalResolution();
+    TestMinSizeDefaults();
+    TestPeakModeSelection();
     TestSamplerLifecycle();
+    TestFirstCrossingTakesOneSnapshot();
+    TestFirstCrossingRetriesWhenNothingRetained();
     TestCadenceAbsorbsWorkTime();
     TestCadenceDoesNotAccumulateDrift();
     TestSlowSampleSkipsSlotsInsteadOfBursting();

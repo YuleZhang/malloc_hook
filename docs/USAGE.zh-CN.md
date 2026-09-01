@@ -79,9 +79,9 @@ export BACKTRACE_MIN_SIZE=4096
 
 | 变量 | 作用 |
 | --- | --- |
-| `DUMP_PEAK_VALUE_MB` | 启用峰值记录、退出时导出，并在当前所选峰值判据超过该下限后开始抓取快照。 |
-| `DUMP_PEAK_STEP_MB` | 再次抓取峰值快照所需增长量的上限；小峰值使用 25% 增长量，下限为 64 KB。`0` 表示每次新峰值都抓。 |
-| `ALLOC_HOOK_PEAK_SAMPLE_MS` | 按该正整数毫秒间隔采样实测 `VmRSS + DMA + GPU` 总量，并将它作为峰值判据。需要同时设置 `DUMP_PEAK_VALUE_MB`；`0` 表示强制关闭。 |
+| `DUMP_PEAK_VALUE_MB` | 选择首次越线模式：启用峰值记录和退出时导出，只保留峰值判据首次越过该下限时的那一张快照。设为 `0` 表示没有下限，转为峰值追踪模式。 |
+| `DUMP_PEAK_STEP_MB` | 仅峰值追踪模式使用：再次抓取峰值快照所需增长量的上限；小峰值使用 25% 增长量，下限为 64 KB。`0` 表示每次新峰值都抓。首次越线模式下不生效。 |
+| `ALLOC_HOOK_PEAK_SAMPLE_MS` | 采样实测 `VmRSS + DMA + GPU` 总量的毫秒间隔，两种模式的峰值判据都是它。只设它即选择峰值追踪模式，同样会启用峰值记录和退出时导出。默认取宿主框架公布的间隔，没有则为 50ms。`0` 表示强制不起采样线程。 |
 | `ALLOC_HOOK_DUMP_PREFIX` | 设置报告路径前缀。 |
 | `BACKTRACE_DUMP_SIGNAL` | 覆盖平台默认的检查点信号。 |
 | `ALLOC_HOOK_DEBUG` | 在 stderr 输出 hook 诊断信息。 |
@@ -93,11 +93,18 @@ export BACKTRACE_MIN_SIZE=4096
 两套不同机制：前者通过概率采样减少 host 堆栈抓取，后者启动独立的内存观察线程，
 不会改变哪些分配被跟踪。
 
-没有正数峰值采样间隔时，快照由跟踪到的存活分配字节数驱动。间隔为正数时，每轮
-观察会读取 `/proc/self/status` 的当前 `VmRSS`、dmabuf 字节数，以及这两者都没有
-覆盖的 GPU 设备映射，并以同一轮三者之和的最大值选择峰值窗口。若宿主框架提供了
-名字以 `AUTO_SHOW_MEM_USE_DURATION_MS` 结尾且值为正数的环境变量，hook 会自动采用
-该间隔；显式的 `ALLOC_HOOK_PEAK_SAMPLE_MS` 始终优先，包括值为 `0` 时。
+峰值记录是同一个判据上的两种模式。`DUMP_PEAK_VALUE_MB` 选择首次越线：整个运行只
+抓一张快照，即判据首次越过下限的那一刻，之后不再有分配线程被快照阻塞。只设
+`ALLOC_HOOK_PEAK_SAMPLE_MS` 则选择峰值追踪：快照按 `DUMP_PEAK_STEP_MB` 刷新，最终
+落在运行期的最大值上，且不需要事先知道这个最大值。两者都会在退出时写报告，并自动
+创建报告目录。
+
+每轮观察会读取 `/proc/self/status` 的当前 `VmRSS`、dmabuf 字节数，以及这两者都没有
+覆盖的 GPU 设备映射，并以同一轮三者之和的最大值作为判据。若宿主框架提供了名字以
+`AUTO_SHOW_MEM_USE_DURATION_MS` 结尾且值为正数的环境变量，hook 会自动采用该间隔；
+显式的 `ALLOC_HOOK_PEAK_SAMPLE_MS` 始终优先，包括值为 `0`——那表示不起采样线程，
+改用跟踪到的分配字节数与下限比较。框架的那个变量本身永远不会打开峰值记录。没有采样
+线程时快照由跟踪到的存活分配字节数驱动，报告会写明这一点。
 
 观察线程不使用历史累计字段 `VmPeak` 或 `VmHWM`。当新的实测峰值越过快照门槛时，
 它会立即再次读取 `VmRSS`、`RssAnon`、`RssFile`、`RssShmem`，从
@@ -107,11 +114,20 @@ export BACKTRACE_MIN_SIZE=4096
 要为每次采样到的新最大值保留堆栈快照，可使用：
 
 ```sh
-export DUMP_PEAK_VALUE_MB=0
 export ALLOC_HOOK_PEAK_SAMPLE_MS=5   # 使用外部采样器的间隔
 export DUMP_PEAK_STEP_MB=0
 export BACKTRACE_MIN_SIZE=1024
 ```
+
+只要在已知水位首次越线时留一张快照：
+
+```sh
+export DUMP_PEAK_VALUE_MB=300
+export BACKTRACE_MIN_SIZE=1024
+```
+
+报告里的 `snapshot_lag` 就是那张快照之后判据还涨了多少，也就是下一次运行下限可以
+再抬高多少。
 
 `DUMP_PEAK_STEP_MB=0` 最精确但开销更高；若可以接受 `at_snapshot` 和
 `max_of_sum` 之间存在有界差距，就保留默认步进。只有确实需要 1 KB 以下分配的堆栈

@@ -246,18 +246,20 @@ static bool StartSignalDumpThread() {
 }
 
 // Relays a new evaluator-visible peak to the allocation bookkeeping, which
-// snapshots the live stacks at that instant.
-static void OnObservedMemoryPeak(const ObservedMemSample& sample) {
+// snapshots the live stacks at that instant. Returns whether a snapshot was
+// retained, which is what tells a first-crossing run it is finished.
+static bool OnObservedMemoryPeak(const ObservedMemSample& sample) {
     if (g_debug != nullptr && g_debug->TrackPointers()) {
-        g_debug->pointer->RecordObservedPeak(sample);
+        return g_debug->pointer->RecordObservedPeak(sample);
     }
+    return false;
 }
 
-// Starts sampling this process's real footprint, so the peak snapshot lands at
-// the instant an external evaluator calls the peak rather than at the instant
-// tracked bytes happen to top out. Off unless something is sampling the process
-// (see Config::observed_peak_sample_ms) -- with nothing to align to, the extra
-// thread would cost the run without making any report more accurate.
+// Starts sampling this process's real footprint. Both peak modes need it: the
+// criterion they compare against -- host RSS + dmabuf + GPU mappings -- exists
+// only in /proc, and reading it from the allocation path is not an option.
+// Off only when peak recording was not requested at all, or when an explicit
+// interval of 0 opted out of the extra thread (see Config::Init).
 static void StartObservedPeakSampler() {
     if (!(g_debug->config().options() & RECORD_MEMORY_PEAK)) {
         return;
@@ -266,19 +268,27 @@ static void StartObservedPeakSampler() {
     if (interval_ms == 0) {
         return;
     }
+    const bool one_shot = g_debug->config().peak_retention() ==
+                          PeakRetention::FirstCrossing;
     const bool started = ObservedPeakSamplerInstance().Start(
             interval_ms, g_debug->config().backtrace_dump_peak_val(),
-            g_debug->config().peak_record_step_bytes(), &OnObservedMemoryPeak);
+            g_debug->config().peak_record_step_bytes(), one_shot,
+            &OnObservedMemoryPeak);
     if (!started) {
-        // Not fatal: the allocation-path criterion still produces a snapshot,
-        // and the report says which criterion produced the one it retained.
+        // Not fatal, but the report will not answer the question that was asked:
+        // the allocation-path criterion chases tracked bytes, a different
+        // quantity from the floor. The report says which criterion produced the
+        // snapshot it retained.
         static const char message[] =
                 "alloc_hook: could not start the memory peak sampler; peak "
                 "snapshots fall back to tracked allocation bytes\n";
         write(STDERR_FILENO, message, sizeof(message) - 1);
     } else {
         SignalDebugLogInt(
-                "alloc_hook: peak sampler started, interval ms ",
+                one_shot ? "alloc_hook: peak sampler started (first crossing), "
+                           "interval ms "
+                         : "alloc_hook: peak sampler started (chase max), "
+                           "interval ms ",
                 static_cast<int>(interval_ms));
     }
 }

@@ -47,12 +47,16 @@
 
 `PointerData` 管理存活分配表和峰值计数。Host 分配可以使用 Fast 专用 Poisson 字节采样；资源路径保持精确。采样 host 记录保存估算后的统计大小，释放时仍通过同一指针身份路径移除。
 
-检查点报告由导出的 `checkpoint(const char*)` 入口或配置的信号触发。使用 `DUMP_PEAK_VALUE_MB` 启用峰值快照，并由 `DUMP_PEAK_STEP_MB` 限制重建频率。
+检查点报告由导出的 `checkpoint(const char*)` 入口或配置的信号触发。峰值快照由
+`DUMP_PEAK_VALUE_MB` 或 `ALLOC_HOOK_PEAK_SAMPLE_MS` 任一启用：前者只保留首次越过该
+下限的那一张，后者追踪最大值并由 `DUMP_PEAK_STEP_MB` 限制重建频率。
 
-默认峰值判据是跟踪到的分配字节数。将 `ALLOC_HOOK_PEAK_SAMPLE_MS` 设为正数后，
-判据改为同一轮采样中当前 `VmRSS`、dmabuf 字节数和前两者未覆盖的 GPU 映射之和的
+峰值判据是同一轮采样中当前 `VmRSS`、dmabuf 字节数和前两者未覆盖的 GPU 映射之和的
 最大值。采样器使用独立线程，因为页面驻留状态和设备内存所有权可能在没有任何分配
-hook 调用时变化。它读取的是当前 `VmRSS`，而不是历史累计的 `VmPeak` 或 `VmHWM`。
+hook 调用时变化，也因为这个判据只存在于 `/proc` 中。它读取的是当前 `VmRSS`，而不是
+历史累计的 `VmPeak` 或 `VmHWM`。跟踪到的分配字节数是兜底判据，只在没有采样线程时
+使用——显式设置 `ALLOC_HOOK_PEAK_SAMPLE_MS=0`，或采样线程启动失败——报告会写明保留
+下来的快照由两者中的哪一个产生。
 
 实测样本越过快照门槛后，回调会再次读取 `/proc/self/status`（`VmRSS`、
 `RssAnon`、`RssFile`、`RssShmem`），从 `/proc/self/smaps` 收集驻留量最高的映射，

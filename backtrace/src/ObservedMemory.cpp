@@ -710,7 +710,7 @@ size_t NextPeakThreshold(size_t peak_bytes, size_t step_bytes) {
 }
 
 bool ObservedPeakSampler::Start(
-        unsigned interval_ms, size_t floor_bytes, size_t step_bytes,
+        unsigned interval_ms, size_t floor_bytes, size_t step_bytes, bool one_shot,
         PeakCallback on_new_peak) {
     if (interval_ms == 0 || on_new_peak == nullptr ||
         started_.load(std::memory_order_acquire)) {
@@ -719,6 +719,7 @@ bool ObservedPeakSampler::Start(
     interval_ms_ = interval_ms;
     floor_bytes_ = floor_bytes;
     step_bytes_ = step_bytes;
+    one_shot_ = one_shot;
     on_new_peak_ = on_new_peak;
     running_.store(true, std::memory_order_release);
     if (pthread_create(&thread_, nullptr, &ObservedPeakSampler::Trampoline, this) !=
@@ -889,9 +890,26 @@ void ObservedPeakSampler::Run() {
                 peak_total_gpu_bytes_.store(
                         sample.gpu_bytes, std::memory_order_relaxed);
                 if (total > next_threshold) {
-                    next_threshold = NextPeakThreshold(total, step_bytes_);
                     snapshots_.fetch_add(1, std::memory_order_relaxed);
-                    on_new_peak_(sample);
+                    const bool retained = on_new_peak_(sample);
+                    // A one-shot run pins the threshold out of reach instead of
+                    // stopping the thread: the reads are the cheap half and keep
+                    // the observed-peak statistics complete, so the report can
+                    // still say what the run's real peak was and how far past the
+                    // floor it went. Only the stack walk -- the half that takes
+                    // the allocation locks -- is given up.
+                    //
+                    // A crossing that retained nothing leaves the threshold at
+                    // the floor so the next new peak tries again; otherwise a
+                    // process that crossed before its first stack-carrying
+                    // allocation would report nothing at all.
+                    if (one_shot_) {
+                        if (retained) {
+                            next_threshold = SIZE_MAX;
+                        }
+                    } else {
+                        next_threshold = NextPeakThreshold(total, step_bytes_);
+                    }
                     const uint64_t snapshot_us = MonotonicMicros() - read_done_us;
                     total_snapshot_us_.fetch_add(
                             snapshot_us, std::memory_order_relaxed);
