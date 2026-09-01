@@ -60,6 +60,14 @@ TEST(CaptureRouting, FastCapacityProducesPartialStack) {
 #endif
 }
 
+TEST(CaptureRouting, FastFrameRecordRejectsWrappingAddress) {
+    constexpr uintptr_t kStackLow = 0x1000;
+    constexpr uintptr_t kStackHigh = 0x2000;
+    EXPECT_TRUE(FrameRecordFitsStackForTest(0x1ff0, kStackLow, kStackHigh));
+    EXPECT_FALSE(FrameRecordFitsStackForTest(0x1ff8, kStackLow, kStackHigh));
+    EXPECT_FALSE(FrameRecordFitsStackForTest(UINTPTR_MAX - 7, kStackLow, kStackHigh));
+}
+
 TEST(CaptureRouting, RecursiveCaptureIsRejectedExplicitly) {
     g_recursive_result = RawStackRecord{};
     SetStackCaptureReentryHookForTest(ReenterCapture);
