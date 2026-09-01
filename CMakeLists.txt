@@ -262,6 +262,31 @@ message(STATUS
   "resource_tracking=${MALLOC_HOOK_ENABLE_DMA_CAPTURE}, "
   "cpp_new=${MALLOC_HOOK_EXPORT_CPP_NEW_HOOK}")
 
+if(MALLOC_HOOK_BUILD_TESTS AND MALLOC_HOOK_BUILD_GL_TESTS AND ANDROID)
+  set(_malloc_hook_build_gl_tests_effective ON)
+else()
+  set(_malloc_hook_build_gl_tests_effective OFF)
+endif()
+
+add_custom_target(print_build_options
+  COMMAND ${CMAKE_COMMAND} -E echo "malloc_hook effective build options:"
+  COMMAND ${CMAKE_COMMAND} -E echo "  CMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE}"
+  COMMAND ${CMAKE_COMMAND} -E echo "  compiler=${CMAKE_CXX_COMPILER_ID}-${CMAKE_CXX_COMPILER_VERSION}"
+  COMMAND ${CMAKE_COMMAND} -E echo "  target=${MALLOC_HOOK_TARGET_OS}/${MALLOC_HOOK_TARGET_LIBC}/${MALLOC_HOOK_TARGET_ARCH}"
+  COMMAND ${CMAKE_COMMAND} -E echo "  MALLOC_HOOK_ENABLE_DMA_CAPTURE=${MALLOC_HOOK_ENABLE_DMA_CAPTURE}"
+  COMMAND ${CMAKE_COMMAND} -E echo "  MALLOC_HOOK_OHOS_MMAP_HOOK=${MALLOC_HOOK_OHOS_MMAP_HOOK}"
+  COMMAND ${CMAKE_COMMAND} -E echo "  MALLOC_HOOK_BUILD_TESTS=${MALLOC_HOOK_BUILD_TESTS}"
+  COMMAND ${CMAKE_COMMAND} -E echo "  MALLOC_HOOK_BUILD_GL_TESTS=${MALLOC_HOOK_BUILD_GL_TESTS}"
+  COMMAND ${CMAKE_COMMAND} -E echo "  build_gl_tests_effective=${_malloc_hook_build_gl_tests_effective}"
+  COMMAND ${CMAKE_COMMAND} -E echo "  compiler_unwind=${MALLOC_HOOK_HAVE_COMPILER_UNWIND}"
+  COMMAND ${CMAKE_COMMAND} -E echo "  dma_heap_uapi=${_malloc_hook_dma_heap_uapi}"
+  COMMAND ${CMAKE_COMMAND} -E echo "  export_policy=${MALLOC_HOOK_EXPORT_POLICY}"
+  COMMAND ${CMAKE_COMMAND} -E echo "  export_mmap=${MALLOC_HOOK_EXPORT_MMAP_HOOK}"
+  COMMAND ${CMAKE_COMMAND} -E echo "  export_resource=${MALLOC_HOOK_EXPORT_RESOURCE_HOOKS}"
+  COMMAND ${CMAKE_COMMAND} -E echo "  export_cpp_new=${MALLOC_HOOK_EXPORT_CPP_NEW_HOOK}"
+  COMMENT "Printing effective malloc_hook build options"
+  VERBATIM)
+
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -g -O3 -fPIC")
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)

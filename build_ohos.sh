@@ -76,5 +76,6 @@ cmake -S "${SRC_DIR}" -B "${BUILD_DIR}" -G Ninja \
     -DMALLOC_HOOK_OHOS_MMAP_HOOK="${OHOS_ENABLE_MMAP_HOOK:-OFF}" \
     -DMALLOC_HOOK_BUILD_TESTS=OFF
 cmake --build "${BUILD_DIR}" --target install -v
+cmake --build "${BUILD_DIR}" --target print_build_options
 
 echo "Built: ${SRC_DIR}/out/lib/liballoc_hook.so"

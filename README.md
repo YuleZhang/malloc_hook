@@ -81,16 +81,20 @@ switches: if a behaviour is not listed here, it is not tunable.
 copy of the UAPI is used, so a cross toolchain missing that header still gets
 DMA capture. Nothing needs to be set for this.
 
+`build_android.sh`, `build_linux.sh`, and `build_ohos.sh` print the effective
+options and derived export policy after a successful build. For a manual CMake
+build, run `cmake --build <build-dir> --target print_build_options`.
+
 ### Runtime options (environment)
 
 | Variable | Default | Effect |
 | --- | --- | --- |
-| `DUMP_PEAK_VALUE_MB` | unset | **Required to get a report.** Enables peak recording and the dump-on-exit report, and starts snapshotting once the tracked peak exceeds this many MB. Setting it also lowers the default minimum allocation size to 1 KB. |
+| `DUMP_PEAK_VALUE_MB` | unset | **Required for an automatic peak report on normal exit.** Enables peak recording and dump on exit, and starts snapshotting once the selected peak criterion exceeds this many MB. On-demand checkpoint reports remain available without it. Setting it also lowers the default minimum allocation size to 1 KB. |
 | `ALLOC_HOOK_DUMP_PREFIX` | `/data/local/tmp/trace/backtrace_heap` | Path prefix for reports. Files are named `<prefix>.exit.pid_<pid>.time_<t>.txt`, so a report can always be tied to the process that produced it. |
-| `DUMP_PEAK_STEP_MB` | `12` | Re-snapshot the peak every this many MB of growth. `0` snapshots on every new peak (much more expensive). Applies to whichever peak criterion is in use. |
-| `ALLOC_HOOK_PEAK_SAMPLE_MS` | the interval published by a host framework, else off | Interval at which the process's *observed* footprint — `VmRSS` from `/proc/self/status`, its dmabuf bytes, and GPU device mappings that neither of those covers — is sampled on a dedicated thread, and the peak snapshot is taken at the maximum of their sum instead of at the maximum of tracked allocation bytes. Those maxima are different instants: on one measured run the resident peak led the device-buffer peak by 167 ms. Use this whenever the number you are optimising against comes from an external sampler, so the stacks describe the moment that sampler calls the peak. `0` forces it off. |
+| `DUMP_PEAK_STEP_MB` | `12` | Upper bound on the growth required before rebuilding the peak snapshot. For small peaks the code uses 25% growth, with a 64 KB floor; `0` snapshots on every new peak (much more expensive). Applies to whichever peak criterion is in use. |
+| `ALLOC_HOOK_PEAK_SAMPLE_MS` | the interval published by a host framework, else off | Positive interval for sampling the process's *observed* footprint on a dedicated thread: current `VmRSS` from `/proc/self/status`, dmabuf bytes, and GPU device mappings covered by neither. Their same-sample sum becomes the peak criterion instead of tracked allocation bytes. It only takes effect when `DUMP_PEAK_VALUE_MB` enables peak recording; `0` forces it off. |
 | `BACKTRACE_MIN_SIZE` | `1024` when `DUMP_PEAK_VALUE_MB` is set, else `0` | Skip stack capture for allocations smaller than this. This is the main cost control: in a typical pipeline it filters >99% of allocations. |
-| `ALLOC_HOOK_CAPTURE_MODE` | `fast` | `fast` = bounded raw-PC capture, no symbolization (resolve offline). `accurate` = OS-specific backend. |
+| `ALLOC_HOOK_CAPTURE_MODE` | `fast` | `fast` = bounded raw-PC capture with no symbolization on the allocation thread; the worker may resolve dynamic symbols. `accurate` = OS-specific backend. |
 | `ALLOC_HOOK_SAMPLING_INTERVAL_BYTES` | `1` (off) | Poisson-sample host allocations at this byte interval. Scales reported host sizes; does not affect DMA accounting. |
 | `ALLOC_HOOK_FAST_CAPTURE_INTERVAL_BYTES` | `1` (off) | Capture a stack only once per this many bytes allocated. Suppresses stacks only; exact size accounting is unaffected. |
 | `ALLOC_HOOK_FAST_UNWINDER` | unset | `compiler` forces `_Unwind_Backtrace` instead of the aarch64 frame-pointer walk. The frame-pointer walk is the default because it is cheaper and does not fault on targets whose unwind tables drive libgcc's pointer-authentication path into a `SIGILL`. |
@@ -106,9 +110,37 @@ them.
 `ALLOC_HOOK_PEAK_SAMPLE_MS` needs no value in the common case. A host framework
 that samples this process's memory publishes the interval it uses in a variable
 whose name ends in `AUTO_SHOW_MEM_USE_DURATION_MS`; when the hook finds one set
-to a positive value it adopts that interval, so both sides sample the same
-quantity at the same cadence with nothing to keep in sync by hand. Setting
-`ALLOC_HOOK_PEAK_SAMPLE_MS` explicitly overrides that, including to `0`.
+to a positive value it adopts that interval, so the sampling cadence does not
+need to be kept in sync by hand. Setting `ALLOC_HOOK_PEAK_SAMPLE_MS` explicitly
+overrides that, including to `0`. The setting has no effect unless
+`DUMP_PEAK_VALUE_MB` is also set.
+
+This does not read the historical `VmPeak` or `VmHWM` fields. They cannot tell
+the hook when to copy live stacks. Each sampling cycle instead reads the current
+`VmRSS`, then DMA and GPU memory, and compares that same-cycle sum with the
+largest sum seen so far. When the sum also crosses the `DUMP_PEAK_VALUE_MB` and
+`DUMP_PEAK_STEP_MB` gates, the callback immediately re-reads
+`VmRSS`/`RssAnon`/`RssFile`/`RssShmem`, collects the top resident mappings from
+`/proc/self/smaps`, and copies the live stack table. These reads and the stack
+copy are sequential, not an atomic kernel snapshot; report labels such as
+`at_peak` mean the same peak callback window.
+
+For a retained snapshot at every newly observed maximum, a practical explicit
+configuration is:
+
+```sh
+export DUMP_PEAK_VALUE_MB=0          # enable immediately; use a floor to skip startup
+export ALLOC_HOOK_PEAK_SAMPLE_MS=5   # preferably match the external sampler
+export DUMP_PEAK_STEP_MB=0           # exact sampled maximum; higher snapshot cost
+export BACKTRACE_MIN_SIZE=1024       # use 0 only when every small stack is required
+```
+
+Leave `ALLOC_HOOK_SAMPLING_INTERVAL_BYTES` and
+`ALLOC_HOOK_FAST_CAPTURE_INTERVAL_BYTES` unset (their effective default is `1`)
+when exact host attribution and a stack for every eligible allocation are
+required. On a platform with a supported GPU device node the observed criterion
+is `rss + dma + gpu`; there is no runtime switch for `rss + dma` while excluding
+only that otherwise-unaccounted GPU term.
 
 The report says which criterion produced the snapshot it retained, and — when it
 was the observed footprint — what that footprint read at the snapshot instant,

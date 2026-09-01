@@ -65,6 +65,7 @@ function build_sdk(){
     cd build
     cmake ${CMAKE_PARA} .. 
     ninja install -v
+    cmake --build . --target print_build_options
     popd
 }
 
