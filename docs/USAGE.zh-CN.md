@@ -19,15 +19,24 @@
 ### 主机 Linux
 
 ```sh
+./build_linux.sh host
+```
+
+该脚本执行本机构建、运行测试、把库安装到 `out/linux-host/lib`，并打印实际生效的
+构建选项。等价的手工构建方式为：
+
+```sh
 cmake -S . -B build-host \
-  -DCMAKE_BUILD_TYPE=Release \
-  -DMALLOC_HOOK_ENABLE_DMA_CAPTURE=OFF
+  -DCMAKE_BUILD_TYPE=Release
 cmake --build build-host --target alloc_hook
 ctest --test-dir build-host --output-on-failure
 cmake --install build-host --prefix "$PWD"
 ```
 
 生成的库为 `out/lib/liballoc_hook.so`。
+
+要交叉编译 glibc Linux/aarch64，请将 `ARM_GNU_TOOLCHAIN_PATH` 指向
+`aarch64-none-linux-gnu` 工具链根目录，然后运行 `./build_linux.sh arm64`。
 
 ### Android
 
@@ -39,6 +48,7 @@ export NDK_ROOT=/path/to/android-ndk
 脚本对 arm64 和 armeabi-v7a 使用 API level 21，将库安装到 `out/lib`，
 然后通过 `adb` 运行内置 smoke workload。请连接匹配的设备并确保
 `adb` 在 `PATH` 中；如果只需要库文件，可直接使用 CMake 构建。
+成功编译后，脚本会打印实际生效的 CMake 选项和派生出的导出策略。
 
 ### OHOS
 
@@ -50,6 +60,7 @@ export OHOS_NDK_ROOT=/path/to/ohos-sdk/native
 `OHOS_ENABLE_MMAP_HOOK=ON` 是受控复现时的可选开关；`build_ohos.sh` 会将该
 环境变量转发为 `MALLOC_HOOK_OHOS_MMAP_HOOK` CMake 选项。默认 OHOS 构建关闭
 mmap 拦截。
+成功编译后，脚本会打印实际生效的 CMake 选项和派生出的导出策略。
 
 ## 3. 选择抓栈和采样
 
@@ -68,13 +79,44 @@ export BACKTRACE_MIN_SIZE=4096
 
 | 变量 | 作用 |
 | --- | --- |
-| `DUMP_PEAK_VALUE_MB` | 存活总量超过阈值后启用峰值快照。 |
-| `DUMP_PEAK_STEP_MB` | 两次峰值快照之间所需的最小增长量。 |
+| `DUMP_PEAK_VALUE_MB` | 启用峰值记录、退出时导出，并在当前所选峰值判据超过该下限后开始抓取快照。 |
+| `DUMP_PEAK_STEP_MB` | 再次抓取峰值快照所需增长量的上限；小峰值使用 25% 增长量，下限为 64 KB。`0` 表示每次新峰值都抓。 |
+| `ALLOC_HOOK_PEAK_SAMPLE_MS` | 按该正整数毫秒间隔采样实测 `VmRSS + DMA + GPU` 总量，并将它作为峰值判据。需要同时设置 `DUMP_PEAK_VALUE_MB`；`0` 表示强制关闭。 |
+| `ALLOC_HOOK_DUMP_PREFIX` | 设置报告路径前缀。 |
 | `BACKTRACE_DUMP_SIGNAL` | 覆盖平台默认的检查点信号。 |
-| `ALLOC_HOOK_DEBUG_SIGNAL` | 在 stderr 输出信号 worker 诊断。 |
+| `ALLOC_HOOK_DEBUG` | 在 stderr 输出 hook 诊断信息。 |
 
 采样只影响 host 分配归因；对通过平台导出策略和资源过滤的 mmap、DMA、ioctl
 事件，资源记账仍然精确。
+
+`ALLOC_HOOK_SAMPLING_INTERVAL_BYTES` 和 `ALLOC_HOOK_PEAK_SAMPLE_MS` 控制的是
+两套不同机制：前者通过概率采样减少 host 堆栈抓取，后者启动独立的内存观察线程，
+不会改变哪些分配被跟踪。
+
+没有正数峰值采样间隔时，快照由跟踪到的存活分配字节数驱动。间隔为正数时，每轮
+观察会读取 `/proc/self/status` 的当前 `VmRSS`、dmabuf 字节数，以及这两者都没有
+覆盖的 GPU 设备映射，并以同一轮三者之和的最大值选择峰值窗口。若宿主框架提供了
+名字以 `AUTO_SHOW_MEM_USE_DURATION_MS` 结尾且值为正数的环境变量，hook 会自动采用
+该间隔；显式的 `ALLOC_HOOK_PEAK_SAMPLE_MS` 始终优先，包括值为 `0` 时。
+
+观察线程不使用历史累计字段 `VmPeak` 或 `VmHWM`。当新的实测峰值越过快照门槛时，
+它会立即再次读取 `VmRSS`、`RssAnon`、`RssFile`、`RssShmem`，从
+`/proc/self/smaps` 收集驻留量最高的映射，然后复制存活堆栈表。这些操作顺序执行，
+所以 `at_peak` 表示同一个回调窗口，而不是内核提供的原子快照。
+
+要为每次采样到的新最大值保留堆栈快照，可使用：
+
+```sh
+export DUMP_PEAK_VALUE_MB=0
+export ALLOC_HOOK_PEAK_SAMPLE_MS=5   # 使用外部采样器的间隔
+export DUMP_PEAK_STEP_MB=0
+export BACKTRACE_MIN_SIZE=1024
+```
+
+`DUMP_PEAK_STEP_MB=0` 最精确但开销更高；若可以接受 `at_snapshot` 和
+`max_of_sum` 之间存在有界差距，就保留默认步进。只有确实需要 1 KB 以下分配的堆栈
+时才设置 `BACKTRACE_MIN_SIZE=0`。要保持精确 host 归因且不抑制满足尺寸条件的堆栈，
+两个字节采样变量都应保持未设置（实际值为 `1`）。
 
 ## 4. 预加载原生进程
 
@@ -114,6 +156,11 @@ kill -<BACKTRACE_DUMP_SIGNAL> <pid>
   的存活分配表中。
 - host 和 DMA 的分量峰值可能发生在不同时间；应使用 hook 自身时间一致的总峰值，
   不要直接相加两个独立最大值。
+- `observed_peak(at_snapshot)` 是触发当前保留堆栈快照的那轮采样；
+  `observed_peak(max_of_sum)` 是整个运行中同轮总和的最大值。步进门槛抑制后续重建时，
+  两者可能不同。
+- `rss_breakdown(at_peak)` 和 `rss_by_mapping(at_peak)` 是为该峰值窗口立即收集的
+  `/proc` 状态；如果没有抓到峰值上下文，标签会改为 `at_exit`。
 - `partial` 抓栈、模块无法解析、队列丢弃和符号器失败都会以显式状态输出，不会
   伪造栈帧。
 

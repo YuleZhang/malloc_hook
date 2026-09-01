@@ -73,16 +73,20 @@ C/C++ 和当前线程；托管运行时栈、远程线程上下文和完整离�
 `linux/dma-heap.h` 优先使用 sysroot 中的版本；没有时使用仓库内自带的一份
 UAPI，因此缺少该头文件的交叉工具链依然可以抓取 DMA。这一步不需要任何配置。
 
+`build_android.sh`、`build_linux.sh` 和 `build_ohos.sh` 会在成功编译后打印实际
+生效的选项和派生出的导出策略。手工使用 CMake 构建时，可运行
+`cmake --build <build-dir> --target print_build_options` 查看同一份摘要。
+
 ### 运行选项（环境变量）
 
 | 变量 | 默认值 | 作用 |
 | --- | --- | --- |
-| `DUMP_PEAK_VALUE_MB` | 未设置 | **不设置就不会产生报告。** 打开峰值记录和退出时导出报告，并在跟踪峰值超过该 MB 数后开始抓取快照。设置它同时会把默认最小分配尺寸降到 1 KB。 |
+| `DUMP_PEAK_VALUE_MB` | 未设置 | **正常退出时自动生成峰值报告必须设置它。** 打开峰值记录和退出时导出，并在当前所选峰值判据超过该 MB 数后开始抓取快照；不设置时仍可按需生成检查点报告。设置它同时会把默认最小分配尺寸降到 1 KB。 |
 | `ALLOC_HOOK_DUMP_PREFIX` | `/data/local/tmp/trace/backtrace_heap` | 报告路径前缀。文件名为 `<prefix>.exit.pid_<pid>.time_<t>.txt`，因此报告始终能对应到产生它的进程。 |
-| `DUMP_PEAK_STEP_MB` | `12` | 峰值每增长这么多 MB 重新抓一次快照。`0` 表示每次新峰值都抓（开销大得多）。对两种峰值判据都生效。 |
-| `ALLOC_HOOK_PEAK_SAMPLE_MS` | 宿主框架公布的采样间隔，否则关闭 | 以该间隔在独立线程上采样进程的**实测**占用——`/proc/self/status` 的 `VmRSS`、dmabuf 字节数，以及这两者都覆盖不到的 GPU 设备映射——并在三者之和取得最大值的那一刻抓快照，而不是在跟踪到的分配字节数最大时抓。这些最大值不在同一时刻：实测中曾出现驻留峰值比设备缓冲峰值早 167 ms。当你要对齐的数字来自外部采样器时就应该开启它，这样堆栈描述的就是那个采样器所称的峰值时刻。`0` 表示强制关闭。 |
+| `DUMP_PEAK_STEP_MB` | `12` | 重新构建峰值快照所需增长量的上限。峰值较小时实际使用 25% 的增长量，下限为 64 KB；`0` 表示每次新峰值都抓（开销大得多）。对两种峰值判据都生效。 |
+| `ALLOC_HOOK_PEAK_SAMPLE_MS` | 宿主框架公布的采样间隔，否则关闭 | 正整数表示在独立线程上采样进程的**实测**占用：`/proc/self/status` 的当前 `VmRSS`、dmabuf 字节数，以及这两者都覆盖不到的 GPU 设备映射。以同一轮采样中三者之和作为峰值判据，而不是使用跟踪到的分配字节数。只有 `DUMP_PEAK_VALUE_MB` 已启用峰值记录时才生效；`0` 表示强制关闭。 |
 | `BACKTRACE_MIN_SIZE` | 设置了 `DUMP_PEAK_VALUE_MB` 时为 `1024`，否则为 `0` | 小于该尺寸的分配不抓堆栈。这是最主要的开销控制项：典型流水线里它会过滤掉 99% 以上的分配。 |
-| `ALLOC_HOOK_CAPTURE_MODE` | `fast` | `fast` = 只抓有界的原始 PC，不做符号化（离线解析）。`accurate` = 使用操作系统特定后端。 |
+| `ALLOC_HOOK_CAPTURE_MODE` | `fast` | `fast` = 在分配线程中只抓有界原始 PC，不做符号化；worker 后续可解析动态符号。`accurate` = 使用操作系统特定后端。 |
 | `ALLOC_HOOK_SAMPLING_INTERVAL_BYTES` | `1`（关闭） | 按该字节间隔对 host 分配做 Poisson 采样。会缩放报告中的 host 尺寸，不影响 DMA 统计。 |
 | `ALLOC_HOOK_FAST_CAPTURE_INTERVAL_BYTES` | `1`（关闭） | 每分配这么多字节才抓一次堆栈。只抑制堆栈，不影响精确的尺寸统计。 |
 | `ALLOC_HOOK_FAST_UNWINDER` | 未设置 | 设为 `compiler` 时强制使用 `_Unwind_Backtrace`，而不是 aarch64 帧指针回溯。默认使用帧指针回溯，因为它更快，而且不会在某些 unwind 表会把 libgcc 带进指针认证路径、进而触发 `SIGILL` 的目标上崩溃。 |
@@ -96,8 +100,32 @@ UAPI，因此缺少该头文件的交叉工具链依然可以抓取 DMA。这一
 
 常见场景下 `ALLOC_HOOK_PEAK_SAMPLE_MS` 不需要显式赋值。采样本进程内存的宿主框架
 会把自己使用的间隔写在一个名字以 `AUTO_SHOW_MEM_USE_DURATION_MS` 结尾的环境变量
-里；hook 发现它被设为正值时就直接沿用该间隔，于是两边采样同一个量、用同一个节奏，
-不需要人工同步。显式设置 `ALLOC_HOOK_PEAK_SAMPLE_MS` 会覆盖它，包括设为 `0`。
+里；hook 发现它被设为正值时就直接沿用该间隔，因此不需要人工同步采样节奏。显式
+设置 `ALLOC_HOOK_PEAK_SAMPLE_MS` 会覆盖它，包括设为 `0`。如果没有同时设置
+`DUMP_PEAK_VALUE_MB`，该变量不会启动采样线程。
+
+这里不会读取历史累计字段 `VmPeak` 或 `VmHWM`，因为它们无法告诉 hook 应在哪一刻
+复制存活堆栈。每一轮采样先读取当前 `VmRSS`，再读取 DMA 和 GPU 内存，并用同一轮
+三者之和与此前最大值比较。当总和还越过 `DUMP_PEAK_VALUE_MB` 和
+`DUMP_PEAK_STEP_MB` 的门槛时，回调会立即再次读取
+`VmRSS`/`RssAnon`/`RssFile`/`RssShmem`，从 `/proc/self/smaps` 收集驻留量最高的
+映射，并复制存活堆栈表。这些读取和堆栈复制是顺序执行的，不是内核提供的原子快照；
+报告中的 `at_peak` 表示它们来自同一个峰值回调窗口。
+
+如果要求每次出现新的实测最大值都保留对应快照，可以显式配置：
+
+```sh
+export DUMP_PEAK_VALUE_MB=0          # 立即启用；也可设下限以跳过启动阶段
+export ALLOC_HOOK_PEAK_SAMPLE_MS=5   # 最好与外部采样器保持一致
+export DUMP_PEAK_STEP_MB=0           # 对齐采样到的最终最大值，但快照开销更高
+export BACKTRACE_MIN_SIZE=1024       # 只有确实需要每个小分配的栈时才设为 0
+```
+
+需要精确 host 归因并为每个满足尺寸条件的分配抓栈时，应让
+`ALLOC_HOOK_SAMPLING_INTERVAL_BYTES` 和 `ALLOC_HOOK_FAST_CAPTURE_INTERVAL_BYTES`
+保持未设置（实际默认值均为 `1`）。在存在受支持 GPU 设备节点的平台上，实测判据是
+`rss + dma + gpu`；当前没有只排除这项未被其他统计覆盖的 GPU 内存、强制改为
+`rss + dma` 的运行时开关。
 
 报告会写明保留下来的快照是哪种判据产生的；如果是实测占用，还会写明快照那一刻的实
 测值、整个 run 的最大值，以及采样器本身的开销：

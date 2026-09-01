@@ -13,6 +13,11 @@ allocation hook
        -> symbolizer
        -> completion result
     -> checkpoint / peak report
+
+dedicated observed-memory sampler (optional)
+    -> current VmRSS + DMA + uncovered GPU mappings
+    -> same-sample combined peak gate
+    -> /proc peak context + PointerData live-stack snapshot
 ```
 
 The allocation hook performs only bounded work. It records the requested size and memory type, captures raw program counters, and queues a copy of the raw record. Module lookup and symbolization are deliberately outside the hook path.
@@ -45,6 +50,20 @@ The completion callback receives a `StackResult` with the raw record, resolution
 `PointerData` owns the live-allocation table and peak counters. Host allocations may use Fast-only Poisson byte sampling; resource paths remain exact. A sampled host record stores an estimated tracked size and is removed through the same pointer identity path when the allocation is freed.
 
 Checkpoint reports are emitted by the exported `checkpoint(const char*)` entry point or by the configured signal. Peak snapshots are enabled with `DUMP_PEAK_VALUE_MB` and throttled by `DUMP_PEAK_STEP_MB`.
+
+By default the peak criterion is tracked allocation bytes. A positive
+`ALLOC_HOOK_PEAK_SAMPLE_MS` switches it to the maximum same-cycle sum of current
+`VmRSS`, dmabuf bytes, and GPU mappings covered by neither. The sampler runs on
+its own thread because residency and device ownership can change without an
+allocation hook call. It reads current `VmRSS`, not the historical `VmPeak` or
+`VmHWM` fields.
+
+When an observed sample crosses the snapshot gates, the callback collects a
+second `/proc/self/status` reading (`VmRSS`, `RssAnon`, `RssFile`, and
+`RssShmem`), the top resident mappings from `/proc/self/smaps`, and then the
+live stack table. The sequence deliberately keeps expensive `/proc` work off
+allocator threads, but it is not atomic: report values tagged `at_peak` belong
+to the same callback window, not one kernel snapshot instant.
 
 ## Platform boundaries
 

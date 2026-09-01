@@ -19,15 +19,25 @@ explicit toolchain identity and is not inferred from a generic musl build.
 ### Host Linux
 
 ```sh
+./build_linux.sh host
+```
+
+The script builds natively, runs the tests, installs the library under
+`out/linux-host/lib`, and prints the effective build options. The equivalent
+manual build is:
+
+```sh
 cmake -S . -B build-host \
-  -DCMAKE_BUILD_TYPE=Release \
-  -DMALLOC_HOOK_ENABLE_DMA_CAPTURE=OFF
+  -DCMAKE_BUILD_TYPE=Release
 cmake --build build-host --target alloc_hook
 ctest --test-dir build-host --output-on-failure
 cmake --install build-host --prefix "$PWD"
 ```
 
 The resulting library is `out/lib/liballoc_hook.so`.
+
+For a glibc Linux/aarch64 cross-build, set `ARM_GNU_TOOLCHAIN_PATH` to an
+`aarch64-none-linux-gnu` toolchain root and run `./build_linux.sh arm64`.
 
 ### Android
 
@@ -40,6 +50,8 @@ The script uses API level 21 for the arm64 and armeabi-v7a targets, installs the
 library under `out/lib`, and then runs the bundled smoke workload through
 `adb`. Keep a matching device connected and make `adb` available on `PATH`, or
 invoke the CMake build directly when only the library artifact is needed.
+After a successful build it prints the effective CMake options and derived
+export policy.
 
 ### OHOS
 
@@ -52,6 +64,8 @@ export OHOS_NDK_ROOT=/path/to/ohos-sdk/native
 `build_ohos.sh` forwards this environment variable to the
 `MALLOC_HOOK_OHOS_MMAP_HOOK` CMake option.
 The default OHOS build leaves mmap interposition disabled.
+After a successful build the script prints the effective CMake options and
+derived export policy.
 
 ## 3. Select capture and sampling
 
@@ -71,14 +85,51 @@ Additional public controls:
 
 | Variable | Purpose |
 | --- | --- |
-| `DUMP_PEAK_VALUE_MB` | Enable a peak snapshot after the configured live total is exceeded. |
-| `DUMP_PEAK_STEP_MB` | Minimum additional growth before another peak snapshot is built. |
+| `DUMP_PEAK_VALUE_MB` | Enable peak recording, dump on exit, and snapshots after the selected peak criterion exceeds this floor. |
+| `DUMP_PEAK_STEP_MB` | Upper bound on growth before another peak snapshot; small peaks use 25% growth with a 64 KB floor. `0` snapshots every new peak. |
+| `ALLOC_HOOK_PEAK_SAMPLE_MS` | Use the observed `VmRSS + DMA + GPU` total sampled at this positive millisecond interval as the peak criterion. Requires `DUMP_PEAK_VALUE_MB`; `0` forces it off. |
+| `ALLOC_HOOK_DUMP_PREFIX` | Set the report path prefix. |
 | `BACKTRACE_DUMP_SIGNAL` | Override the platform-selected checkpoint signal. |
-| `ALLOC_HOOK_DEBUG_SIGNAL` | Enable signal-worker diagnostics on stderr. |
+| `ALLOC_HOOK_DEBUG` | Enable hook diagnostics on stderr. |
 
 Sampling affects host allocation attribution only. mmap, DMA, and ioctl
 resource accounting remains exact for events that pass the platform export and
 resource filters.
+
+`ALLOC_HOOK_SAMPLING_INTERVAL_BYTES` and `ALLOC_HOOK_PEAK_SAMPLE_MS` control
+different mechanisms. The first probabilistically reduces host stack capture.
+The second starts a dedicated observer thread and does not change which
+allocations are tracked.
+
+With no positive peak interval, snapshots follow tracked live allocation bytes.
+With a positive interval, each observer cycle reads current `VmRSS` from
+`/proc/self/status`, dmabuf bytes, and GPU device mappings covered by neither;
+the maximum of that same-cycle sum selects the peak window. A host framework's
+positive environment value whose name ends in `AUTO_SHOW_MEM_USE_DURATION_MS`
+is adopted automatically unless `ALLOC_HOOK_PEAK_SAMPLE_MS` is explicitly set,
+including to `0`.
+
+The observer does not use the historical `VmPeak` or `VmHWM` fields. When a new
+observed peak crosses the configured snapshot gates, it immediately re-reads
+`VmRSS`, `RssAnon`, `RssFile`, and `RssShmem`, collects the top resident mappings
+from `/proc/self/smaps`, and copies the live stack table. These operations are
+sequential, so `at_peak` means the same callback window rather than an atomic
+kernel snapshot.
+
+To retain a stack snapshot for every newly sampled maximum:
+
+```sh
+export DUMP_PEAK_VALUE_MB=0
+export ALLOC_HOOK_PEAK_SAMPLE_MS=5   # use the external sampler's interval
+export DUMP_PEAK_STEP_MB=0
+export BACKTRACE_MIN_SIZE=1024
+```
+
+`DUMP_PEAK_STEP_MB=0` is the exact but more expensive mode. Keep the default
+step when a bounded gap between `at_snapshot` and `max_of_sum` is acceptable.
+Set `BACKTRACE_MIN_SIZE=0` only if stacks for allocations below 1 KB are worth
+the extra overhead. Leave both byte-sampling variables unset (effective value
+`1`) for exact host attribution and unsuppressed eligible stacks.
 
 ## 4. Preload a native process
 
@@ -124,6 +175,12 @@ Interpret the values carefully:
   are outside this hook's live-allocation table.
 - Host and DMA component peaks can occur at different times; use the hook's
   time-consistent combined peak rather than adding independent maxima.
+- `observed_peak(at_snapshot)` is the sample that triggered the retained stack
+  snapshot; `observed_peak(max_of_sum)` is the largest same-cycle sum seen over
+  the run. They can differ when the step gate suppresses a later rebuild.
+- `rss_breakdown(at_peak)` and `rss_by_mapping(at_peak)` are the `/proc` state
+  collected immediately for that retained peak window; if no peak context was
+  captured, their labels say `at_exit` instead.
 - A `partial` capture, unresolved module, dropped queue item, or symbolizer
   failure is explicit report metadata, not a fabricated frame.
 
