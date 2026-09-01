@@ -268,6 +268,46 @@ void TestIntervalResolution() {
     unsetenv("DUMP_PEAK_VALUE_MB");
 }
 
+// The minimum-size filter has three sources -- the platform default, the
+// environment, and the peak-recording default -- and they have to compose in
+// that order of authority. Written without naming any platform's number so the
+// same assertions hold wherever this runs.
+void TestMinSizeDefaults() {
+    unsetenv("BACKTRACE_MIN_SIZE");
+    unsetenv("DUMP_PEAK_VALUE_MB");
+    unsetenv("ALLOC_HOOK_PEAK_SAMPLE_MS");
+    unsetenv("PROBE_AUTO_SHOW_MEM_USE_DURATION_MS");
+    Config config;
+    assert(config.Init());
+    const size_t platform_default = config.backtrace_min_size_bytes();
+
+    setenv("BACKTRACE_MIN_SIZE", "4096", 1);
+    assert(config.Init());
+    assert(config.backtrace_min_size_bytes() == 4096);
+
+    // Re-initialising without the variable returns to the platform default
+    // instead of carrying the previous run's explicit value.
+    unsetenv("BACKTRACE_MIN_SIZE");
+    assert(config.Init());
+    assert(config.backtrace_min_size_bytes() == platform_default);
+
+    // An explicit 0 is a real request for no filter, not a parse failure.
+    setenv("BACKTRACE_MIN_SIZE", "0", 1);
+    assert(config.Init());
+    assert(config.backtrace_min_size_bytes() == 0);
+    unsetenv("BACKTRACE_MIN_SIZE");
+
+    // Peak recording supplies a filter where the platform has none, and leaves a
+    // platform default alone: enabling it must not start capturing stacks the
+    // platform had decided to skip.
+    setenv("ALLOC_HOOK_PEAK_SAMPLE_MS", "5", 1);
+    assert(config.Init());
+    assert(config.backtrace_min_size_bytes() ==
+           (platform_default != 0 ? platform_default : 1024));
+    assert(config.backtrace_min_size_bytes() >= platform_default);
+    unsetenv("ALLOC_HOOK_PEAK_SAMPLE_MS");
+}
+
 // The two peak modes are selected by which variable is set, and each has to
 // arrive complete: a criterion to compare against, a report on exit, and a
 // default size filter. A mode that samples for a whole run and then writes no
@@ -798,6 +838,7 @@ int main() {
     TestMapPassGate();
     TestPeakThresholdPolicy();
     TestIntervalResolution();
+    TestMinSizeDefaults();
     TestPeakModeSelection();
     TestSamplerLifecycle();
     TestFirstCrossingTakesOneSnapshot();

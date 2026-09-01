@@ -85,7 +85,7 @@ UAPI，因此缺少该头文件的交叉工具链依然可以抓取 DMA。这一
 | `ALLOC_HOOK_DUMP_PREFIX` | `/data/local/tmp/trace/backtrace_heap` | 报告路径前缀。文件名为 `<prefix>.exit.pid_<pid>.time_<t>.txt`，因此报告始终能对应到产生它的进程。 |
 | `DUMP_PEAK_STEP_MB` | `12` | 仅峰值追踪模式使用：重新构建峰值快照所需增长量的上限。峰值较小时实际使用 25% 的增长量，下限为 64 KB；`0` 表示每次新峰值都抓（开销大得多）。首次越线模式不会重建快照，因此该值不生效。 |
 | `ALLOC_HOOK_PEAK_SAMPLE_MS` | 宿主框架公布的采样间隔；开启峰值记录而框架未公布时为 `50` | 在独立线程上采样进程**实测**占用的间隔：`/proc/self/status` 的当前 `VmRSS`、dmabuf 字节数，以及这两者都覆盖不到的 GPU 设备映射。两种模式共用的峰值判据都是同一轮采样中三者之和。不设 `DUMP_PEAK_VALUE_MB` 而只设它，即选择**峰值追踪**模式，同样会打开峰值记录和退出时导出。`0` 表示强制不起采样线程，判据退回跟踪到的分配字节数。 |
-| `BACKTRACE_MIN_SIZE` | 开启峰值记录时为 `1024`，否则为 `0` | 小于该尺寸的分配不抓堆栈。这是最主要的开销控制项：典型流水线里它会过滤掉 99% 以上的分配。 |
+| `BACKTRACE_MIN_SIZE` | OHOS 为 `40960`；其他平台开启峰值记录时为 `1024`，否则为 `0` | 小于该尺寸的分配不抓堆栈。这是最主要的开销控制项：典型流水线里它会过滤掉 99% 以上的分配。 |
 | `ALLOC_HOOK_CAPTURE_MODE` | `fast` | `fast` = 在分配线程中只抓有界原始 PC，不做符号化；worker 后续可解析动态符号。`accurate` = 使用操作系统特定后端。 |
 | `ALLOC_HOOK_SAMPLING_INTERVAL_BYTES` | `1`（关闭） | 按该字节间隔对 host 分配做 Poisson 采样。会缩放报告中的 host 尺寸，不影响 DMA 统计。 |
 | `ALLOC_HOOK_FAST_CAPTURE_INTERVAL_BYTES` | `1`（关闭） | 每分配这么多字节才抓一次堆栈。只抑制堆栈，不影响精确的尺寸统计。 |

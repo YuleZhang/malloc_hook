@@ -19,6 +19,10 @@ static constexpr size_t DEFAULT_BACKTRACE_FRAMES = 128;
 static constexpr const char DEFAULT_BACKTRACE_DUMP_PREFIX[] =
         "/data/local/tmp/trace/backtrace_heap";
 static constexpr size_t DEFAULT_OHOS_BACKTRACE_MIN_SIZE_BYTES = 40960;
+// Size filter applied when peak recording is enabled on a platform that sets no
+// default of its own. Peak recording walks the live stack table, so an unfiltered
+// run pays for stacks that no report line can attribute.
+static constexpr size_t kPeakRecordingMinSizeBytes = 1024;
 static constexpr char kSamplingIntervalBytesEnv[] =
         "ALLOC_HOOK_SAMPLING_INTERVAL_BYTES";
 static constexpr char kFastCaptureIntervalEnv[] =
@@ -150,8 +154,23 @@ bool Config::Init() {
     options_ |= BACKTRACE_SPECIFIC_SIZES;
 #if defined(MALLOC_HOOK_TARGET_OS_OHOS)
     backtrace_min_size_bytes_ = DEFAULT_OHOS_BACKTRACE_MIN_SIZE_BYTES;
+#else
+    backtrace_min_size_bytes_ = 0;
 #endif
-    ParseValue(getenv("BACKTRACE_MIN_SIZE"), &backtrace_min_size_bytes_);
+    // Only a value that parsed replaces the platform default. ParseValue zeroes
+    // its out-parameter before reporting failure, so passing the member directly
+    // erased the default on every run that did not set the variable -- which is
+    // every run on the one platform that has a default.
+    //
+    // Assigned unconditionally above rather than left to that side effect,
+    // because Init() runs more than once in a process and must not carry a
+    // previous run's explicit value into one that has none.
+    size_t min_size_bytes = 0;
+    const bool explicit_min_size =
+            ParseValue(getenv("BACKTRACE_MIN_SIZE"), &min_size_bytes);
+    if (explicit_min_size) {
+        backtrace_min_size_bytes_ = min_size_bytes;
+    }
     backtrace_max_size_bytes_ = SIZE_MAX;
 
     // 开启 unwind
@@ -192,8 +211,12 @@ bool Config::Init() {
                                      : PeakRetention::ChaseMax;
     if (record_peak) {
         options_ |= RECORD_MEMORY_PEAK;
-        if (getenv("BACKTRACE_MIN_SIZE") == nullptr) {
-            backtrace_min_size_bytes_ = 1024;
+        // Fills in a filter where the platform sets none. It must not relax one
+        // that a platform did set: that default exists for that platform's own
+        // cost reasons, and enabling peak recording is not a reason to capture
+        // stacks it had decided to skip.
+        if (!explicit_min_size && backtrace_min_size_bytes_ == 0) {
+            backtrace_min_size_bytes_ = kPeakRecordingMinSizeBytes;
         }
         // Both modes report on exit. Without this a run configured only for
         // peak-chasing would sample the footprint for its whole lifetime and then
