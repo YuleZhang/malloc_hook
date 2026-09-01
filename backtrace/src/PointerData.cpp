@@ -1061,6 +1061,14 @@ void PointerData::DumpLiveToFile(int fd, bool dump_peak) {
             "used: %fMB\n",
             host_use / 1024.0 / 1024.0, dma_use / 1024.0 / 1024.0,
             (host_use + dma_use) / 1024.0 / 1024.0);
+    // What the addresses on the "#<n> <addr> <module>" lines mean, so the file is
+    // self-describing and can be fed to llvm-symbolizer/addr2line without an
+    // out-of-band convention. Emitted for every report, not just a peak one:
+    // those frame lines are, and a checkpoint dump needs symbolizing too.
+    dprintf(fd,
+            "frame_pc: elf_vaddr_of_call_site (captured return address minus "
+            "%zu)\n",
+            static_cast<size_t>(kReturnAddressPcAdjust));
     // Stack-less live allocations are counted in the totals above but not
     // listed. Kept as one line so a capture failure is still visible without
     // paying a block per allocation.
@@ -1326,13 +1334,20 @@ void PointerData::DumpLiveToFile(int fd, bool dump_peak) {
             // preferred over any in-process symbolization result: a resolver
             // that failed still leaves frame entries behind, and emitting those
             // would produce absolute PCs against "<unknown>" modules.
+            //
+            // Every captured PC is a return address, so it is converted to its
+            // call site before the module lookup rather than after: a call that
+            // is the last instruction of a module's executable mapping returns
+            // to an address outside it, which Resolve() cannot attribute at all.
             const std::vector<uintptr_t>& raw = *info.raw_frames;
             size_t first = 0;
             if (self_module != nullptr) {
                 while (first < raw.size()) {
                     uintptr_t rel_pc = 0;
                     const char* module_name = nullptr;
-                    if (!modules.Resolve(raw[first], &rel_pc, &module_name) ||
+                    if (!modules.Resolve(
+                                CallSitePcFromReturnAddress(raw[first]), &rel_pc,
+                                &module_name) ||
                         strcmp(module_name, self_module) != 0) {
                         break;
                     }
@@ -1345,7 +1360,7 @@ void PointerData::DumpLiveToFile(int fd, bool dump_peak) {
                 }
             }
             for (size_t i = first; i < raw.size(); ++i) {
-                const uintptr_t pc = raw[i];
+                const uintptr_t pc = CallSitePcFromReturnAddress(raw[i]);
                 uintptr_t rel_pc = pc;
                 const char* module_name = "<unknown>";
                 modules.Resolve(pc, &rel_pc, &module_name);

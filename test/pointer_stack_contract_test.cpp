@@ -85,5 +85,24 @@ int main() {
     // deep-copying it.
     assert(report.raw_frames.get() == frame_info.frames.get());
     assert(report.raw_frames->size() == 2);
+
+    // Captured PCs are return addresses. A symbolizer resolves the address it
+    // is handed as the instruction being executed, so the report converts each
+    // one to its call site before module lookup; otherwise a call in a
+    // function's last instruction resolves to the next function, and a call in
+    // a module's last instruction resolves to no module at all.
+    assert(CallSitePcFromReturnAddress(0x1000) == 0x1000 - kReturnAddressPcAdjust);
+    assert(CallSitePcFromReturnAddress(0x1000) < 0x1000);
+#if defined(__aarch64__)
+    // Fixed-width instructions: exactly the bl/blr.
+    assert(kReturnAddressPcAdjust == 4);
+#else
+    assert(kReturnAddressPcAdjust == 1);
+#endif
+    // Too small to sit after a call; must not underflow into the top of the
+    // address space.
+    assert(CallSitePcFromReturnAddress(0) == 0);
+    assert(CallSitePcFromReturnAddress(kReturnAddressPcAdjust) ==
+           kReturnAddressPcAdjust);
     return 0;
 }

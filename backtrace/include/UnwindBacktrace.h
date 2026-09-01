@@ -74,8 +74,41 @@ struct RawStackRecord {
     }
 };
 
+// Every PC these backends record is a return address, never the address of the
+// call itself: the aarch64 frame-pointer walk stores the saved LR, and
+// _Unwind_GetIP()/backtrace() report the return address for every frame that
+// survives the capture-time skip. A symbolizer resolves whatever address it is
+// given as the instruction being executed, so handing it the return address
+// resolves the instruction *after* the call. Under inlining that is the
+// caller's cleanup code -- destructors of temporaries, the next statement --
+// which lands in standard-library headers instead of the calling source line;
+// when the call is a function's last instruction it is the next function
+// entirely; and when it is a module's last instruction it falls outside the
+// module's mapping and cannot be attributed at all.
+//
+// Step back into the call instruction before any module lookup, relative-PC or
+// symbol-offset computation. Captured records keep the raw return address so
+// stack identity and dedup stay untouched.
+constexpr uintptr_t kReturnAddressPcAdjust =
+#if defined(__aarch64__)
+        // Fixed-width instructions: this is exactly the bl/blr.
+        4;
+#else
+        // Variable-width ISAs: any address inside the call instruction resolves
+        // to the call site, and one byte back is always inside it.
+        1;
+#endif
+
+inline uintptr_t CallSitePcFromReturnAddress(uintptr_t return_address) {
+    return return_address > kReturnAddressPcAdjust
+            ? return_address - kReturnAddressPcAdjust
+            : return_address;
+}
+
 struct SymbolizedFrame {
+    // Raw return address as captured.
     uintptr_t pc = 0;
+    // Module-relative address of the *call site*, i.e. what a symbolizer needs.
     uintptr_t rel_pc = 0;
     uintptr_t sp = 0;
     uintptr_t module_start = 0;

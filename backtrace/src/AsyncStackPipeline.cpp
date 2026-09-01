@@ -254,6 +254,12 @@ bool NativeSymbolizer::Symbolize(
     frames->reserve(raw.frame_count);
     for (size_t i = 0; i < raw.frame_count; ++i) {
         const uintptr_t pc = raw.pcs[i];
+        // The captured value is a return address; every lookup below wants the
+        // call site instead. Keeping the raw address in frame.pc and deriving
+        // rel_pc/function_offset from the call site is what makes a symbol
+        // offset point at the call rather than at whatever follows it -- for a
+        // call in a function's last instruction, that is the next symbol.
+        const uintptr_t call_site = CallSitePcFromReturnAddress(pc);
         const ModuleInfo* module = i < modules.size() ? &modules[i] : nullptr;
         SymbolizedFrame frame;
         frame.pc = pc;
@@ -266,14 +272,16 @@ bool NativeSymbolizer::Symbolize(
             // canonical relative PC is the runtime/ELF virtual address,
             // while PIE/DSO images use the dynamic-loader load bias.
             frame.rel_pc = module->load_bias == 0
-                    ? pc
-                    : (pc >= module->load_bias ? pc - module->load_bias : pc);
+                    ? call_site
+                    : (call_site >= module->load_bias
+                               ? call_site - module->load_bias
+                               : call_site);
         } else {
-            frame.rel_pc = pc;
+            frame.rel_pc = call_site;
         }
 
         Dl_info info = {};
-        if (dladdr(reinterpret_cast<void*>(pc), &info) != 0 &&
+        if (dladdr(reinterpret_cast<void*>(call_site), &info) != 0 &&
             info.dli_sname != nullptr && module != nullptr &&
             reinterpret_cast<uintptr_t>(info.dli_fbase) ==
                     module->load_bias &&
@@ -281,7 +289,7 @@ bool NativeSymbolizer::Symbolize(
              module->name == info.dli_fname)) {
             frame.function_name = info.dli_sname;
             const uintptr_t symbol = reinterpret_cast<uintptr_t>(info.dli_saddr);
-            frame.function_offset = pc >= symbol ? pc - symbol : 0;
+            frame.function_offset = call_site >= symbol ? call_site - symbol : 0;
         }
         frames->push_back(std::move(frame));
     }
@@ -606,7 +614,11 @@ void AsyncStackPipeline::WorkerLoop() {
         bool unresolved_module = false;
         for (size_t i = 0; i < item.raw.frame_count; ++i) {
             ModuleInfo module;
-            if (!resolver_->Resolve(item.raw.pcs[i], item.raw.module_generation, &module)) {
+            // Attribute the call site, not the return address: a call that ends
+            // a module's mapping returns past it and would resolve to nothing.
+            if (!resolver_->Resolve(
+                        CallSitePcFromReturnAddress(item.raw.pcs[i]),
+                        item.raw.module_generation, &module)) {
                 unresolved_module = true;
             }
             modules.push_back(std::move(module));

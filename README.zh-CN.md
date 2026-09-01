@@ -36,6 +36,10 @@ flowchart LR
   并保留部分栈及错误状态。
 - **异步解析：** `AsyncStackPipeline` 对原始栈去重，在 worker 中快照已加载
   ELF 模块并解析动态符号；符号不可用时仍保留原始 PC 和模块相对 PC。
+- **报告地址：** 抓到的 PC 都是返回地址，因此报告中的模块相对 PC 会先回退到
+  调用指令，再做模块归属。`#<n> <addr> <module>` 行上的地址是调用点的 ELF
+  虚拟地址，可直接交给 `llvm-symbolizer --obj=<带符号的 ELF>`；每份报告的
+  `frame_pc:` 行都声明了这一约定。
 - **记账：** `PointerData` 管理存活分配身份、host 采样记账、资源记账和峰值
   计数器。
 - **平台边界：** CMake 分离 OS、libc、架构、编译器 unwind 能力和导出策略。
