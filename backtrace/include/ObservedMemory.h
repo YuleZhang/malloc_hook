@@ -153,13 +153,21 @@ struct GpuMmapCache {
 // sample.
 struct DmaInodeSet {
     static constexpr size_t kSlots = 4096;
+    // Buffers one pass can actually dedup, which is *half* the slot count, not
+    // all of it. Open addressing degrades badly as it fills, so insertion stops
+    // at a 0.5 load factor and reports overflow from there on. Named explicitly
+    // because kSlots alone reads as the capacity and overstates it 2x: an
+    // overflow at 2048 buffers would otherwise look like a bug against a
+    // "4096-slot" table rather than the documented limit.
+    static constexpr size_t kMaxDedupedBuffers = kSlots / 2;
     uint64_t inode[kSlots];
     uint32_t stamp[kSlots];
     uint32_t generation;
     size_t count;
-    // Set when a pass held more distinct buffers than the table can dedup. The
-    // resulting total may double-count, so it is surfaced rather than hidden:
-    // a silently wrong DMA figure would move the apparent peak instant.
+    // Set when a pass held more distinct buffers than the table can dedup (see
+    // kMaxDedupedBuffers). The resulting total may double-count, so it is
+    // surfaced rather than hidden: a silently wrong DMA figure would move the
+    // apparent peak instant.
     bool overflowed;
 };
 
@@ -176,6 +184,37 @@ size_t DmaBytesFromMapsLine(char* line, DmaInodeSet* set, bool* saw_any);
 // Exposed with an explicit path and pid for the same reason: the kernels that
 // publish this file are not the kernels a host test runs on.
 bool ReadIonProcInfoBytesFrom(const char* path, int pid, size_t* bytes);
+
+// What the sampler loop should do after finishing a sample.
+//
+// Split out of ObservedPeakSampler::Run() as a pure function so the scheduling
+// rules can be tested exhaustively without a thread or a clock: the loop itself
+// is untestable in any deterministic way.
+struct SampleSchedule {
+    // Instant the next sample should start at. Always on the interval grid
+    // established by the first sample, so phase is preserved across a slow one.
+    uint64_t next_deadline_us = 0;
+    // Grid slots that went unserved, either because the last sample overran
+    // them or because the duty cap pushed past them.
+    uint64_t skipped_slots = 0;
+    // The duty cap, rather than the requested cadence, decided the wait.
+    bool throttled = false;
+};
+
+// Fixed-rate scheduling for the sampler.
+//
+// The next deadline is derived from the previous *deadline*, not from "now", so
+// the time a sample took is absorbed into the period instead of being added to
+// it. A fixed-delay loop (sleep interval after the work) instead runs at
+// interval + work_us forever, and because the reads get more expensive as the
+// process grows, that drift is worst exactly when peak resolution matters most.
+//
+// `work_us` is the whole iteration's cost, not just the /proc read: the duty cap
+// exists to bound what the sampler takes from the process, and a peak snapshot
+// is as much the sampler's cost as the read that triggered it.
+SampleSchedule NextSampleSchedule(
+        uint64_t previous_deadline_us, uint64_t now_us, uint64_t work_us,
+        uint64_t interval_us);
 
 // One reading of the footprint an evaluator sees: host resident bytes, device
 // buffer bytes, and GPU device mappings that neither of those two covers. The sum
@@ -305,6 +344,14 @@ struct ObservedSamplerStats {
     // Wall time from the first sample to the last, so the cadence actually
     // achieved is visible next to the one requested.
     uint64_t span_us = 0;
+    // Grid slots the sampler never served. Non-zero means the achieved cadence
+    // below is not the requested one, and says so directly rather than leaving
+    // it to be inferred from the mean.
+    uint64_t skipped_slots = 0;
+    // Samples after which the duty cap, rather than the requested interval,
+    // set the wait. Separates "too expensive to sample this fast" from "the
+    // scheduler did not wake us on time".
+    uint64_t throttled_samples = 0;
     bool dedup_overflowed = false;
     // Maximum of (rss + dma + gpu) over the run, with every part as it stood at
     // that instant.
@@ -346,9 +393,28 @@ public:
     // Idempotent. Joins the sampler thread, so after it returns the statistics
     // below are stable and no snapshot can be in flight.
     void Stop();
+    // Declares the sampler absent without joining. fork() does not clone the
+    // sampler thread, so the child inherits started_ == true describing a
+    // thread that does not exist; Stop() would then block forever in
+    // pthread_join on a stale id. Child-side use only.
+    void ResetAfterForkInChild();
 
     bool running() const { return running_.load(std::memory_order_acquire); }
     bool started() const { return started_.load(std::memory_order_acquire); }
+
+    // True only when the sampler claims to be running but has stopped
+    // delivering samples -- a wedged or dead sampler thread.
+    //
+    // This exists to give the one-way observed-peak latch a liveness fallback.
+    // Once the sampler has taken a snapshot it owns the peak criterion, so if it
+    // then dies the report would stay pinned to whatever early snapshot it had
+    // already taken, with the allocation-path criterion permanently disabled.
+    //
+    // Deliberately false for a sampler that was never started or that Stop()
+    // shut down: finalization stops the sampler *before* the final dump, and
+    // treating that as death would let a late allocation overwrite the observed
+    // snapshot the run exists to report.
+    bool Stalled() const;
 
     ObservedSamplerStats stats() const;
 
@@ -377,6 +443,8 @@ private:
     std::atomic<uint64_t> total_fd_us_{0};
     std::atomic<uint64_t> total_map_us_{0};
     std::atomic<uint64_t> total_gpu_us_{0};
+    std::atomic<uint64_t> skipped_slots_{0};
+    std::atomic<uint64_t> throttled_samples_{0};
     std::atomic<uint64_t> first_sample_us_{0};
     std::atomic<uint64_t> last_sample_us_{0};
     std::atomic<size_t> peak_total_bytes_{0};

@@ -17,7 +17,6 @@
 #include <vector>
 
 #include "Config.h"
-#include "AsyncStackPipeline.h"
 #include "ObservedMemory.h"
 #include "Sampling.h"
 #include "UnwindBacktrace.h"
@@ -130,8 +129,6 @@ struct FrameInfoType {
     uint64_t module_generation = 0;
     StackCaptureState capture_state = StackCaptureState::Empty;
     uint8_t terminal_error = 0;
-    AsyncStackId async_stack_id = 0;
-    StackResolutionState resolution_state = StackResolutionState::Pending;
 };
 
 // 新增 timeval 比较函数
@@ -163,7 +160,6 @@ struct ListInfoType {
     std::shared_ptr<std::vector<SymbolizedFrame>> backtrace_info;
     StackCaptureState capture_state = StackCaptureState::Empty;
     uint8_t terminal_error = 0;
-    StackResolutionState resolution_state = StackResolutionState::Pending;
     timeval alloc_time;
 };
 using Pred = std::function<bool(const ListInfoType&, const ListInfoType&)>;
@@ -211,10 +207,12 @@ public:
     // overwriting it, because that trigger fires at an instant nothing outside
     // the process reports.
     void RecordObservedPeak(const ObservedMemSample& sample);
-    void FlushAsync();
-    void BeginFinalization();
-    void CompleteAsyncStack(const StackResult& result);
-    AsyncStackStats AsyncStats() const;
+    // fork() only clones the calling thread, so a mutex another thread held at
+    // fork time stays locked forever in the child. These acquire and release
+    // both tracker mutexes in the canonical pointer -> frame order so a
+    // pthread_atfork handler can hand the child an unlocked tracker.
+    void LockForFork();
+    void UnlockAfterFork();
 
 private:
     inline uintptr_t ManglePointer(uintptr_t pointer) { return pointer ^ UINTPTR_MAX; }
@@ -251,8 +249,6 @@ private:
     std::unordered_map<FrameKeyType, size_t> key_to_index_;
     std::unordered_map<size_t, FrameInfoType> frames_;
     std::unordered_map<size_t, std::shared_ptr<std::vector<SymbolizedFrame>>> backtraces_info_;
-    std::unordered_map<AsyncStackId, size_t> async_stack_to_index_;
-    std::unique_ptr<AsyncStackPipeline> async_pipeline_;
     size_t cur_hash_index_;
 
     size_t current_used, current_host, current_dma;

@@ -20,6 +20,7 @@
 #include "LinuxResourceBackend.h"
 #endif
 
+#include "AsyncStackPipeline.h"
 #include "Config.h"
 #include "DebugData.h"
 #include "HookSourcePolicy.h"
@@ -64,6 +65,15 @@ public:
     }
 
     static void BlockAllOperations() { pthread_rwlock_wrlock(&lock_); }
+    // Child-side fork recovery only. The child inherits the lock with the read
+    // counts of threads fork() did not clone, so a later wrlock (finalization's
+    // BlockAllOperations) would wait on readers that no longer exist. Only the
+    // forking thread runs at this point, so re-initialising is safe and is the
+    // only way to discard those phantom readers.
+    static void ReinitAfterForkInChild() {
+        pthread_rwlock_destroy(&lock_);
+        Init();
+    }
 
 private:
     static pthread_rwlock_t lock_;
@@ -273,6 +283,51 @@ static void StartObservedPeakSampler() {
     }
 }
 
+// fork() clones only the calling thread. Any hook lock another thread held at
+// fork time is inherited *locked* by the child, where its owner does not exist
+// to release it, so the child's first tracked allocation would block forever.
+//
+// The barrier deliberately takes only the two tracker mutexes, in the same
+// pointer -> frame order the tracker itself uses. It must not take the rwlock's
+// write side: PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP is only applied on
+// Android, so on a reader-preferring glibc a writer starves indefinitely
+// against threads that allocate in a loop -- the fork itself would hang. The
+// rwlock is instead discarded and rebuilt in the child, which removes the
+// phantom read counts of the threads fork() did not clone.
+static void HookAtForkPrepare() {
+    if (g_debug != nullptr && g_debug->pointer != nullptr) {
+        g_debug->pointer->LockForFork();
+    }
+}
+
+static void HookAtForkParent() {
+    if (g_debug != nullptr && g_debug->pointer != nullptr) {
+        g_debug->pointer->UnlockAfterFork();
+    }
+}
+
+static void HookAtForkChild() {
+    if (g_debug != nullptr && g_debug->pointer != nullptr) {
+        g_debug->pointer->UnlockAfterFork();
+    }
+    ScopedConcurrentLock::ReinitAfterForkInChild();
+    // Both helper threads are gone. Clearing their bookkeeping keeps the child
+    // from joining thread ids that were never valid in this process; the child
+    // keeps accounting allocations, it just has no signal dump or sampler until
+    // something restarts them.
+    g_signal_thread_started = false;
+    ObservedPeakSamplerInstance().ResetAfterForkInChild();
+}
+
+static void RegisterForkHandlers() {
+    static bool registered = false;
+    if (registered) {
+        return;
+    }
+    registered = true;
+    pthread_atfork(HookAtForkPrepare, HookAtForkParent, HookAtForkChild);
+}
+
 bool debug_initialize(void* init_space[]) {
     if (!DebugDisableInitialize()) {
         return false;
@@ -286,6 +341,10 @@ bool debug_initialize(void* init_space[]) {
     g_debug = debug;
 
     ScopedConcurrentLock::Init();
+
+    // Registered after the lock exists and before any helper thread starts, so
+    // there is no window in which a fork could find a half-built barrier.
+    RegisterForkHandlers();
 
     if (g_debug->config().options() & DUMP_ON_SINGAL) {
         if (!StartSignalDumpThread()) {
@@ -321,10 +380,6 @@ void debug_finalize() {
     // operation in the process. Stop() joins, so no snapshot can be in flight
     // once it returns.
     ObservedPeakSamplerInstance().Stop();
-
-    // Prevent the async resolver from starting another dynamic-loader/module
-    // snapshot refresh while allocator and C++ runtime teardown is underway.
-    g_debug->pointer->BeginFinalization();
 
     // Make sure that there are no other threads doing debug allocations
     // before we kill everything.
@@ -827,6 +882,12 @@ static bool handle_dma_node(unsigned long request, void* arg, int* fd, size_t* s
             return set_pending_gpu_allocation();
         // parse the backtrace immediately
         case DMA_HEAP_IOCTL_ALLOC: {
+                // A driver that accepts this command with a null argument would
+                // otherwise fault inside the hook. HandleIonIoctl guards the
+                // same way; the GPU cases above never dereference `arg`.
+                if (arg == nullptr) {
+                    return false;
+                }
                 struct dma_heap_allocation_data* heap = (struct dma_heap_allocation_data*)arg;
                 *fd = heap->fd;
                 IonPathLog("DMA_HEAP", request, static_cast<size_t>(heap->len));
@@ -838,6 +899,9 @@ static bool handle_dma_node(unsigned long request, void* arg, int* fd, size_t* s
                 return *fd >= 0 && *size > 0;
             }
         case CAM_MEM_ION_MAP_PA: {
+                if (arg == nullptr) {
+                    return false;
+                }
                 struct CAM_MEM_DEV_ION_NODE_STRUCT* heap = (struct CAM_MEM_DEV_ION_NODE_STRUCT*)arg;
                 *fd = heap->memID;
             }
@@ -913,6 +977,15 @@ static int CallMunmap(void* addr, size_t size) {
     }
     return static_cast<int>(syscall(SYS_munmap, addr, size));
 }
+
+// Older glibc/NDK/OHOS sysroots predate this flag but the running kernel may
+// still honour it, so match on the kernel's ABI value rather than on whether
+// the build headers happen to declare it.
+#if defined(MREMAP_DONTUNMAP)
+#define ALLOC_HOOK_MREMAP_DONTUNMAP MREMAP_DONTUNMAP
+#else
+#define ALLOC_HOOK_MREMAP_DONTUNMAP 4
+#endif
 
 static void* CallMremap(
         void* old_addr, size_t old_size, size_t new_size, int flags, void* new_addr) {
@@ -1137,7 +1210,16 @@ void* debug_mremap(
     ScopedDisableDebugCalls disable;
     void* result = CallMremap(old_addr, old_size, new_size, flags, new_addr);
     if (hook_source::MappingSucceeded(result) && g_debug->TrackPointers()) {
-        g_debug->pointer->Remap(old_addr, result, new_size);
+        if ((flags & ALLOC_HOOK_MREMAP_DONTUNMAP) != 0) {
+            // MREMAP_DONTUNMAP leaves the source range mapped and live, so the
+            // process now holds two mappings rather than one that moved.
+            // Re-keying the record would drop the still-valid old range from
+            // current_used and leave a later munmap(old_addr) with no entry to
+            // remove, so record the destination as its own mapping instead.
+            g_debug->pointer->Add(result, new_size, new_size, MMAP);
+        } else {
+            g_debug->pointer->Remap(old_addr, result, new_size);
+        }
     }
     return result;
 }

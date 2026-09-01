@@ -31,14 +31,6 @@ constexpr size_t kBacktraceEmptyIndex = 1;
 constexpr size_t kHookCaptureSkipFrames = 3;
 const char* mtype[3] = {"host", "mmap", "dma"};
 
-namespace {
-void AsyncStackComplete(void* opaque, const StackResult& result) {
-    if (opaque != nullptr) {
-        static_cast<PointerData*>(opaque)->CompleteAsyncStack(result);
-    }
-}
-}  // namespace
-
 static inline bool ShouldBacktraceAllocSize(size_t size_bytes) {
     static bool only_backtrace_specific_sizes =
             g_debug->config().options() & BACKTRACE_SPECIFIC_SIZES;
@@ -363,10 +355,25 @@ void CollectMappingRss(
     }
 }
 
+// Released through the system allocator: the state is owned by the thread, not
+// by the tracker, so it must not outlive the thread. Without this the sampler
+// leaks one SamplerTlsState per thread exit for the life of the process.
+void DestroySamplerState(void* raw_state) {
+    if (raw_state == nullptr) {
+        return;
+    }
+    static_cast<SamplerTlsState*>(raw_state)->~SamplerTlsState();
+    // A thread can exit before the real free has been resolved (alloc_hook.cpp
+    // guards the same way). Leaking this one state beats calling through null.
+    if (m_sys_free != nullptr) {
+        m_sys_free(raw_state);
+    }
+}
+
 pthread_key_t& SamplerKey() {
     static pthread_key_t key;
     static pthread_once_t once = PTHREAD_ONCE_INIT;
-    pthread_once(&once, [] { pthread_key_create(&key, nullptr); });
+    pthread_once(&once, [] { pthread_key_create(&key, DestroySamplerState); });
     return key;
 }
 
@@ -381,27 +388,24 @@ SamplerTlsState* GetSamplerState() {
         return nullptr;
     }
     state = new (storage) SamplerTlsState();
-    pthread_setspecific(SamplerKey(), state);
+    // A failed setspecific would otherwise allocate and leak a fresh state on
+    // every subsequent allocation, so drop it and fall back to not sampling.
+    if (pthread_setspecific(SamplerKey(), state) != 0) {
+        DestroySamplerState(state);
+        return nullptr;
+    }
     return state;
 }
 
 }  // namespace
 
-PointerData::~PointerData() {
-    if (async_pipeline_ != nullptr) {
-        async_pipeline_->Shutdown();
-    }
-}
+PointerData::~PointerData() = default;
 
 bool PointerData::Initialize(const Config& config) {
-    if (async_pipeline_ != nullptr) {
-        async_pipeline_->Shutdown();
-    }
     pointers_.clear();
     key_to_index_.clear();
     frames_.clear();
     backtraces_info_.clear();
-    async_stack_to_index_.clear();
     peak_list.clear();
     // A hash index of kBacktraceEmptyIndex indicates that we tried to get
     // a backtrace, but there was nothing recorded.
@@ -418,13 +422,6 @@ bool PointerData::Initialize(const Config& config) {
     peak_observed_dma_ = 0;
     peak_observed_gpu_ = 0;
     observed_peak_active_.store(false, std::memory_order_relaxed);
-    // No in-process symbol/module resolver is started on any platform. Module
-    // identity and relative PCs are recovered at report time from
-    // /proc/self/maps, which is uniform across targets, costs one pass per
-    // dump instead of a worker thread plus a submission per unique stack, and
-    // cannot leave the report full of unresolved frames when the resolver
-    // fails.
-    async_pipeline_.reset();
 
     return true;
 }
@@ -445,7 +442,25 @@ bool PointerData::ShouldTrackAllocation(
         state->configured_interval = interval;
     }
     *tracked_size = state->sampler.SampleSize(pointer_size);
+    // SampleSize() scales the request up to interval * samples, which is
+    // unrelated to the MaxSize() bound debug_malloc checks against the
+    // *requested* size. Left unclamped, a scaled size above the bound has its
+    // bit 31 masked off by RealSize() while current_used was incremented by the
+    // full value, so per-entry sizes and the totals stop agreeing.
+    if (*tracked_size > PointerInfoType::MaxSize()) {
+        *tracked_size = PointerInfoType::MaxSize();
+    }
     return *tracked_size != 0;
+}
+
+void PointerData::LockForFork() {
+    pointer_mutex_.lock();
+    frame_mutex_.lock();
+}
+
+void PointerData::UnlockAfterFork() {
+    frame_mutex_.unlock();
+    pointer_mutex_.unlock();
 }
 
 bool PointerData::MightContain(const void* ptr) const {
@@ -505,7 +520,14 @@ void PointerData::MaybeRecordPeakSnapshotLocked() {
     // Once the evaluator-visible footprint has produced a snapshot, it owns the
     // criterion. Overwriting it here would move the snapshot back to an instant
     // that only the hook's own counters call a peak.
-    if (observed_peak_active_.load(std::memory_order_relaxed)) {
+    //
+    // Unless the sampler has since stopped delivering samples: the latch is
+    // one-way, so a wedged sampler would otherwise leave the report pinned to
+    // whatever early snapshot it managed to take, with this criterion disabled
+    // for the rest of the run. Stalled() is false for a deliberate Stop(), so
+    // finalization still preserves the observed snapshot.
+    if (observed_peak_active_.load(std::memory_order_relaxed) &&
+        !ObservedPeakSamplerInstance().Stalled()) {
         return;
     }
     TakePeakSnapshotLocked(PeakSnapshotSource::Tracked, nullptr, nullptr);
@@ -605,27 +627,54 @@ void PointerData::Add(
     if (hash_index == kBacktraceExitIndex)
         return;
 
-    std::lock_guard<std::mutex> pointer_guard(pointer_mutex_);
-    struct timeval tv;
-    gettimeofday(&tv, NULL);
-    uintptr_t mangled_ptr = ManglePointer(reinterpret_cast<uintptr_t>(ptr));
-    pointers_[mangled_ptr] = PointerInfoType{tracked_size, hash_index, type, tv};
-    MarkPointerFilter(ptr);
-    current_used += tracked_size;
-    size_t* current = (type == DMA) ? &current_dma : &current_host;
-    size_t* peak = (type == DMA) ? &peak_dma : &peak_host;
-    *current += tracked_size;
-    if (*current > *peak) {
-        *peak = *current;
+    // A displaced entry's stack reference is released after the pointer lock is
+    // dropped, matching Remove()/Remap()'s ordering.
+    size_t displaced_hash_index = 0;
+    {
+        std::lock_guard<std::mutex> pointer_guard(pointer_mutex_);
+        struct timeval tv;
+        gettimeofday(&tv, NULL);
+        uintptr_t mangled_ptr = ManglePointer(reinterpret_cast<uintptr_t>(ptr));
+
+        // This address may still carry a record: a DMA descriptor number gets
+        // recycled by the kernel, and a free/munmap this build does not
+        // interpose (a direct syscall, or one made before the hook installed)
+        // leaves a stale entry behind. A bare pointers_[key] assignment would
+        // then add the new size without ever subtracting the old one, drifting
+        // current_used upward for the rest of the run and leaking the old
+        // stack's frames_ entry. Reverse the displaced record instead.
+        auto displaced = pointers_.find(mangled_ptr);
+        if (displaced != pointers_.end()) {
+            const size_t displaced_size = displaced->second.size;
+            current_used -= displaced_size;
+            size_t* displaced_current =
+                    (displaced->second.mem_type == DMA) ? &current_dma : &current_host;
+            *displaced_current -= displaced_size;
+            displaced_hash_index = displaced->second.hash_index;
+            pointers_.erase(displaced);
+        }
+
+        pointers_[mangled_ptr] = PointerInfoType{tracked_size, hash_index, type, tv};
+        MarkPointerFilter(ptr);
+        current_used += tracked_size;
+        size_t* current = (type == DMA) ? &current_dma : &current_host;
+        size_t* peak = (type == DMA) ? &peak_dma : &peak_host;
+        *current += tracked_size;
+        if (*current > *peak) {
+            *peak = *current;
+        }
+        if (peak_tot < current_used) {
+            peak_tot = current_used;
+            // Deliberately not gated on this allocation having captured a stack.
+            // Requiring that made the snapshot depend on which allocation happened
+            // to cross the threshold, so with capture sampling enabled it almost
+            // never refreshed and the report's headline total stayed at an early,
+            // much lower moment.
+            MaybeRecordPeakSnapshotLocked();
+        }
     }
-    if (peak_tot < current_used) {
-        peak_tot = current_used;
-        // Deliberately not gated on this allocation having captured a stack.
-        // Requiring that made the snapshot depend on which allocation happened
-        // to cross the threshold, so with capture sampling enabled it almost
-        // never refreshed and the report's headline total stayed at an early,
-        // much lower moment.
-        MaybeRecordPeakSnapshotLocked();
+    if (displaced_hash_index > kBacktraceEmptyIndex) {
+        RemoveBacktrace(displaced_hash_index);
     }
 }
 
@@ -720,11 +769,6 @@ size_t PointerData::AddBacktrace(size_t num_frames, size_t size_bytes) {
          raw.capture_state != StackCaptureState::Partial)) {
         return kBacktraceEmptyIndex;
     }
-#if !defined(MALLOC_HOOK_TARGET_OS_LINUX)
-    if (raw.module_generation == 0 && async_pipeline_ != nullptr) {
-        raw.module_generation = async_pipeline_->CurrentModuleGeneration();
-    }
-#endif
     // Look the stack up through a key that borrows the just-captured PCs. The
     // common case is a repeat stack, which must not allocate anything at all.
     FrameKeyType probe;
@@ -749,51 +793,12 @@ size_t PointerData::AddBacktrace(size_t num_frames, size_t size_bytes) {
                               .frames = frames,
                               .module_generation = raw.module_generation,
                               .capture_state = raw.capture_state,
-                              .terminal_error = raw.terminal_error,
-                              .resolution_state = StackResolutionState::Pending});
+                              .terminal_error = raw.terminal_error});
         // The stored key must borrow the PCs owned by the frames_ entry, which
         // lives exactly as long as the key does.
         FrameKeyType stored = probe;
         stored.pcs = frames->data();
         key_to_index_.emplace(stored, hash_index);
-
-#if !defined(MALLOC_HOOK_TARGET_OS_LINUX)
-        if (async_pipeline_ != nullptr) {
-            const auto submit = async_pipeline_->Submit(raw);
-            FrameInfoType& frame_info = frames_.at(hash_index);
-            if (submit.id != 0) {
-                frame_info.async_stack_id = submit.id;
-                async_stack_to_index_[submit.id] = hash_index;
-            }
-            if (submit.dropped || submit.rejected_recursion) {
-                frame_info.resolution_state = submit.rejected_recursion
-                                                      ? StackResolutionState::Failed
-                                                      : StackResolutionState::Dropped;
-            } else if (submit.duplicate) {
-                // The pipeline still holds this raw stack from an earlier
-                // capture whose frame entry has since been released, so no
-                // further completion callback will fire for it. Adopt the
-                // cached result now instead of reporting Pending with no stack
-                // forever. A still-pending duplicate needs nothing here: the
-                // callback routes through async_stack_to_index_, which was
-                // just repointed at this hash_index.
-                StackResult cached;
-                if (async_pipeline_->GetResult(submit.id, &cached) &&
-                    cached.state != StackResolutionState::Pending) {
-                    frame_info.resolution_state = cached.state;
-                    if (!cached.frames.empty()) {
-                        backtraces_info_[hash_index] =
-                                std::make_shared<std::vector<SymbolizedFrame>>(
-                                        std::move(cached.frames));
-                    }
-                }
-            } else if (!submit.accepted) {
-                // A pipeline that could not start, or that has already entered
-                // shutdown, must not leave the report permanently Pending.
-                frame_info.resolution_state = StackResolutionState::Failed;
-            }
-        }
-#endif
     } else {
         hash_index = entry->second;
         FrameInfoType* frame_info = &frames_[hash_index];
@@ -860,14 +865,6 @@ void PointerData::RemoveBacktrace(size_t hash_index) {
         key.pcs = frame_info->frames->data();
         key_to_index_.erase(key);
         frames_.erase(hash_index);
-        for (auto entry = async_stack_to_index_.begin();
-             entry != async_stack_to_index_.end();) {
-            if (entry->second == hash_index) {
-                entry = async_stack_to_index_.erase(entry);
-            } else {
-                ++entry;
-            }
-        }
         if (g_debug->config().options() & BACKTRACE) {
             backtraces_info_.erase(hash_index);
         }
@@ -909,8 +906,6 @@ void PointerData::GetList(
                 frame_info == nullptr ? StackCaptureState::Empty : frame_info->capture_state,
                 static_cast<uint8_t>(
                         frame_info == nullptr ? 0 : frame_info->terminal_error),
-                frame_info == nullptr ? StackResolutionState::Dropped
-                                       : frame_info->resolution_state,
                 entry.second.alloc_time});
     }
 
@@ -961,8 +956,6 @@ void PointerData::GetUniqueList(
 }
 
 void PointerData::DumpLiveToFile(int fd, bool dump_peak) {
-    FlushAsync();
-    const AsyncStackStats async_stats = AsyncStats();
     std::lock_guard<std::mutex> pointer_guard(pointer_mutex_);
     std::lock_guard<std::mutex> frame_guard(frame_mutex_);
 
@@ -1090,7 +1083,8 @@ void PointerData::DumpLiveToFile(int fd, bool dump_peak) {
                     "fd_mean_us=%llu maps_mean_us=%llu maps_passes=%zu "
                     "maps_only_max=%fMB gpu_mean_us=%llu gpu_passes=%zu "
                     "gpu_max=%fMB snapshot_mean_us=%llu "
-                    "snapshot_max_us=%llu dedup_overflow=%s\n",
+                    "snapshot_max_us=%llu dedup_overflow=%s dedup_limit=%zu "
+                    "skipped_slots=%llu throttled_samples=%llu\n",
                     sampler.interval_ms,
                     sampler.samples > 1
                             ? sampler.span_us / 1000.0 / (sampler.samples - 1)
@@ -1118,7 +1112,10 @@ void PointerData::DumpLiveToFile(int fd, bool dump_peak) {
                                     ? sampler.total_snapshot_us / sampler.snapshots
                                     : 0),
                     static_cast<unsigned long long>(sampler.max_snapshot_us),
-                    sampler.dedup_overflowed ? "yes" : "no");
+                    sampler.dedup_overflowed ? "yes" : "no",
+                    DmaInodeSet::kMaxDedupedBuffers,
+                    static_cast<unsigned long long>(sampler.skipped_slots),
+                    static_cast<unsigned long long>(sampler.throttled_samples));
         }
     }
     // Accounting reference: tracked host bytes can only ever explain the
@@ -1210,8 +1207,6 @@ void PointerData::DumpLiveToFile(int fd, bool dump_peak) {
                 peak_list_mb, filter_mb,
                 pointers_mb + stacks_mb + peak_list_mb + filter_mb);
     }
-    const std::string async_stats_line = FormatAsyncStackStats(async_stats);
-    dprintf(fd, "async_stack_stats: %s\n", async_stats_line.c_str());
     dprintf(fd,
             "++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++"
             "+++++++++++++++\n\n");
@@ -1264,11 +1259,9 @@ void PointerData::DumpLiveToFile(int fd, bool dump_peak) {
             continue;
         }
         if (info.backtrace_info == nullptr) {
-            dprintf(fd, "<no stack: capture_state=%u capture_error=%u "
-                        "resolution_state=%u>\n\n",
+            dprintf(fd, "<no stack: capture_state=%u capture_error=%u>\n\n",
                     static_cast<unsigned>(info.capture_state),
-                    static_cast<unsigned>(info.terminal_error),
-                    static_cast<unsigned>(info.resolution_state));
+                    static_cast<unsigned>(info.terminal_error));
             continue;
         }
         for (size_t i = 0; i < info.backtrace_info->size(); ++i) {
@@ -1306,45 +1299,7 @@ void PointerData::DumpLiveToFile(int fd, bool dump_peak) {
     }
 }
 
-void PointerData::FlushAsync() {
-    if (async_pipeline_ != nullptr) {
-        async_pipeline_->Flush();
-    }
-}
-
-void PointerData::BeginFinalization() {
-    if (async_pipeline_ != nullptr) {
-        async_pipeline_->BeginFinalization();
-    }
-}
-
-void PointerData::CompleteAsyncStack(const StackResult& result) {
-    std::lock_guard<std::mutex> frame_guard(frame_mutex_);
-    auto stack_entry = async_stack_to_index_.find(result.id);
-    if (stack_entry == async_stack_to_index_.end()) {
-        return;
-    }
-    auto frame_entry = frames_.find(stack_entry->second);
-    if (frame_entry == frames_.end()) {
-        return;
-    }
-    FrameInfoType& frame_info = frame_entry->second;
-    frame_info.resolution_state = result.state;
-    if (!result.frames.empty()) {
-        backtraces_info_[stack_entry->second] =
-                std::make_shared<std::vector<SymbolizedFrame>>(result.frames);
-    }
-}
-
-AsyncStackStats PointerData::AsyncStats() const {
-    if (async_pipeline_ == nullptr) {
-        return {};
-    }
-    return async_pipeline_->stats();
-}
-
 void PointerData::DumpPeakInfo() {
-    FlushAsync();
     std::lock_guard<std::mutex> pointer_guard(pointer_mutex_);
     printf("\n+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++"
            "++++++++++++++++\n");
@@ -1363,6 +1318,4 @@ void PointerData::DumpPeakInfo() {
                sampler.peak_total_dma_bytes / 1024.0 / 1024.0,
                sampler.peak_total_bytes / 1024.0 / 1024.0);
     }
-    printf("async_stack_stats: %s\n",
-           FormatAsyncStackStats(AsyncStats()).c_str());
 }

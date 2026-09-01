@@ -159,6 +159,19 @@ if(NOT ANDROID AND NOT OHOS)
             helper Threads::Threads)
         add_test(NAME mremap_lifecycle COMMAND mremap_lifecycle_test)
         set_tests_properties(mremap_lifecycle PROPERTIES TIMEOUT 10)
+
+        add_executable(fork_lock_safety_test
+            fork_lock_safety_test.cpp)
+        target_compile_features(fork_lock_safety_test PRIVATE cxx_std_17)
+        target_include_directories(fork_lock_safety_test PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/../backtrace/include)
+        target_link_libraries(fork_lock_safety_test PRIVATE
+            helper Threads::Threads)
+        add_test(NAME fork_lock_safety COMMAND fork_lock_safety_test)
+        # Above the in-test per-child deadline (which the test stops at on the
+        # first hang) so a deadlock surfaces as the test's own assertion rather
+        # than as an opaque ctest timeout.
+        set_tests_properties(fork_lock_safety PROPERTIES TIMEOUT 60)
     endif()
 endif()
 

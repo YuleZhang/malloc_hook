@@ -12,10 +12,20 @@ namespace {
 
 alignas(4096) unsigned char g_old_mapping[4096];
 alignas(4096) unsigned char g_new_mapping[8192];
+alignas(4096) unsigned char g_dontunmap_dest[4096];
 int g_mremap_calls = 0;
 void* g_mremap_result = g_new_mapping;
 int g_munmap_result = 0;
 bool g_realloc_should_fail = false;
+bool g_dontunmap_phase = false;
+
+// The build headers on some sysroots predate the flag; the kernel ABI value is
+// what matters here.
+#if defined(MREMAP_DONTUNMAP)
+constexpr int kMremapDontunmap = MREMAP_DONTUNMAP;
+#else
+constexpr int kMremapDontunmap = 4;
+#endif
 
 void* FakeMmap(void*, size_t, int, int, int, off_t) {
     return g_old_mapping;
@@ -34,6 +44,14 @@ void* FakeRealloc(void* pointer, size_t size) {
 }
 
 void* FakeMremap(void* old_addr, size_t old_size, size_t new_size, int flags, ...) {
+    if (g_dontunmap_phase) {
+        // MREMAP_DONTUNMAP requires MAYMOVE and an unchanged length.
+        assert((flags & kMremapDontunmap) != 0);
+        assert((flags & MREMAP_MAYMOVE) != 0);
+        assert(old_size == new_size);
+        ++g_mremap_calls;
+        return g_dontunmap_dest;
+    }
     assert((old_addr == g_old_mapping && g_mremap_calls == 0) ||
            (old_addr == g_new_mapping && g_mremap_calls >= 1));
     assert(old_size == (g_mremap_calls == 0 ? sizeof(g_old_mapping)
@@ -57,6 +75,15 @@ std::string DumpLive() {
     }
     fclose(file);
     return output;
+}
+
+size_t CountOccurrences(const std::string& haystack, const std::string& needle) {
+    size_t count = 0;
+    for (size_t at = haystack.find(needle); at != std::string::npos;
+         at = haystack.find(needle, at + needle.size())) {
+        ++count;
+    }
+    return count;
 }
 
 }  // namespace
@@ -164,6 +191,36 @@ int main() {
     debug_free(grown);
     output = DumpLive();
     assert(output.find("alloc_size:16.000000KB") == std::string::npos);
+
+    // MREMAP_DONTUNMAP moves the mapping but leaves the source range mapped and
+    // live, so the process holds two mappings afterwards and both must stay
+    // accounted. Treating it as a plain move would re-key the record onto the
+    // destination and silently drop the still-valid source: its bytes would
+    // vanish from the totals and a later munmap would find nothing to remove.
+    assert(CountOccurrences(DumpLive(), "alloc_size:4.000000KB") == 0);
+    g_munmap_result = 0;
+    void* dontunmap_src = debug_mmap(
+            nullptr, sizeof(g_old_mapping), PROT_READ | PROT_WRITE,
+            MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    assert(dontunmap_src == g_old_mapping);
+    assert(CountOccurrences(DumpLive(), "alloc_size:4.000000KB") == 1);
+
+    g_dontunmap_phase = true;
+    void* dontunmap_dest = debug_mremap(
+            g_old_mapping, sizeof(g_old_mapping), sizeof(g_old_mapping),
+            MREMAP_MAYMOVE | kMremapDontunmap, nullptr);
+    g_dontunmap_phase = false;
+    assert(dontunmap_dest == g_dontunmap_dest);
+    (void)dontunmap_dest;
+    // Two live 4KB mappings, not one re-keyed record.
+    assert(CountOccurrences(DumpLive(), "alloc_size:4.000000KB") == 2);
+
+    // Both ranges are independently unmappable, which is only true if both were
+    // tracked separately.
+    assert(debug_munmap(g_old_mapping, sizeof(g_old_mapping)) == 0);
+    assert(CountOccurrences(DumpLive(), "alloc_size:4.000000KB") == 1);
+    assert(debug_munmap(g_dontunmap_dest, sizeof(g_dontunmap_dest)) == 0);
+    assert(CountOccurrences(DumpLive(), "alloc_size:4.000000KB") == 0);
 
     debug_finalize();
     return 0;
