@@ -64,10 +64,18 @@ limitations:
 
 [`docs/USAGE.md`](docs/USAGE.md)
 
+How GPU device memory is accounted differs by OS, vendor, driver allocation path
+and kernel version, and the three signals the sampler sums do not partition it
+cleanly. Which paths land in which signal, with the vendor API pitfalls found
+while establishing it:
+
+[`docs/GPU_MEMORY_ACCOUNTING.md`](docs/GPU_MEMORY_ACCOUNTING.md)
+
 The Chinese entry points remain entirely in Chinese:
 [`README.zh-CN.md`](README.zh-CN.md),
-[`docs/ARCHITECTURE.zh-CN.md`](docs/ARCHITECTURE.zh-CN.md), and
-[`docs/USAGE.zh-CN.md`](docs/USAGE.zh-CN.md).
+[`docs/ARCHITECTURE.zh-CN.md`](docs/ARCHITECTURE.zh-CN.md),
+[`docs/USAGE.zh-CN.md`](docs/USAGE.zh-CN.md), and
+[`docs/GPU_MEMORY_ACCOUNTING.zh-CN.md`](docs/GPU_MEMORY_ACCOUNTING.zh-CN.md).
 
 ## Configuration
 
