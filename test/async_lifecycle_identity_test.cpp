@@ -174,7 +174,13 @@ bool SymbolizedFramesCarryDurableModuleIdentity() {
     CHECK_TRUE(symbolizer.Symbolize(raw, {module}, &frames));
     CHECK_TRUE(frames.size() == 1);
     CHECK_TRUE(frames[0].pc == raw.pcs[0]);
-    CHECK_TRUE(frames[0].rel_pc == 0x34);
+    // rel_pc is the module-relative address of the *call site*, not of the
+    // captured return address: symbolizing the return address resolves the
+    // instruction after the call, which is a different source line and
+    // sometimes a different function.
+    CHECK_TRUE(frames[0].rel_pc ==
+               CallSitePcFromReturnAddress(raw.pcs[0]) - module.load_bias);
+    CHECK_TRUE(frames[0].rel_pc < 0x34);
     CHECK_TRUE(HasDurableIdentity(frames[0], build_id, kGeneration));
     return true;
 }

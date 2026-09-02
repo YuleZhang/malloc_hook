@@ -40,6 +40,12 @@ backends:
 - **Async resolution:** `AsyncStackPipeline` deduplicates raw stacks, snapshots
   loaded ELF modules, resolves dynamic names on a worker, and retains raw and
   module-relative PCs when symbols are unavailable.
+- **Report addresses:** captured PCs are return addresses, so every
+  module-relative PC in a report is stepped back into the call instruction
+  before module lookup. The addresses on `#<n> <addr> <module>` lines are ELF
+  virtual addresses of call sites and can be fed straight to
+  `llvm-symbolizer --obj=<unstripped-elf>`; each report states the convention on
+  its `frame_pc:` line.
 - **Accounting:** `PointerData` owns live-allocation identity, sampled host
   accounting, resource accounting, and peak counters.
 - **Platform boundaries:** CMake separates OS, libc, architecture, compiler

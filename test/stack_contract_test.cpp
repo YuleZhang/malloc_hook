@@ -43,3 +43,26 @@ TEST(StackContract, CarriesNeutralSymbolizedFields) {
     EXPECT_EQ(frame.function_name, "sample");
     EXPECT_EQ(frame.module_name, "libsample.so");
 }
+
+TEST(StackContract, StepsReturnAddressesBackIntoTheCallInstruction) {
+    // A symbolizer resolves the address it is handed as the instruction being
+    // executed, so a captured return address must be moved back into the call
+    // before any module lookup or offset computation.
+    EXPECT_EQ(0x1000u - kReturnAddressPcAdjust,
+              CallSitePcFromReturnAddress(0x1000));
+    EXPECT_LT(CallSitePcFromReturnAddress(0x1000), 0x1000u);
+
+    // On fixed-width aarch64 the step is exactly the bl/blr; elsewhere it only
+    // has to stay inside the call instruction.
+#if defined(__aarch64__)
+    EXPECT_EQ(4u, kReturnAddressPcAdjust);
+#else
+    EXPECT_EQ(1u, kReturnAddressPcAdjust);
+#endif
+
+    // A PC too small to hold a preceding call cannot underflow into the top of
+    // the address space; such a frame is unusable either way.
+    EXPECT_EQ(0u, CallSitePcFromReturnAddress(0));
+    EXPECT_EQ(kReturnAddressPcAdjust,
+              CallSitePcFromReturnAddress(kReturnAddressPcAdjust));
+}
