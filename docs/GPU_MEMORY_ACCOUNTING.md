@@ -116,13 +116,57 @@ device node would therefore report that memory twice: once here and once in
 
 ### OHOS
 
-H1 runs a HongMeng kernel, not Linux. It exposes neither GPU character device,
-carries both `/dev/ion` and `/dev/dma_heap`, and provides `/proc/self/status`
-with `VmRSS`, `maps`, `smaps` and `pagemap`. `libOpenCL.so` is present under
-`/vendor/lib64`. The allocation paths above have **not** been run there — it needs
-an OHOS-targeted build — so no row is claimed. What is established is that the
-device-node scan finds nothing there, which is the correct outcome for a platform
-with no such node, and that the `/proc` interfaces the sampler depends on exist.
+H1 runs a HongMeng kernel, not Linux, on a Hisilicon GPU. It exposes neither GPU
+character device, carries both `/dev/ion` and `/dev/dma_heap`, and provides
+`/proc/self/status` with `VmRSS`, `maps`, `smaps` and `pagemap`.
+
+It is a **fourth mechanism**, and the current implementation does not see it.
+A 256 MB `clCreateBuffer` plus map plus touch produces:
+
+```text
+   4096 MB  6f00000000-7000000000 ---p  [io]   <- sparse VA reservation, PROT_NONE
+    256 MB  70cff9a000-70dff9b000 rw-p  [io]   <- the allocation
+```
+
+There is no device node in the path, so the node-path scan matches nothing. The
+region is named `[io]`, which is what the kernel calls a PFN/IO mapping, and the
+accounting follows from that:
+
+| state | `[io]` rw mapped | its `Rss` | Σ all `Rss` | `VmRSS` | divergence |
+| --- | --- | --- | --- | --- | --- |
+| baseline | 400 | 0 | 38088 | 38080 | 8 |
+| after create | 262548 | 0 | 38156 | 38148 | 8 |
+| after map + touch | 262548 | **0** | 38344 | 38336 | **8** |
+
+So 256 MB is allocated and written, and **every residency interface reports
+nothing**: `VmRSS` does not count it, and neither does per-VMA `Rss`. Because both
+agree, there is no divergence to measure, and the arithmetic above evaluates to
+zero. The only signal that sees this memory at all is the region's mapped size.
+
+That is a different failure from A1. On A1 the two interfaces disagree and the
+disagreement *is* the answer. Here they agree, and both are blind.
+
+Worse, this state is indistinguishable from Mali by residency alone: on both, the
+device region reports `Rss` 0 and a full mapped size. The answers required are
+opposite — Mali's pages are in `VmRSS` and must contribute nothing, H1's are in
+nothing and must contribute their mapped size. What separates them is whether
+`VmRSS` grew when the mapping appeared, which on Mali happens in the same step as
+the mapping and on A2 happens a step later. No single one of the three signals
+resolves all four targets.
+
+Two consequences, both open:
+
+* The scan is scoped to device-node paths, so it does not match `[io]` at all and
+  reports zero on this platform. Widening it must exclude the `PROT_NONE`
+  reservation, which is 4 GB here and would dwarf any real figure; the `rw` versus
+  `---` permission split separates them cleanly.
+* The arithmetic needs a term the divergence cannot supply. Nothing is shipped for
+  this yet, because the rule that covers A1, A2, Mali and H1 together has not been
+  established, and a rule verified on three of four is how the previous two
+  attempts went wrong.
+
+The dma-heap allocation used elsewhere in this page also failed here: the heap
+names differ from both Android vendors, so that row is unmeasured on H1.
 
 ## What the sampler computes
 
