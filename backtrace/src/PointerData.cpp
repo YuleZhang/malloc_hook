@@ -1305,8 +1305,8 @@ void PointerData::DumpLiveToFile(int fd, bool dump_peak) {
                     "snapshots=%zu "
                     "read_mean_us=%llu read_max_us=%llu status_mean_us=%llu "
                     "fd_mean_us=%llu maps_mean_us=%llu maps_passes=%zu "
-                    "maps_only_max=%fMB gpu_mean_us_per_sample=%llu gpu_passes=%zu "
-                    "gpu_read_failures=%zu "
+                    "maps_only_max=%fMB gpu_mean_us_per_sample=%llu "
+                    "gpu_read_failures=%zu gpu_rss=%s "
                     "gpu_max=%fMB snapshot_mean_us=%llu "
                     "snapshot_max_us=%llu dedup_overflow=%s dedup_limit=%zu "
                     "skipped_slots=%llu throttled_samples=%llu\n",
@@ -1330,7 +1330,8 @@ void PointerData::DumpLiveToFile(int fd, bool dump_peak) {
                     sampler.max_map_only_bytes / 1024.0 / 1024.0,
                     static_cast<unsigned long long>(
                             sampler.total_gpu_us / sampler.samples),
-                    sampler.gpu_passes, sampler.gpu_read_failures,
+                    sampler.gpu_read_failures,
+                    GpuRssInclusionName(sampler.gpu_rss_inclusion),
                     sampler.max_gpu_bytes_seen / 1024.0 / 1024.0,
                     static_cast<unsigned long long>(
                             sampler.snapshots != 0

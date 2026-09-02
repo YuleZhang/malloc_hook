@@ -33,8 +33,25 @@ size_t MapsLineBytes(const char* text, bool* saw_any) {
     return DmaBytesFromMapsLine(line, &g_set, saw_any);
 }
 
+// A writable directory that exists on the target, not just on a build host.
+// Android has no /tmp, so hardcoding it made every test below unrunnable on a
+// device -- which is where the device-only formats these tests encode actually
+// come from. TMPDIR is set on Android; /data/local/tmp is the fallback for a
+// shell that does not set it.
+const char* TempDir() {
+    const char* env = getenv("TMPDIR");
+    if (env != nullptr && env[0] != '\0') {
+        return env;
+    }
+    if (access("/data/local/tmp", W_OK) == 0) {
+        return "/data/local/tmp";
+    }
+    return "/tmp";
+}
+
 std::string WriteTempFile(const char* name, const char* contents) {
-    std::string path = std::string("/tmp/") + name + "." + std::to_string(getpid());
+    std::string path = std::string(TempDir()) + "/" + name + "." +
+                       std::to_string(getpid());
     FILE* file = fopen(path.c_str(), "w");
     assert(file != nullptr);
     fputs(contents, file);
@@ -741,78 +758,70 @@ void TestGpuMmapAccounting() {
     assert(GpuMmapBytesFromSmapsLine(orphan_rss, &orphaned) == 0);
 }
 
-void TestGpuCalibrationPolicy() {
-    // The policy that decides how often the expensive read happens, tested
-    // directly. The surrounding pass cannot cover it: on any machine without the
-    // device node it returns before reaching this, which is every host CI runner,
-    // so the previous version of this test asserted nothing anywhere.
-    GpuMmapCache cache;
+void TestGpuRssInclusionInference() {
+    // Whether the platform counts these mappings in VmRSS is inferred from what
+    // VmRSS does when the mapped total grows. Both answers are real: they were
+    // measured on two Adreno targets with opposite results, so neither can be
+    // assumed. Tested directly, because the surrounding pass returns before any
+    // of this on a machine with no device node -- which is every host CI runner.
+    const size_t MB = 1024 * 1024;
 
-    // Nothing mapped: no residency to correct, so no smaps read is owed. This is
-    // what keeps a process that merely has the node from paying for the
-    // dimension at all.
-    assert(!GpuSampleNeedsCalibration(cache, 0));
-    assert(GpuBytesForMapped(cache, 0) == 0);
+    // No sample yet: nothing to conclude, and the figure must not be zero, since
+    // reporting a real footprint as nothing is the failure this dimension exists
+    // to prevent.
+    GpuMmapCache open_q;
+    assert(GpuRssInclusionOf(open_q) == GpuRssInclusion::Undetermined);
+    assert(GpuObserveSample(&open_q, 64 * MB, 100 * MB) == 64u * MB);
+    assert(GpuRssInclusionOf(open_q) == GpuRssInclusion::Undetermined);
 
-    // First sighting of a region must calibrate.
-    assert(GpuSampleNeedsCalibration(cache, 100 * 1024 * 1024));
+    // VmRSS does not follow the mapped total: the mapping is invisible to
+    // rss_bytes, so its whole size is the contribution. This is the OpenCL
+    // buffer case on one of the measured targets.
+    GpuMmapCache not_counted;
+    GpuObserveSample(&not_counted, 0, 100 * MB);
+    GpuObserveSample(&not_counted, 64 * MB, 100 * MB);
+    GpuObserveSample(&not_counted, 128 * MB, 100 * MB);
+    assert(GpuRssInclusionOf(not_counted) == GpuRssInclusion::NotCounted);
+    assert(GpuObserveSample(&not_counted, 128 * MB, 100 * MB) == 128u * MB);
 
-    // A fully PFN/IO region set: smaps reports the whole mapped total as
-    // unaccounted, so the correction is zero and the figure is the mapped size.
-    ApplyGpuCalibration(&cache, 100 * 1024 * 1024, 100 * 1024 * 1024);
-    assert(cache.calibrated);
-    assert(cache.calibrations == 1);
-    assert(cache.resident_correction == 0);
-    assert(GpuBytesForMapped(cache, 100 * 1024 * 1024) == 100u * 1024 * 1024);
+    // VmRSS follows the mapped total: rss_bytes already holds those pages, so
+    // adding them would count the same memory twice. This is the direct
+    // allocation-ioctl case on the other measured target.
+    GpuMmapCache counted;
+    GpuObserveSample(&counted, 0, 100 * MB);
+    GpuObserveSample(&counted, 64 * MB, 164 * MB);
+    GpuObserveSample(&counted, 128 * MB, 228 * MB);
+    assert(GpuRssInclusionOf(counted) == GpuRssInclusion::Counted);
+    assert(GpuObserveSample(&counted, 128 * MB, 228 * MB) == 0);
 
-    // A steady region set does not re-pay for smaps.
-    assert(!GpuSampleNeedsCalibration(cache, 100 * 1024 * 1024));
-    // ...nor does a small move, which is the same regions growing slightly.
-    assert(!GpuSampleNeedsCalibration(cache, 110 * 1024 * 1024));
-    // ...but the figure still tracks that move, every sample, without a smaps
-    // read. This is the property the old peak gate could not provide: a GPU
-    // allocation growing while host RSS falls is visible immediately.
-    assert(GpuBytesForMapped(cache, 110 * 1024 * 1024) == 110u * 1024 * 1024);
+    // One step is not enough. A mapping appearing in the same tick as unrelated
+    // host allocation looks like VmRSS following it, and must not settle the run.
+    GpuMmapCache one_step;
+    GpuObserveSample(&one_step, 0, 100 * MB);
+    GpuObserveSample(&one_step, 8 * MB, 200 * MB);
+    assert(GpuRssInclusionOf(one_step) == GpuRssInclusion::Undetermined);
+    assert(one_step.rss_follows == 1);
 
-    // A large move means a different region set, so the correction no longer
-    // describes it and must be re-measured.
-    assert(GpuSampleNeedsCalibration(cache, 200 * 1024 * 1024));
-    assert(GpuSampleNeedsCalibration(cache, 40 * 1024 * 1024));
+    // A shrinking or steady mapped total is not a growth step and teaches
+    // nothing either way, so a run whose GPU use only falls stays undetermined
+    // rather than concluding from noise.
+    GpuMmapCache falling;
+    GpuObserveSample(&falling, 128 * MB, 100 * MB);
+    GpuObserveSample(&falling, 64 * MB, 100 * MB);
+    GpuObserveSample(&falling, 64 * MB, 100 * MB);
+    GpuObserveSample(&falling, 0, 100 * MB);
+    assert(GpuRssInclusionOf(falling) == GpuRssInclusion::Undetermined);
+    assert(falling.rss_follows == 0 && falling.rss_ignores == 0);
 
-    // Staleness is bounded even when nothing moves at all.
-    GpuMmapCache steady;
-    ApplyGpuCalibration(&steady, 64 * 1024 * 1024, 64 * 1024 * 1024);
-    unsigned reads = 0;
-    for (int i = 0; i < 256; ++i) {
-        if (GpuSampleNeedsCalibration(steady, 64 * 1024 * 1024)) {
-            ApplyGpuCalibration(&steady, 64 * 1024 * 1024, 64 * 1024 * 1024);
-            ++reads;
-        } else {
-            ++steady.samples_since_calibration;
-        }
-    }
-    assert(reads >= 1);
-    // Far below one per sample, which is the entire point: the previous gate
-    // compared against the running peak and so ran on every sample of a growing
-    // run -- the whole ramp to the peak.
-    assert(reads <= 256 / 32);
-
-    // A partly resident region set: smaps reports less than the mapped total, so
-    // the difference is residency VmRSS already holds and must not be counted
-    // twice. 100 MB mapped of which 40 MB is unaccounted -> 60 MB correction.
-    GpuMmapCache cacheable;
-    ApplyGpuCalibration(&cacheable, 100 * 1024 * 1024, 40 * 1024 * 1024);
-    assert(cacheable.resident_correction == 60u * 1024 * 1024);
-    assert(GpuBytesForMapped(cacheable, 100 * 1024 * 1024) == 40u * 1024 * 1024);
-    // The correction can exceed a later mapped total; the figure floors at zero
-    // rather than wrapping.
-    assert(GpuBytesForMapped(cacheable, 10 * 1024 * 1024) == 0);
+    // The largest figure ever reported is retained even after the mapping is
+    // released, so the peak is not lost when the driver frees.
+    assert(falling.max_bytes == 128u * MB);
 }
 
 void TestGpuMappedFromMaps() {
     // maps carries the same header lines as smaps, so the same path rule applies
     // -- including the rejections, which is what keeps the cheap per-sample read
-    // from reintroducing the over-report the expensive one was fixed for.
+    // from admitting regions that are not the device.
     assert(GpuMappedBytesFromMapsLine(
                    "7a1c000000-7a1c800000 rw-s 00000000 00:0d 12345 "
                    "/dev/kgsl-3d0") == 8u * 1024 * 1024);
@@ -843,8 +852,7 @@ void TestGpuMappedFromMaps() {
 
 void TestGpuPassGate() {
     // On a host with no device node the pass must report itself structurally
-    // inapplicable and, critically, read neither /proc file: the per-region name
-    // filter can only reject regions the kernel has already been made to produce.
+    // inapplicable and read neither /proc file.
     ObservedMemSample sample;
     sample.rss_bytes = 1;
     GpuMmapCache cache;
@@ -853,27 +861,17 @@ void TestGpuPassGate() {
         assert(bytes == 0);
         assert(sample.gpu_bytes == 0);
         assert(cache.probed_absent);
-        assert(cache.calibrations == 0);
-        // Once probed absent the pass is disabled for the run, so a later sample
-        // costs nothing at all rather than one access() each.
+        assert(!cache.have_previous);
         ObservedMemSample again;
         again.rss_bytes = 1;
         assert(ReadSelfGpuMmapBytesGated(&again, &cache, 0) == 0);
-        assert(cache.calibrations == 0);
+        assert(!cache.have_previous);
         return;
     }
-
-    // On a machine that does have the node, a sample yields a figure and at most
-    // one calibration, and repeating it must not pay for smaps again.
-    assert(sample.gpu_source == GpuMmapSource::MapsAndSmaps);
-    const size_t after_first = cache.calibrations;
-    for (int i = 0; i < 8; ++i) {
-        ObservedMemSample s;
-        s.rss_bytes = 1;
-        ReadSelfGpuMmapBytesGated(&s, &cache, 0);
-        assert(s.gpu_bytes == cache.bytes);
-    }
-    assert(cache.calibrations == after_first);
+    // On a machine that does have the node, every sample reads maps and nothing
+    // else, and the figure is whatever the inference currently says.
+    assert(sample.gpu_source == GpuMmapSource::Maps);
+    assert(cache.have_previous);
 }
 
 }  // namespace
@@ -1013,7 +1011,7 @@ int main() {
     TestGpuMmapAccounting();
     TestGpuNodePathMatching();
     TestGpuReadFailurePath();
-    TestGpuCalibrationPolicy();
+    TestGpuRssInclusionInference();
     TestGpuMappedFromMaps();
     TestGpuPassGate();
     TestIonProcInfoAccounting();
