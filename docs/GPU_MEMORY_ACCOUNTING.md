@@ -128,9 +128,22 @@ A 256 MB `clCreateBuffer` plus map plus touch produces:
     256 MB  70cff9a000-70dff9b000 rw-p  [io]   <- the allocation
 ```
 
-There is no device node in the path, so the node-path scan matches nothing. The
-region is named `[io]`, which is what the kernel calls a PFN/IO mapping, and the
-accounting follows from that:
+There is no device node in the path, and searching for one found nothing to scan
+for. `/dev` on this target carries no GPU render node — no `mali`, no `kgsl`, no
+`dri/render*`; the closest entries are `graphics/{fb0,dpu_res}` and some
+`hisi_*` control nodes. With a live OpenCL context, a 256 MB buffer allocated and
+written, the process holds **no GPU device descriptor at all**: the only
+device-like fds open are `/dev/kmsg` and `/dev/null`. And the mapping itself
+records `dev 00:00 inode 0`, so it is not file-backed either:
+
+```text
+6f00000000-7000000000 ---p 00000000 00:00 0    [io]
+70cff9a000-70dff9b000 rw-p 00000000 00:00 0    [io]
+```
+
+So the allocation does not travel through a character device this process opens.
+The kernel names the result `[io]`, which is what it calls a PFN/IO mapping, and
+the accounting follows from that:
 
 | state | `[io]` rw mapped | its `Rss` | Σ all `Rss` | `VmRSS` | divergence |
 | --- | --- | --- | --- | --- | --- |
