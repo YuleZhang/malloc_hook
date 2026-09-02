@@ -191,9 +191,15 @@ void TestObservedSample() {
     assert(sample.rss_bytes > 0);
     assert(sample.total() >= sample.rss_bytes);
     // A host kernel exposes no dmabuf to this process, and that has to be
-    // reported as "no such accounting" rather than as a measured zero.
+    // reported as "no such accounting" rather than as a measured zero. All three
+    // real sources are accepted: a host runner reports None, Android reports
+    // FdAndMaps, and a HarmonyOS target reports IonProcInfo because it publishes
+    // the process-wide ION file. Omitting the third aborted this test on the only
+    // platform that takes that branch, which is also the only place it has ever
+    // run.
     assert(sample.dma_source == DmaSource::None ||
-           sample.dma_source == DmaSource::FdAndMaps);
+           sample.dma_source == DmaSource::FdAndMaps ||
+           sample.dma_source == DmaSource::IonProcInfo);
     if (sample.dma_source == DmaSource::None) {
         assert(sample.dma_bytes == 0);
     }
@@ -501,6 +507,15 @@ void TestMapPassGate() {
     ObservedMemSample forced;
     forced.rss_bytes = 1;
     ReadSelfDmaBytesGated(&g_set, &forced, nullptr, 0);
+
+    // Where the kernel publishes process-wide ION accounting, that one file is
+    // the whole answer and the descriptor and mapping passes never run -- so the
+    // gate below does not exist to be tested. A HarmonyOS target takes this
+    // branch, and it is the only platform that does, which is why asserting on
+    // the gate unconditionally aborted only there.
+    if (forced.dma_source == DmaSource::IonProcInfo) {
+        return;
+    }
 
     DmaMapCache cache;
     // First gated read must run the pass: nothing is carried yet, so skipping
