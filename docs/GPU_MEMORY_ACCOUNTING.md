@@ -87,11 +87,11 @@ structurally zero there. Of the two that do create one, A1 and A2 disagree with
 each other about `VmRSS`.
 
 That is also why an inference of the form "did `VmRSS` move when the mapped total
-grew" is not sufficient. On A2 the mapping appears in one sample and the faulting
-happens later, so at the growth step `VmRSS` has not moved yet and the sample
-looks like A1 — while the same pages are counted in `VmRSS` a moment later.
-Distinguishing the two requires per-region residency, which is what A1 breaks:
-there, per-region `Rss` reports the full size while `VmRSS` reports none of it.
+grew" is not sufficient, and it was tried and discarded. On A2 the mapping appears
+in one sample and the faulting happens later, so at the growth step `VmRSS` has
+not moved yet and the sample is indistinguishable from A1 — while the same pages
+are counted in `VmRSS` a moment later, which would double count them. The
+arithmetic that does separate them is below.
 
 ### dma-buf, and the vendor imports of it
 
@@ -124,7 +124,7 @@ an OHOS-targeted build — so no row is claimed. What is established is that the
 device-node scan finds nothing there, which is the correct outcome for a platform
 with no such node, and that the `/proc` interfaces the sampler depends on exist.
 
-### What the sampler computes
+## What the sampler computes
 
 `VmRSS` is supposed to equal the sum of per-VMA `Rss`. Where a device mapping's
 pages are counted by the page-table walk that produces per-VMA `Rss` but not by
@@ -232,3 +232,10 @@ counts. Both were tried as cheap substitutes for `smaps` and both were wrong.
 Measure the delta, never the absolute. A GPU driver maps its own working set at
 context creation, so any baseline taken before the context exists attributes the
 driver's memory to whatever is measured next.
+
+Sum the per-VMA `Rss` and compare it against `VmRSS`. Those two are supposed to be
+the same number, and where they are not, the difference is memory one kernel
+interface counts and the other does not. That comparison is what finally separated
+A1 from A2 after two cheaper discriminators had failed, and it is the first thing
+to look at for any new target: if the sums agree, the target has no blind spot of
+this kind, whatever its device mappings look like.
