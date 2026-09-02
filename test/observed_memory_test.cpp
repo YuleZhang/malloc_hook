@@ -22,6 +22,7 @@
 
 #include "Config.h"
 #include "ObservedMemory.h"
+#include "debug_disable.h"
 
 namespace {
 
@@ -1060,6 +1061,17 @@ void TestZeroIntervalDoesNotDivideByZero() {
 }
 
 int main() {
+    // The sampler thread calls DebugDisableSet so its own allocations stay out of
+    // the tracked totals, and that needs the pthread key the hook library creates
+    // at load. A standalone test is not loaded that way, so it has to create the
+    // key itself -- as task10_hook_boundary_test already does. Without it the key
+    // is an uninitialised pthread_key_t: bionic tolerates that, musl faults on it,
+    // so the sampler crashed only on the OHOS target.
+    if (!DebugDisableInitialize()) {
+        fprintf(stderr, "DebugDisableInitialize failed\n");
+        return 1;
+    }
+
     TestStatusFieldParsing();
     TestSelfRss();
     TestMapsDmaBufAccounting();
