@@ -758,64 +758,96 @@ void TestGpuMmapAccounting() {
     assert(GpuMmapBytesFromSmapsLine(orphan_rss, &orphaned) == 0);
 }
 
-void TestGpuRssInclusionInference() {
-    // Whether the platform counts these mappings in VmRSS is inferred from what
-    // VmRSS does when the mapped total grows. Both answers are real: they were
-    // measured on two Adreno targets with opposite results, so neither can be
-    // assumed. Tested directly, because the surrounding pass returns before any
-    // of this on a machine with no device node -- which is every host CI runner.
-    const size_t MB = 1024 * 1024;
+void TestGpuBytesFromReading() {
+    // The figures below are the measured readings from four targets, so the
+    // arithmetic is checked against what devices actually report rather than
+    // against invented numbers. kB as reported, converted here.
+    const size_t K = 1024;
 
-    // No sample yet: nothing to conclude, and the figure must not be zero, since
-    // reporting a real footprint as nothing is the failure this dimension exists
-    // to prevent.
-    GpuMmapCache open_q;
-    assert(GpuRssInclusionOf(open_q) == GpuRssInclusion::Undetermined);
-    assert(GpuObserveSample(&open_q, 64 * MB, 100 * MB) == 64u * MB);
-    assert(GpuRssInclusionOf(open_q) == GpuRssInclusion::Undetermined);
+    // Target A: the region's Rss is its full size and VmRSS never moves, so the
+    // per-VMA walk and VmRSS diverge by exactly the allocation. That divergence is
+    // the memory rss_bytes cannot see, and is what must be reported.
+    GpuSmapsReading a;
+    a.valid = true;
+    a.all_rss_bytes = 83332 * K;
+    a.device_rss_bytes = 65576 * K;
+    a.device_mapped_bytes = 74064 * K;
+    assert(GpuBytesFromReading(a, 17740 * K) == 65576u * K);
 
-    // VmRSS does not follow the mapped total: the mapping is invisible to
-    // rss_bytes, so its whole size is the contribution. This is the OpenCL
-    // buffer case on one of the measured targets.
-    GpuMmapCache not_counted;
-    GpuObserveSample(&not_counted, 0, 100 * MB);
-    GpuObserveSample(&not_counted, 64 * MB, 100 * MB);
-    GpuObserveSample(&not_counted, 128 * MB, 100 * MB);
-    assert(GpuRssInclusionOf(not_counted) == GpuRssInclusion::NotCounted);
-    assert(GpuObserveSample(&not_counted, 128 * MB, 100 * MB) == 128u * MB);
+    // Target B, before the region is faulted in: it has a mapping but no
+    // residency, and nothing diverges. Reporting its mapped size here would
+    // invent memory that is not backed yet.
+    GpuSmapsReading b1;
+    b1.valid = true;
+    b1.all_rss_bytes = 21520 * K;
+    b1.device_rss_bytes = 40 * K;
+    b1.device_mapped_bytes = 72000 * K;
+    // Bounded by the region's own Rss (40 kB), not by the 112 kB of unrelated
+    // divergence the process happens to carry.
+    assert(GpuBytesFromReading(b1, 21408 * K) == 40u * K);
 
-    // VmRSS follows the mapped total: rss_bytes already holds those pages, so
-    // adding them would count the same memory twice. This is the direct
-    // allocation-ioctl case on the other measured target.
-    GpuMmapCache counted;
-    GpuObserveSample(&counted, 0, 100 * MB);
-    GpuObserveSample(&counted, 64 * MB, 164 * MB);
-    GpuObserveSample(&counted, 128 * MB, 228 * MB);
-    assert(GpuRssInclusionOf(counted) == GpuRssInclusion::Counted);
-    assert(GpuObserveSample(&counted, 128 * MB, 228 * MB) == 0);
+    // Target B, after faulting: its Rss and VmRSS grew together, so the
+    // divergence stays near zero. This is the case an inference over consecutive
+    // samples got wrong -- the mapping appears in one sample and the faulting
+    // happens in a later one, so at the growth step this target is
+    // indistinguishable from target A.
+    GpuSmapsReading b2;
+    b2.valid = true;
+    b2.all_rss_bytes = 87060 * K;
+    b2.device_rss_bytes = 65576 * K;
+    b2.device_mapped_bytes = 72000 * K;
+    const size_t b2_bytes = GpuBytesFromReading(b2, 86868 * K);
+    assert(b2_bytes == 192u * K);
+    assert(b2_bytes < 1u * 1024 * 1024);
 
-    // One step is not enough. A mapping appearing in the same tick as unrelated
-    // host allocation looks like VmRSS following it, and must not settle the run.
-    GpuMmapCache one_step;
-    GpuObserveSample(&one_step, 0, 100 * MB);
-    GpuObserveSample(&one_step, 8 * MB, 200 * MB);
-    assert(GpuRssInclusionOf(one_step) == GpuRssInclusion::Undetermined);
-    assert(one_step.rss_follows == 1);
+    // Target C, the other vendor: the divergence runs the *other* way, VmRSS
+    // counting pages the per-VMA walk does not. That is not this dimension's
+    // memory, and the figure must floor at zero rather than underflow.
+    GpuSmapsReading c;
+    c.valid = true;
+    c.all_rss_bytes = 30340 * K;
+    c.device_rss_bytes = 0;
+    c.device_mapped_bytes = 67984 * K;
+    assert(GpuBytesFromReading(c, 100680 * K) == 0);
 
-    // A shrinking or steady mapped total is not a growth step and teaches
-    // nothing either way, so a run whose GPU use only falls stays undetermined
-    // rather than concluding from noise.
-    GpuMmapCache falling;
-    GpuObserveSample(&falling, 128 * MB, 100 * MB);
-    GpuObserveSample(&falling, 64 * MB, 100 * MB);
-    GpuObserveSample(&falling, 64 * MB, 100 * MB);
-    GpuObserveSample(&falling, 0, 100 * MB);
-    assert(GpuRssInclusionOf(falling) == GpuRssInclusion::Undetermined);
-    assert(falling.rss_follows == 0 && falling.rss_ignores == 0);
+    // Bounded by the device regions' own Rss: an unrelated source of divergence
+    // must not be attributed here.
+    GpuSmapsReading d;
+    d.valid = true;
+    d.all_rss_bytes = 500 * K;
+    d.device_rss_bytes = 8 * K;
+    assert(GpuBytesFromReading(d, 100 * K) == 8u * K);
 
-    // The largest figure ever reported is retained even after the mapping is
-    // released, so the peak is not lost when the driver frees.
-    assert(falling.max_bytes == 128u * MB);
+    // An invalid reading is not a measured zero.
+    GpuSmapsReading none;
+    assert(GpuBytesFromReading(none, 100 * K) == 0);
+}
+
+void TestGpuReadPolicy() {
+    // Nothing mapped and nothing read: the expensive read buys nothing, which is
+    // what keeps a process that merely has the device node from paying for a
+    // dimension it does not use.
+    GpuMmapCache fresh;
+    assert(!GpuSampleNeedsRead(fresh, 0));
+
+    // First device mapping seen: read.
+    assert(GpuSampleNeedsRead(fresh, 64 * 1024 * 1024));
+
+    // After a read, a steady mapped total does not re-pay. This is the common
+    // case: a driver maps its working set once and holds it.
+    GpuMmapCache warm;
+    warm.have_read = true;
+    warm.mapped_at_read = 64 * 1024 * 1024;
+    assert(!GpuSampleNeedsRead(warm, 64 * 1024 * 1024));
+    for (int i = 0; i < 100; ++i) {
+        assert(!GpuSampleNeedsRead(warm, 64 * 1024 * 1024));
+    }
+
+    // Any change in the mapped total is the event that can change the answer, in
+    // either direction.
+    assert(GpuSampleNeedsRead(warm, 128 * 1024 * 1024));
+    assert(GpuSampleNeedsRead(warm, 32 * 1024 * 1024));
+    assert(GpuSampleNeedsRead(warm, 0));
 }
 
 void TestGpuMappedFromMaps() {
@@ -861,17 +893,25 @@ void TestGpuPassGate() {
         assert(bytes == 0);
         assert(sample.gpu_bytes == 0);
         assert(cache.probed_absent);
-        assert(!cache.have_previous);
+        assert(!cache.have_read);
         ObservedMemSample again;
         again.rss_bytes = 1;
         assert(ReadSelfGpuMmapBytesGated(&again, &cache, 0) == 0);
-        assert(!cache.have_previous);
+        assert(!cache.have_read);
         return;
     }
-    // On a machine that does have the node, every sample reads maps and nothing
-    // else, and the figure is whatever the inference currently says.
+    // On a machine that does have the node, the sample reads maps. Whether it
+    // also paid for smaps depends on whether this process holds any device
+    // mapping at all -- a test binary holds none, and not paying there is the
+    // point, so both outcomes are correct and the figure must agree with them.
     assert(sample.gpu_source == GpuMmapSource::Maps);
-    assert(cache.have_previous);
+    if (!cache.have_read) {
+        assert(sample.gpu_bytes == 0);
+        assert(cache.reads == 0);
+    } else {
+        assert(cache.reads >= 1);
+        assert(sample.gpu_bytes == cache.bytes);
+    }
 }
 
 }  // namespace
@@ -1011,7 +1051,8 @@ int main() {
     TestGpuMmapAccounting();
     TestGpuNodePathMatching();
     TestGpuReadFailurePath();
-    TestGpuRssInclusionInference();
+    TestGpuBytesFromReading();
+    TestGpuReadPolicy();
     TestGpuMappedFromMaps();
     TestGpuPassGate();
     TestIonProcInfoAccounting();

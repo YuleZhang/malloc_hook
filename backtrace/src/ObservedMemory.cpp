@@ -528,64 +528,98 @@ bool ReadGpuMappedBytesFrom(const char* path, size_t* bytes) {
     return true;
 }
 
-const char* GpuRssInclusionName(GpuRssInclusion inclusion) {
-    switch (inclusion) {
-        case GpuRssInclusion::NotCounted:
-            return "not_counted_in_vmrss";
-        case GpuRssInclusion::Counted:
-            return "counted_in_vmrss";
-        case GpuRssInclusion::Undetermined:
+bool ReadGpuSmapsReading(const char* path, GpuSmapsReading* into) {
+    if (into == nullptr) {
+        return false;
+    }
+    *into = GpuSmapsReading{};
+    const int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        return false;
+    }
+    char buffer[16384];
+    size_t held = 0;
+    bool in_device = false;
+    for (;;) {
+        const ssize_t got = read(fd, buffer + held, sizeof(buffer) - held - 1);
+        if (got <= 0) {
             break;
-    }
-    return "undetermined";
-}
-
-GpuRssInclusion GpuRssInclusionOf(const GpuMmapCache& cache) {
-    if (cache.rss_ignores >= kGpuInclusionEvidence &&
-        cache.rss_ignores > cache.rss_follows) {
-        return GpuRssInclusion::NotCounted;
-    }
-    if (cache.rss_follows >= kGpuInclusionEvidence &&
-        cache.rss_follows > cache.rss_ignores) {
-        return GpuRssInclusion::Counted;
-    }
-    return GpuRssInclusion::Undetermined;
-}
-
-size_t GpuObserveSample(GpuMmapCache* cache, size_t mapped_bytes, size_t rss_bytes) {
-    if (cache == nullptr) {
-        return mapped_bytes;
-    }
-    if (cache->have_previous && mapped_bytes > cache->last_mapped) {
-        // The mapped total grew. Did VmRSS grow with it? Compared with a wide
-        // tolerance because host allocation is happening at the same time: the
-        // question is only whether VmRSS moved by something like the mapping,
-        // not whether it matched it to the page.
-        const size_t mapped_step = mapped_bytes - cache->last_mapped;
-        const size_t rss_step =
-                rss_bytes > cache->last_rss ? rss_bytes - cache->last_rss : 0;
-        if (rss_step >= mapped_step / 2) {
-            ++cache->rss_follows;
-        } else {
-            ++cache->rss_ignores;
+        }
+        const size_t available = held + static_cast<size_t>(got);
+        buffer[available] = '\0';
+        size_t start = 0;
+        for (;;) {
+            char* newline =
+                    static_cast<char*>(memchr(buffer + start, '\n', available - start));
+            if (newline == nullptr) {
+                break;
+            }
+            *newline = '\0';
+            char* line = buffer + start;
+            start = static_cast<size_t>(newline - buffer) + 1;
+            uintptr_t lo = 0, hi = 0;
+            if (sscanf(line, "%" SCNxPTR "-%" SCNxPTR, &lo, &hi) == 2) {
+                const char* p = MapsLinePath(line);
+                in_device = p != nullptr && IsGpuNodePath(p);
+                if (in_device && hi > lo) {
+                    into->device_mapped_bytes += static_cast<size_t>(hi - lo);
+                }
+                continue;
+            }
+            if (strncmp(line, "Rss:", 4) != 0) {
+                continue;
+            }
+            long rss_kb = 0;
+            if (sscanf(line + 4, "%ld", &rss_kb) != 1 || rss_kb < 0) {
+                continue;
+            }
+            const size_t rss = static_cast<size_t>(rss_kb) * 1024;
+            into->all_rss_bytes += rss;
+            if (in_device) {
+                into->device_rss_bytes += rss;
+            }
+        }
+        held = available - start;
+        if (held >= sizeof(buffer) - 1) {
+            held = 0;
+            in_device = false;
+        } else if (held > 0) {
+            memmove(buffer, buffer + start, held);
         }
     }
-    cache->last_mapped = mapped_bytes;
-    cache->last_rss = rss_bytes;
-    cache->have_previous = true;
+    close(fd);
+    into->valid = true;
+    return true;
+}
 
-    // Until the question is settled, report the mapped size. That is the answer
-    // on every platform measured to need this dimension at all, and the
-    // alternative default -- zero -- is the failure this dimension exists to
-    // prevent: a real footprint reported as nothing.
-    const size_t bytes = GpuRssInclusionOf(*cache) == GpuRssInclusion::Counted
-            ? 0
-            : mapped_bytes;
-    cache->bytes = bytes;
-    if (bytes > cache->max_bytes) {
-        cache->max_bytes = bytes;
+size_t GpuBytesFromReading(const GpuSmapsReading& reading, size_t vmrss_bytes) {
+    if (!reading.valid) {
+        return 0;
     }
-    return bytes;
+    // How much of what the per-VMA walk counted is absent from VmRSS. Floored at
+    // zero: on one vendor's parts the divergence runs the other way, VmRSS
+    // counting pages the walk does not, and that is not this dimension's memory.
+    const size_t divergence = reading.all_rss_bytes > vmrss_bytes
+            ? reading.all_rss_bytes - vmrss_bytes
+            : 0;
+    // Bounded by the device regions' own Rss, so any other source of divergence
+    // cannot be attributed here.
+    return divergence < reading.device_rss_bytes ? divergence
+                                                 : reading.device_rss_bytes;
+}
+
+bool GpuSampleNeedsRead(const GpuMmapCache& cache, size_t mapped_bytes) {
+    // Nothing mapped and nothing read: there is no device memory to attribute, so
+    // the expensive read buys nothing. This is what keeps a process that merely
+    // has the device node from paying for a dimension it does not use.
+    if (mapped_bytes == 0 && !cache.have_read) {
+        return false;
+    }
+    if (!cache.have_read) {
+        return true;
+    }
+    // The mapped total changing is the event that can change the answer.
+    return mapped_bytes != cache.mapped_at_read;
 }
 
 size_t ReadSelfGpuMmapBytes(ObservedMemSample* into) {
@@ -628,7 +662,7 @@ size_t ReadSelfGpuMmapBytesGated(
     if (!ok) {
         if (cache != nullptr) {
             ++cache->read_failures;
-            if (cache->have_previous) {
+            if (cache->have_read) {
                 // A figure carried from an earlier successful read is still the
                 // measurement it was; labelling it Unprobed would report a real
                 // number as "nothing was measured", and because the sampler
@@ -648,13 +682,32 @@ size_t ReadSelfGpuMmapBytesGated(
 
     into->gpu_source = GpuMmapSource::Maps;
     if (cache == nullptr) {
-        // One-shot read with nowhere to carry the inference: report the mapped
-        // total, which is the figure on every platform that needs this
-        // dimension.
-        into->gpu_bytes = mapped;
-        return mapped;
+        // One-shot read with nowhere to carry state: pay smaps and answer exactly.
+        GpuSmapsReading r;
+        if (!ReadGpuSmapsReading("/proc/self/smaps", &r)) {
+            into->gpu_bytes = 0;
+            into->gpu_source = GpuMmapSource::Unprobed;
+            return 0;
+        }
+        into->gpu_bytes = GpuBytesFromReading(r, into->rss_bytes);
+        return into->gpu_bytes;
     }
-    into->gpu_bytes = GpuObserveSample(cache, mapped, into->rss_bytes);
+    if (GpuSampleNeedsRead(*cache, mapped)) {
+        GpuSmapsReading r;
+        if (ReadGpuSmapsReading("/proc/self/smaps", &r)) {
+            cache->bytes = GpuBytesFromReading(r, into->rss_bytes);
+            cache->mapped_at_read = mapped;
+            cache->have_read = true;
+            ++cache->reads;
+            if (cache->bytes > cache->max_bytes) {
+                cache->max_bytes = cache->bytes;
+            }
+        } else {
+            ++cache->read_failures;
+        }
+    }
+    into->gpu_bytes = cache->bytes;
+    into->gpu_us = static_cast<uint32_t>(MonotonicMicros() - begin_us);
     return into->gpu_bytes;
 }
 
@@ -971,7 +1024,7 @@ ObservedSamplerStats ObservedPeakSampler::stats() const {
     out.map_passes = map_cache_.refreshes;
     out.max_map_only_bytes = map_cache_.max_bytes;
     out.max_gpu_bytes_seen = gpu_cache_.max_bytes;
-    out.gpu_rss_inclusion = GpuRssInclusionOf(gpu_cache_);
+    out.gpu_reads = gpu_cache_.reads;
     out.gpu_read_failures = gpu_cache_.read_failures;
     out.gpu_source =
             static_cast<GpuMmapSource>(gpu_source_.load(std::memory_order_relaxed));

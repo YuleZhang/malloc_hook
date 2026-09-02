@@ -124,6 +124,39 @@ an OHOS-targeted build — so no row is claimed. What is established is that the
 device-node scan finds nothing there, which is the correct outcome for a platform
 with no such node, and that the `/proc` interfaces the sampler depends on exist.
 
+### What the sampler computes
+
+`VmRSS` is supposed to equal the sum of per-VMA `Rss`. Where a device mapping's
+pages are counted by the page-table walk that produces per-VMA `Rss` but not by
+the `mm->rss_stat` counters behind `VmRSS`, the two diverge by exactly the amount
+`rss_bytes` cannot see. So:
+
+```text
+divergence = max(sum of all per-VMA Rss - VmRSS, 0)
+gpu_bytes  = min(divergence, sum of per-VMA Rss over device regions)
+```
+
+Measured readings, in kB as `/proc` reports them:
+
+| Target | state | Σ all `Rss` | `VmRSS` | divergence | device `Rss` | `gpu_bytes` | correct? |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| A1 | after create | 83332 | 17740 | 65592 | 65576 | **65576** | yes — `VmRSS` sees none of it |
+| A2 | after create | 21520 | 21408 | 112 | 40 | 40 | yes — nothing backed yet |
+| A2 | after touch | 87060 | 86868 | 192 | 65576 | 192 | yes — `VmRSS` now holds it |
+| M1 | after create | 30340 | 100680 | 0 | 0 | **0** | yes — already in `VmRSS` |
+| A3–A5 | after create | — | — | — | 0 | **0** | yes — no device mapping |
+
+The floor at zero matters: on M1 the divergence runs the other way, `VmRSS`
+counting pages the per-VMA walk does not. The bound by device `Rss` matters
+because a process carries unrelated divergence (112 kB on A2 at rest) that must
+not be attributed here.
+
+This needs smaps, which no cheap substitute replaces. It is read only when the
+device mapped total changes — the event that can change the answer — and the
+figure is carried between those events, so a run whose GPU buffers are allocated
+once pays for one read. A process with the device node but no device mapping pays
+none. `gpu_reads` in `observed_sampler` reports how many were paid.
+
 ## Vendor API notes
 
 These cost real time to rediscover, so they are recorded here.
