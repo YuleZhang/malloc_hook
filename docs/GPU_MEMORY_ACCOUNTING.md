@@ -41,46 +41,88 @@ through a descriptor, through a mapping, and potentially through a second import
 into a GPU API. `dma_bytes` deduplicates by inode for exactly this reason, and
 `gpu_bytes` must not add dma-buf backed memory at all.
 
+## Targets measured
+
+`gpu_model` is `/sys/class/kgsl/kgsl-3d0/gpu_model`; `soc.model` is
+`getprop ro.soc.model`; `machine` is `/sys/bus/soc/devices/soc0/machine`; kernel
+and arch are from `uname`.
+
+| # | gpu_model | soc.model | machine | kernel | Android | arch | device node |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| A1 | Adreno662v2 | SM7450 | DIWALI | 5.10 | 12 | aarch64 | `/dev/kgsl-3d0` |
+| A2 | Adreno720 | SM7550 | CROW | 5.15 | 14 | aarch64 | `/dev/kgsl-3d0` |
+| A3 | Adreno830v2 | SM8750 | SUN | 6.6 | 15 | aarch64 | `/dev/kgsl-3d0` |
+| A4 | Adreno840v2 | SM8850 | CANOE | 6.12 | 16 | aarch64 | `/dev/kgsl-3d0` |
+| A5 | Adreno850v2 | SM8975 | ART | 6.18 | 17 | aarch64 | `/dev/kgsl-3d0` |
+| M1 | Mali-G925-Immortalis MC12 | MT6991 | MT6991 | 6.6 | 15 | aarch64 | `/dev/mali0` |
+| M2 | Mali-G1-Ultra MC12 | MT6993 | MT6993 | 6.12 | 16 | aarch64 | `/dev/mali0` |
+| H1 | — | — | — | HongMeng 1.13.0 | HarmonyOS | aarch64 | neither |
+
+A separate Adreno target on a 6.6 kernel with no userspace GPU stack is referred
+to as **A0**; it is used only for the driver-ioctl row, since it has no OpenCL.
+
 ## Measured behaviour
 
-Targets: **Adreno/OpenCL** is an Adreno 662 Android target; **Adreno/ioctl** is a
-different Adreno target on a 6.6 kernel with no userspace GPU stack, allocating
-straight through the driver's allocation ioctl; **Mali** is a Mali-G925 Android
-target. Sizes are the allocation, deltas are across it.
+64 MB allocations, deltas across the call. "device mapping" means a mapping of the
+GPU character device in `/proc/self/maps`.
 
-| Path | Target | In `VmRSS` | Appears as | Covered by |
+### `clCreateBuffer`, and mapping plus touching it
+
+| Target | at create | after map + touch | verdict |
+| --- | --- | --- | --- |
+| A1 | device mapping +64 MB, its `Rss` **+64 MB**, `VmRSS` **+0** | no change at all | `VmRSS` never counts it; contribution is the full mapped size |
+| A2 | device mapping +64 MB, its `Rss` +0, `VmRSS` +0 | `VmRSS` **+64 MB**, its `Rss` **+64 MB** | `VmRSS` counts it, but only once faulted |
+| A3, A4, A5 | **no device mapping at all** | `VmRSS` +64 MB | ordinary resident memory; nothing for this dimension to add |
+| M1, M2 | device mapping +64 MB, its `Rss` +0, `VmRSS` **+64 MB** | no change | `VmRSS` counts it at create; adding the mapping would double count |
+| A0 | device mapping, `Rss` and `VmRSS` both track faulting | — | `VmRSS` counts it |
+
+`CL_MEM_ALLOC_HOST_PTR` behaved identically to plain `CL_MEM_READ_WRITE` on every
+target. `clEnqueueMapBuffer` never allocated: where anything changed it was the
+faulting caused by touching, not the map call.
+
+Four distinct behaviours across five Adreno parts is the headline. **The device
+mapping only exists on the older two.** On Adreno 830 and newer an OpenCL buffer
+is ordinary `VmRSS` memory with no device mapping, so this dimension is
+structurally zero there. Of the two that do create one, A1 and A2 disagree with
+each other about `VmRSS`.
+
+That is also why an inference of the form "did `VmRSS` move when the mapped total
+grew" is not sufficient. On A2 the mapping appears in one sample and the faulting
+happens later, so at the growth step `VmRSS` has not moved yet and the sample
+looks like A1 — while the same pages are counted in `VmRSS` a moment later.
+Distinguishing the two requires per-region residency, which is what A1 breaks:
+there, per-region `Rss` reports the full size while `VmRSS` reports none of it.
+
+### dma-buf, and the vendor imports of it
+
+| Path | Targets | `VmRSS` | device mapping | dma-buf mapping |
 | --- | --- | --- | --- | --- |
-| `clCreateBuffer(CL_MEM_READ_WRITE)` | Adreno/OpenCL | **no** | device-node mapping, full size | `gpu_bytes` |
-| `clCreateBuffer(… \| CL_MEM_ALLOC_HOST_PTR)` | Adreno/OpenCL | **no** | device-node mapping, full size | `gpu_bytes` |
-| `clEnqueueMapBuffer` on either of the above | Adreno/OpenCL | no change | nothing new | — |
-| driver allocation ioctl, all four cache modes | Adreno/ioctl | **yes**, as it faults | device-node mapping | `rss_bytes` |
-| `clCreateBuffer(CL_MEM_READ_WRITE)` | Mali | **yes**, in full | nothing | `rss_bytes` |
-| `clCreateBuffer(… \| CL_MEM_ALLOC_HOST_PTR)` | Mali | **yes**, in full | nothing | `rss_bytes` |
-| dma-heap allocation, descriptor only | both | no | nothing | `dma_bytes` (by descriptor) |
-| dma-heap allocation, `mmap` + touch | both | **no** | dma-buf mapping, `Rss` 0 | `dma_bytes` |
-| `clCreateBuffer(CL_MEM_EXT_HOST_PTR_QCOM)` importing that dma-buf | Adreno/OpenCL | no change | **nothing new** | already `dma_bytes` |
-| `clEnqueueMapBuffer` on the imported buffer | Adreno/OpenCL | no change | nothing new | — |
-| `eglCreateImageKHR(EGL_LINUX_DMA_BUF_EXT)` importing a dma-buf | Mali | no change beyond driver overhead | nothing new | already `dma_bytes` |
+| dma-heap alloc, descriptor only | all | +0 | +0 | +0 |
+| that dma-buf `mmap` + touch | all | **+0** | +0 | **+64 MB, `Rss` 0** |
+| `CL_MEM_DMABUF_HOST_PTR_QCOM` import | A1–A5 | +0 | +0 | +0 |
+| `CL_MEM_ION_HOST_PTR_QCOM` import | A1–A5 | +0 | +0 | +0 |
+| import + map + touch | A1–A5 | +0 | +0 | +0 |
+| **`clImportMemoryARM`** (`CL_IMPORT_TYPE_DMA_BUF_ARM`) | M1, M2 | +128 kB | **+64 MB** | **+64 MB** |
 
-Three conclusions follow.
+Every dma-buf path is invisible to `VmRSS` and visible as a dma-buf mapping with
+`Rss` 0, on all seven targets, so `dma_bytes` covers it. Both QCOM imports bind
+the existing object and allocate nothing.
 
-**Only the device-node mapping is a genuine blind spot.** Every dma-buf backed
-path is already counted, and importing a dma-buf into a GPU API adds no mapping
-of its own — the import binds the existing object rather than allocating. So
-`gpu_bytes` needs to cover device-node mappings and nothing else, which is also
-why it costs one `/proc/self/maps` read and no more.
+`clImportMemoryARM` is the exception and the reason the Mali device node must stay
+excluded from this dimension. The import creates **both** a `/dev/mali0` mapping
+and a dma-buf mapping for the same 64 MB. A dimension that counted the Mali
+device node would therefore report that memory twice: once here and once in
+`dma_bytes`, which already counts it by descriptor.
 
-**Vendor is the wrong axis.** The two Adreno targets disagree with each other and
-one of them agrees with Mali. Whether these mappings are counted in `VmRSS` is a
-function of the driver's allocation path and the kernel, so the sampler
-determines it at runtime rather than keying off the vendor string. It watches
-whether `VmRSS` moves when the mapped total grows, using the two signals it
-already reads every tick, and reports the conclusion as `gpu_rss` in
-`observed_sampler`.
+### OHOS
 
-**`clEnqueueMapBuffer` is not the allocation point.** On the Adreno/OpenCL target
-the mapping appears at `clCreateBuffer`; mapping and touching it afterwards adds
-nothing. Anything keyed on the map call would see the memory late or not at all.
+H1 runs a HongMeng kernel, not Linux. It exposes neither GPU character device,
+carries both `/dev/ion` and `/dev/dma_heap`, and provides `/proc/self/status`
+with `VmRSS`, `maps`, `smaps` and `pagemap`. `libOpenCL.so` is present under
+`/vendor/lib64`. The allocation paths above have **not** been run there — it needs
+an OHOS-targeted build — so no row is claimed. What is established is that the
+device-node scan finds nothing there, which is the correct outcome for a platform
+with no such node, and that the `/proc` interfaces the sampler depends on exist.
 
 ## Vendor API notes
 

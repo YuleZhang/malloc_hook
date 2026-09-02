@@ -33,40 +33,78 @@ GPU 驱动交给进程的设备内存，会因为操作系统、厂商、驱动�
 API 被触达。`dma_bytes` 之所以按 inode 去重就是为了这个，而 `gpu_bytes` **绝不能**再把
 dma-buf 支撑的内存加进去。
 
+## 实测设备
+
+`gpu_model` 取自 `/sys/class/kgsl/kgsl-3d0/gpu_model`；`soc.model` 取自
+`getprop ro.soc.model`；`machine` 取自 `/sys/bus/soc/devices/soc0/machine`；内核和
+架构取自 `uname`。
+
+| # | gpu_model | soc.model | machine | 内核 | Android | arch | 设备节点 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| A1 | Adreno662v2 | SM7450 | DIWALI | 5.10 | 12 | aarch64 | `/dev/kgsl-3d0` |
+| A2 | Adreno720 | SM7550 | CROW | 5.15 | 14 | aarch64 | `/dev/kgsl-3d0` |
+| A3 | Adreno830v2 | SM8750 | SUN | 6.6 | 15 | aarch64 | `/dev/kgsl-3d0` |
+| A4 | Adreno840v2 | SM8850 | CANOE | 6.12 | 16 | aarch64 | `/dev/kgsl-3d0` |
+| A5 | Adreno850v2 | SM8975 | ART | 6.18 | 17 | aarch64 | `/dev/kgsl-3d0` |
+| M1 | Mali-G925-Immortalis MC12 | MT6991 | MT6991 | 6.6 | 15 | aarch64 | `/dev/mali0` |
+| M2 | Mali-G1-Ultra MC12 | MT6993 | MT6993 | 6.12 | 16 | aarch64 | `/dev/mali0` |
+| H1 | — | — | — | HongMeng 1.13.0 | HarmonyOS | aarch64 | 两者都无 |
+
+另有一台 6.6 内核、无用户态 GPU 栈的 Adreno 设备记为 **A0**，只用于"驱动 ioctl"那一行，
+因为它上面没有 OpenCL。
+
 ## 实测行为
 
-测试对象：**Adreno/OpenCL** 是一台 Adreno 662 的 Android 设备；**Adreno/ioctl** 是另一台
-Adreno 设备，6.6 内核、没有用户态 GPU 栈，直接走驱动的分配 ioctl；**Mali** 是一台
-Mali-G925 的 Android 设备。尺寸是分配量，数值是分配前后的差值。
+64 MB 分配，数值为调用前后的差值。"设备映射"指 `/proc/self/maps` 里对 GPU 字符设备的映射。
 
-| 路径 | 设备 | 进 `VmRSS` | 表现为 | 由谁覆盖 |
+### `clCreateBuffer`，以及随后 map + touch
+
+| 设备 | create 时 | map + touch 后 | 结论 |
+| --- | --- | --- | --- |
+| A1 | 设备映射 +64 MB，其 `Rss` **+64 MB**，`VmRSS` **+0** | 完全无变化 | `VmRSS` 永远不算它；应贡献全额 mapped size |
+| A2 | 设备映射 +64 MB，其 `Rss` +0，`VmRSS` +0 | `VmRSS` **+64 MB**，其 `Rss` **+64 MB** | `VmRSS` 会算它，但只在 fault 之后 |
+| A3、A4、A5 | **完全没有设备映射** | `VmRSS` +64 MB | 就是普通驻留内存，这一维无需增加任何东西 |
+| M1、M2 | 设备映射 +64 MB，其 `Rss` +0，`VmRSS` **+64 MB** | 无变化 | `VmRSS` 在 create 时就算了它；再加映射就是重复计数 |
+| A0 | 设备映射，`Rss` 和 `VmRSS` 都随 fault 增长 | — | `VmRSS` 会算它 |
+
+`CL_MEM_ALLOC_HOST_PTR` 在每台设备上的表现都与普通 `CL_MEM_READ_WRITE` 完全一致。
+`clEnqueueMapBuffer` 从不分配内存：凡是有变化的，变的都是 touch 引起的 fault，而不是 map
+调用本身。
+
+**五颗 Adreno 出现三种不同行为**是最值得注意的一点，而分界线是内核/驱动代次而非厂商：最老
+的两颗会建立设备映射且彼此对 `VmRSS` 的结论相反，最新的三颗**根本不建立设备映射**。也就是
+说任何以厂商字符串、或以"设备节点是否存在"为判据的规则，在这张表里都会在某颗芯片上出错。
+
+这也说明"映射总量增长时 `VmRSS` 是否跟着动"这种推断**不够**。在 A2 上映射出现在某次采样，
+而 fault 发生在更晚，所以在增长那一步 `VmRSS` 还没动，看起来和 A1 一样 —— 但同一批页片刻
+之后就被 `VmRSS` 算进去了。要区分两者需要 per-region 的驻留量，而这恰恰是 A1 打破的：在
+A1 上 per-region `Rss` 报全额，而 `VmRSS` 一点不报。
+
+### dma-buf，以及厂商对它的导入
+
+| 路径 | 设备 | `VmRSS` | 设备映射 | dma-buf 映射 |
 | --- | --- | --- | --- | --- |
-| `clCreateBuffer(CL_MEM_READ_WRITE)` | Adreno/OpenCL | **否** | 设备节点映射，全额 | `gpu_bytes` |
-| `clCreateBuffer(… \| CL_MEM_ALLOC_HOST_PTR)` | Adreno/OpenCL | **否** | 设备节点映射，全额 | `gpu_bytes` |
-| 对上面两者 `clEnqueueMapBuffer` | Adreno/OpenCL | 无变化 | 无新增 | — |
-| 驱动分配 ioctl，四种 cache mode | Adreno/ioctl | **是**，随 fault 增长 | 设备节点映射 | `rss_bytes` |
-| `clCreateBuffer(CL_MEM_READ_WRITE)` | Mali | **是**，全额 | 无 | `rss_bytes` |
-| `clCreateBuffer(… \| CL_MEM_ALLOC_HOST_PTR)` | Mali | **是**，全额 | 无 | `rss_bytes` |
-| dma-heap 分配，只持描述符 | 两者 | 否 | 无 | `dma_bytes`（按描述符）|
-| dma-heap 分配，`mmap` + touch | 两者 | **否** | dma-buf 映射，`Rss` 为 0 | `dma_bytes` |
-| `clCreateBuffer(CL_MEM_EXT_HOST_PTR_QCOM)` 导入该 dma-buf | Adreno/OpenCL | 无变化 | **无新增** | 已在 `dma_bytes` |
-| 对导入的 buffer `clEnqueueMapBuffer` | Adreno/OpenCL | 无变化 | 无新增 | — |
-| `eglCreateImageKHR(EGL_LINUX_DMA_BUF_EXT)` 导入 dma-buf | Mali | 除驱动自身开销外无变化 | 无新增 | 已在 `dma_bytes` |
+| dma-heap 分配，只持描述符 | 全部 | +0 | +0 | +0 |
+| 对该 dma-buf `mmap` + touch | 全部 | **+0** | +0 | **+64 MB，`Rss` 为 0** |
+| `CL_MEM_DMABUF_HOST_PTR_QCOM` 导入 | A1–A5 | +0 | +0 | +0 |
+| `CL_MEM_ION_HOST_PTR_QCOM` 导入 | A1–A5 | +0 | +0 | +0 |
+| 导入 + map + touch | A1–A5 | +0 | +0 | +0 |
+| **`clImportMemoryARM`**（`CL_IMPORT_TYPE_DMA_BUF_ARM`）| M1、M2 | +128 kB | **+64 MB** | **+64 MB** |
 
-由此得到三条结论。
+所有 dma-buf 路径在全部七台设备上都对 `VmRSS` 不可见，并表现为一个 `Rss` 为 0 的 dma-buf
+映射，因此 `dma_bytes` 已经覆盖。两种 QCOM 导入都只是绑定已有对象，不分配内存。
 
-**只有设备节点映射是真正的盲区。** 所有 dma-buf 支撑的路径都已被覆盖，而把 dma-buf 导入
-GPU API **不会**新增任何映射 —— 导入是绑定一个已存在的对象，不是分配。所以 `gpu_bytes`
-只需要覆盖设备节点映射，别的都不用管，这也正是它只要读一次 `/proc/self/maps` 的原因。
+`clImportMemoryARM` 是例外，也正是 Mali 设备节点必须继续排除在这一维之外的原因：这次导入
+对同一块 64 MB **同时**建立了一个 `/dev/mali0` 映射和一个 dma-buf 映射。如果这一维去统计
+Mali 设备节点，那块内存就会被报两遍 —— 一遍在这里，一遍在已经按描述符统计它的 `dma_bytes`。
 
-**按厂商分类是错的轴。** 两台 Adreno 彼此结论相反，而其中一台和 Mali 一致。这类映射是否
-计入 `VmRSS`，取决于驱动的分配路径和内核，所以采样器在运行时判定，而不是看厂商字符串。
-判定方式是：观察映射总量增长时 `VmRSS` 是否跟着动 —— 用的就是它每次采样本来就读的那两个
-信号 —— 结论以 `gpu_rss` 报在 `observed_sampler` 里。
+### OHOS
 
-**`clEnqueueMapBuffer` 不是分配点。** 在 Adreno/OpenCL 上映射是在 `clCreateBuffer` 时就
-建立的，之后 map 再 touch 一个字节都不增加。任何以 map 调用为触发点的逻辑都会晚看到、
-甚至看不到这块内存。
+H1 跑的是 HongMeng 内核，不是 Linux。它两个 GPU 字符设备都没有，同时具备 `/dev/ion` 和
+`/dev/dma_heap`，并且提供带 `VmRSS` 的 `/proc/self/status`、以及 `maps`、`smaps`、
+`pagemap`。`/vendor/lib64` 下有 `libOpenCL.so`。上面那些分配路径**没有**在它上面跑过 ——
+需要一个面向 OHOS 的构建 —— 所以不给出结论行。已确立的是：设备节点扫描在那里什么都找不到，
+这对一个没有该节点的平台正是正确结果；而采样器依赖的那些 `/proc` 接口都存在。
 
 ## 厂商 API 注意事项
 
