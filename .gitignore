@@ -3,3 +3,7 @@
 build/
 out/
 compile_commands.json
+# Site-specific configuration for test/hook_overhead_benchmark.sh. It names a
+# device, an adb endpoint and a local workload path, none of which belong in a
+# repository meant to be shareable.
+.bench.local
