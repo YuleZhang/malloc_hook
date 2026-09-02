@@ -216,9 +216,15 @@ static void* signal_dump_thread(void*) {
     return nullptr;
 }
 
-static bool StartSignalDumpThread() {
+// The pipe is what the signal handler writes to, so it must exist before the
+// dump signal is installed. Creating it is separate from starting the thread
+// that drains it: the thread cannot be created this early (see
+// debug_start_helper_threads) while a signal can arrive at any time. Writes are
+// non-blocking, so a dump requested before the thread exists simply waits in the
+// pipe until it does.
+static bool PrepareSignalDumpChannel() {
     g_signal_debug_enabled = getenv("ALLOC_HOOK_DEBUG") != nullptr;
-    if (g_signal_thread_started) {
+    if (g_signal_pipe[0] != -1) {
         return true;
     }
     if (pipe(g_signal_pipe) != 0) {
@@ -232,11 +238,17 @@ static bool StartSignalDumpThread() {
     if (flags != -1) {
         fcntl(g_signal_pipe[1], F_SETFL, flags | O_NONBLOCK);
     }
+    return true;
+}
+
+static bool StartSignalDumpThread() {
+    if (g_signal_thread_started) {
+        return true;
+    }
+    if (g_signal_pipe[0] == -1) {
+        return false;
+    }
     if (pthread_create(&g_signal_thread, nullptr, signal_dump_thread, nullptr) != 0) {
-        close(g_signal_pipe[0]);
-        close(g_signal_pipe[1]);
-        g_signal_pipe[0] = -1;
-        g_signal_pipe[1] = -1;
         return false;
     }
     pthread_detach(g_signal_thread);
@@ -357,7 +369,7 @@ bool debug_initialize(void* init_space[]) {
     RegisterForkHandlers();
 
     if (g_debug->config().options() & DUMP_ON_SINGAL) {
-        if (!StartSignalDumpThread()) {
+        if (!PrepareSignalDumpChannel()) {
             return false;
         }
         struct sigaction enable_act = {};
@@ -375,9 +387,40 @@ bool debug_initialize(void* init_space[]) {
         }
     }
 
-    StartObservedPeakSampler();
-
     return true;
+}
+
+// Everything above runs on whichever call first triggered initialization, which
+// may be an allocation the loader itself made before the process runtime was
+// finished. pthread_create is not usable there: libc instruments it with an
+// ATrace scope that reads a system property, and the property area it consults is
+// not mapped yet, so the call faults inside libc rather than failing. Measured on
+// both major vendors and on API 33 through 36, this crashes the process at load.
+//
+// So thread creation is not part of initialization. The adapter calls this once
+// the loader has run the interposer's constructors, which is late enough, and
+// calls it directly when initialization happens after that point. Idempotent
+// because both paths can fire in either order.
+void debug_start_helper_threads() {
+    if (g_debug == nullptr) {
+        return;
+    }
+    static bool started = false;
+    if (started) {
+        return;
+    }
+    started = true;
+
+    if ((g_debug->config().options() & DUMP_ON_SINGAL) && !StartSignalDumpThread()) {
+        // The signal stays installed and its handler stays harmless; only the
+        // drain is missing, so dump-on-signal is what is lost. Initialization
+        // already succeeded, so failing it here would disable tracking too.
+        static const char message[] =
+                "alloc_hook: could not start the signal dump thread; "
+                "dump-on-signal is unavailable\n";
+        write(STDERR_FILENO, message, sizeof(message) - 1);
+    }
+    StartObservedPeakSampler();
 }
 
 void debug_finalize() {

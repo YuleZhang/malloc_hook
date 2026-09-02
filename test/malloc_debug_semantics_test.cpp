@@ -8,6 +8,9 @@
 #include <cstdlib>
 #include <new>
 
+#include <dirent.h>
+#include <unistd.h>
+
 namespace {
 
 alignas(64) unsigned char g_malloc_storage[128];
@@ -76,6 +79,34 @@ int FakePosixMemalign(void** pointer, size_t alignment, size_t size) {
     return 0;
 }
 
+// Live entries under /proc/self/task, which is one per thread.
+long CountThreads() {
+    DIR* dir = opendir("/proc/self/task");
+    if (dir == nullptr) {
+        return -1;
+    }
+    long count = 0;
+    while (const dirent* entry = readdir(dir)) {
+        if (entry->d_name[0] != '.') {
+            ++count;
+        }
+    }
+    closedir(dir);
+    return count;
+}
+
+// pthread_create needs a moment before the task directory reflects it.
+long ThreadsAtLeast(long target) {
+    for (int attempt = 0; attempt < 200; ++attempt) {
+        const long count = CountThreads();
+        if (count < 0 || count >= target) {
+            return count;
+        }
+        usleep(1000);
+    }
+    return CountThreads();
+}
+
 }  // namespace
 
 int main() {
@@ -94,8 +125,34 @@ int main() {
     alignas(DebugData) static unsigned char debug_storage[sizeof(DebugData)];
     alignas(PointerData) static unsigned char pointer_storage[sizeof(PointerData)];
     void* init_space[] = {debug_storage, pointer_storage};
+    const long threads_before_init = CountThreads();
+    if (threads_before_init < 1) {
+        return 10;
+    }
     if (!debug_initialize(init_space)) {
         return 1;
+    }
+
+    // Initialization must not create a thread. It can run from an allocation the
+    // loader itself made, before the process runtime is complete, and
+    // pthread_create is not usable there -- on Android libc instruments it with
+    // a trace scope that reads a system property whose area is not mapped yet,
+    // so the call faults instead of failing. Thread creation therefore belongs
+    // to debug_start_helper_threads(), which the adapter calls later.
+    if (CountThreads() != threads_before_init) {
+        return 11;
+    }
+
+    // That call is what starts them, and it is idempotent because the adapter
+    // reaches it from two directions.
+    debug_start_helper_threads();
+    const long threads_after_start = ThreadsAtLeast(threads_before_init + 1);
+    if (threads_after_start != threads_before_init + 1) {
+        return 12;
+    }
+    debug_start_helper_threads();
+    if (CountThreads() != threads_after_start) {
+        return 13;
     }
 
     void* aligned = debug_aligned_alloc(64, 64);
