@@ -80,7 +80,8 @@ GPU character device in `/proc/self/maps`.
 target. `clEnqueueMapBuffer` never allocated: where anything changed it was the
 faulting caused by touching, not the map call.
 
-Four distinct behaviours across five Adreno parts is the headline. **The device
+Three distinct behaviours across five Adreno parts is the headline, and the
+line falls on kernel/driver generation rather than vendor. **The device
 mapping only exists on the older two.** On Adreno 830 and newer an OpenCL buffer
 is ordinary `VmRSS` memory with no device mapping, so this dimension is
 structurally zero there. Of the two that do create one, A1 and A2 disagree with
@@ -247,24 +248,11 @@ the import allocates nothing, neither outcome changes what is accounted.
 
 Stated so the boundary of the table above is explicit.
 
-`clImportMemoryARM` (`cl_arm_import_memory` / `cl_arm_import_memory_dma_buf`) is
-the Mali and PowerVR equivalent of the QCOM host-pointer imports, and is
-advertised on the measured Mali target. **Inferred**: like the QCOM imports it
-binds an existing dma-buf rather than allocating, so the memory should already be
-in `dma_bytes` and it should add no device-node mapping. This has not been
-verified, and it is the most likely place for a surprise on Mali, because Mali's
-own working buffers are dma-bufs whereas the Adreno blind spot is a character
-device.
-
-PowerVR has not been measured at all. The host frameworks that do this import
-route it through the same ARM path, which suggests the same expectation, on the
-same unverified footing.
-
-OHOS has not been measured. The hook supports it, and it leaves `mmap`
-interposition off by default there, so a device-node mapping created by a vendor
-GPU stack would be visible to the `/proc/self/maps` scan but not to the
-allocation hook. Whether OHOS GPU drivers use a character device, a dma-buf
-equivalent, or something else is unknown here.
+PowerVR has not been measured at all. Its equivalent of the ARM import is routed
+through the same `clImportMemoryARM` path by the host frameworks that do this, and
+that path is measured on Mali above, which suggests the same expectation on
+PowerVR — on unverified footing, since PowerVR's own working buffers may not be
+dma-bufs the way Mali's are.
 
 Protected and secure heaps (`CL_MEM_DMABUF_HOST_PTR_PROTECTED_QCOM`, the
 `qcom,secure-*` and `mtk_prot_*` dma-heaps) have not been measured. They may not

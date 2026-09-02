@@ -211,18 +211,9 @@ gpu_bytes  = min(divergence, 设备区间的 per-VMA Rss 之和)
 
 明确写出来，以便上面那张表的边界是清楚的。
 
-`clImportMemoryARM`（`cl_arm_import_memory` / `cl_arm_import_memory_dma_buf`）是 Mali 和
-PowerVR 上对应 QCOM host-pointer 导入的接口，实测的 Mali 设备声明了它。**推断**：和 QCOM
-的导入一样，它绑定一个已存在的 dma-buf 而非分配，所以那块内存应该已经在 `dma_bytes` 里，
-且不会新增设备节点映射。**这一条没有验证**，而且它是 Mali 上最可能出意外的地方 —— 因为
-Mali 自己的工作缓冲就是 dma-buf，而 Adreno 的盲区是字符设备，两者机制不同。
-
-PowerVR 完全没测。做这类导入的宿主框架一般把它和 ARM 归到同一条 import 路径，暗示预期
-相同，但同样处于未验证状态。
-
-OHOS 没测。这个 hook 支持 OHOS，而且在那里默认**关闭** `mmap` interposition，所以厂商
-GPU 栈建立的设备节点映射会被 `/proc/self/maps` 扫描看到，但不会被分配 hook 看到。OHOS 的
-GPU 驱动用字符设备、用 dma-buf 等价物、还是别的什么，这里未知。
+PowerVR 完全没测。做这类导入的宿主框架会把它和 ARM 走同一条 `clImportMemoryARM` 路径，
+而那条路径在上面的 Mali 设备上已经实测，因此对 PowerVR 的预期相同 —— 但仍属未验证，因为
+PowerVR 自己的工作缓冲未必像 Mali 那样是 dma-buf。
 
 受保护/安全堆（`CL_MEM_DMABUF_HOST_PTR_PROTECTED_QCOM`、`qcom,secure-*` 和 `mtk_prot_*`
 这些 dma-heap）没测。它们可能根本不允许普通进程映射，那种情况下采样器里没有任何信号能
