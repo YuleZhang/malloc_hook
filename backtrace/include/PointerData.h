@@ -213,7 +213,7 @@ public:
     bool RecordObservedPeak(const ObservedMemSample& sample);
     // fork() only clones the calling thread, so a mutex another thread held at
     // fork time stays locked forever in the child. These acquire and release
-    // both tracker mutexes in the canonical pointer -> frame order so a
+    // every tracker mutex in the canonical shards -> frame order so a
     // pthread_atfork handler can hand the child an unlocked tracker.
     void LockForFork();
     void UnlockAfterFork();
@@ -228,11 +228,13 @@ private:
             std::vector<ListInfoType>* list, bool only_with_backtrace, Pred pred,
             OmittedStats* omitted = nullptr);
     void GetUniqueList(std::vector<ListInfoType>* list, bool only_with_backtrace);
-    // Records a peak snapshot if the new peak has passed the next threshold.
-    // Caller must hold pointer_mutex_; this takes frame_mutex_.
-    void MaybeRecordPeakSnapshotLocked();
+    // Records a peak snapshot if `tracked_total` has passed the next threshold.
+    // Caller must hold NO shard lock: a snapshot needs a consistent view of
+    // every shard, and upgrading from one shard to all of them would invert the
+    // lock order. It acquires the shards and frame_mutex_ itself.
+    void MaybeRecordPeakSnapshot(size_t tracked_total);
     // Copies the live allocation stacks and the surrounding /proc state into
-    // the retained snapshot. Caller must hold pointer_mutex_; this takes
+    // the retained snapshot. Caller must hold every shard lock; this takes
     // frame_mutex_. Shared by both peak criteria so the snapshot contents can
     // never differ depending on what triggered it. `proc` is the already
     // collected /proc context, or nullptr to collect it under the locks.
@@ -244,12 +246,53 @@ private:
     // Reads the /proc state a snapshot records. Takes no hook lock, so it can
     // be hoisted out of the locked region by callers that are able to.
     void CollectPeakProcContext(PeakProcContext* out);
-    // Records `ptr` in the probabilistic membership filter. Caller holds
-    // pointer_mutex_; the words themselves are atomic so lookups stay lock-free.
+    // Records `ptr` in the probabilistic membership filter. Caller holds the
+    // owning shard lock; the words themselves are atomic so lookups stay
+    // lock-free.
     void MarkPointerFilter(const void* ptr);
 
-    std::mutex pointer_mutex_;
-    std::unordered_map<uintptr_t, PointerInfoType> pointers_;
+    // Live-pointer tracking, sharded by pointer hash.
+    //
+    // One mutex around the whole map made every malloc and every free in the
+    // process serialize on a single lock. That is a path the allocator itself
+    // normally serves from a per-thread cache in tens of nanoseconds, so on a
+    // workload with many allocating threads the tracker -- not the allocator --
+    // became the bottleneck, and the cost was paid for every allocation
+    // regardless of BACKTRACE_MIN_SIZE.
+    //
+    // An operation on a single pointer touches exactly one shard. Operations
+    // needing a whole-process view (report, peak snapshot, fork) take every
+    // shard in ascending index order; that order, followed by frame_mutex_, is
+    // the only lock order used anywhere in this file.
+    static constexpr size_t kPointerShards = 64;
+    // Padded to a cache line: the mutex words of neighbouring shards would
+    // otherwise share one, and threads hashing to different shards would
+    // ping-pong the line between cores -- reintroducing as coherency traffic
+    // exactly the contention the sharding removes.
+    struct alignas(64) PointerShard {
+        std::mutex mutex;
+        std::unordered_map<uintptr_t, PointerInfoType> pointers;
+    };
+    std::array<PointerShard, kPointerShards> shards_;
+    PointerShard& ShardFor(uintptr_t mangled_pointer);
+    // Acquire/release every shard in ascending index order. This is the only
+    // whole-tracker lock, and it is always taken before frame_mutex_.
+    void LockAllShards();
+    void UnlockAllShards();
+    // RAII form, for the paths that have more than one exit. Declare it before
+    // any frame_mutex_ guard so the release order mirrors the acquire order.
+    class AllShardsGuard {
+    public:
+        explicit AllShardsGuard(PointerData* owner) : owner_(owner) {
+            owner_->LockAllShards();
+        }
+        ~AllShardsGuard() { owner_->UnlockAllShards(); }
+        AllShardsGuard(const AllShardsGuard&) = delete;
+        AllShardsGuard& operator=(const AllShardsGuard&) = delete;
+
+    private:
+        PointerData* owner_;
+    };
 
     std::mutex frame_mutex_;
     std::unordered_map<FrameKeyType, size_t> key_to_index_;
@@ -257,13 +300,23 @@ private:
     std::unordered_map<size_t, std::shared_ptr<std::vector<SymbolizedFrame>>> backtraces_info_;
     size_t cur_hash_index_;
 
-    size_t current_used, current_host, current_dma;
-    size_t peak_tot, peak_host, peak_dma;
-    size_t next_peak_record_threshold_;
+    // Atomic because they are maintained outside any single lock now that the
+    // map is sharded. Relaxed ordering throughout: these are counters and
+    // monotonic maxima read only by the report, never used to publish other
+    // state, so no allocation's correctness depends on the order two threads'
+    // updates become visible in.
+    std::atomic<size_t> current_used{0}, current_host{0}, current_dma{0};
+    std::atomic<size_t> peak_tot{0}, peak_host{0}, peak_dma{0};
+    // Read without a lock to decide whether a snapshot is even worth attempting,
+    // then re-checked under the shard locks before one is taken.
+    std::atomic<size_t> next_peak_record_threshold_{0};
     size_t peak_record_step_bytes_;
     // Set once the retained snapshot is final, so nothing can replace it. Only
-    // first-crossing retention sets it. Guarded by pointer_mutex_, which both
-    // the allocation path and the sampler thread hold when they touch it.
+    // first-crossing retention sets it. Guarded by every shard lock, which both
+    // the allocation path's snapshot attempt and the sampler thread hold when
+    // they touch it. The allocation hot path does not read it: finalization pins
+    // next_peak_record_threshold_ out of reach, so the unlocked threshold test
+    // already rejects every later peak.
     bool peak_snapshot_final_ = false;
     // Whether this path keeps only the first crossing of the floor, matching the
     // configured retention. It reaches a snapshot only when the sampler never
@@ -300,7 +353,7 @@ private:
     std::vector<MappingRss> peak_mappings;
     MappingTotals peak_map_totals;
     // The hook's own bookkeeping at that moment. This is what the tool adds to
-    // the traced process's RSS, and it is dominated by one pointers_ entry per
+    // the traced process's RSS, and it is dominated by one shard-map entry per
     // live tracked allocation -- a cost paid for every allocation, independent
     // of BACKTRACE_MIN_SIZE, which only gates stack capture.
     size_t peak_live_pointers = 0;

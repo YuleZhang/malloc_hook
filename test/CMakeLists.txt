@@ -93,6 +93,21 @@ target_link_libraries(async_lifecycle_identity_test PRIVATE
 add_test(NAME async_lifecycle_identity COMMAND async_lifecycle_identity_test)
 set_tests_properties(async_lifecycle_identity PROPERTIES TIMEOUT 10)
 
+# Registered for every target, not just the host: the sharded tracker's whole
+# point is contention between many allocating threads, and the platform that
+# actually runs many of them is the device.
+add_executable(pointer_shard_concurrency_test
+    pointer_shard_concurrency_test.cpp)
+target_compile_features(pointer_shard_concurrency_test PRIVATE cxx_std_17)
+target_include_directories(pointer_shard_concurrency_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../backtrace/include)
+target_link_libraries(pointer_shard_concurrency_test PRIVATE
+    helper ${CMAKE_DL_LIBS} Threads::Threads)
+add_test(NAME pointer_shard_concurrency COMMAND pointer_shard_concurrency_test)
+# Well above the observed runtime; a wedged shard lock should surface as a
+# timeout rather than hanging the suite.
+set_tests_properties(pointer_shard_concurrency PROPERTIES TIMEOUT 60)
+
 add_test(
     NAME pointer_stack_boundary
     COMMAND ${CMAKE_COMMAND}

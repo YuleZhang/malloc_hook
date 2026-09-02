@@ -54,6 +54,25 @@ uint64_t HashPointer(uintptr_t pointer) {
     return hash ^ (hash >> 33);
 }
 
+// Raise a monotonic maximum held outside any lock. Returns true if this call is
+// the one that installed the new maximum.
+//
+// Relaxed and lock-free on purpose: a peak is only ever read by the report, and
+// the loop can lose a race only to a value at least as large as the one it was
+// trying to install. Taking a lock to keep a maximum exact would put back the
+// serialization point the sharding exists to remove.
+bool RaisePeak(std::atomic<size_t>* peak, size_t candidate) {
+    size_t observed = peak->load(std::memory_order_relaxed);
+    while (candidate > observed) {
+        if (peak->compare_exchange_weak(
+                    observed, candidate, std::memory_order_relaxed,
+                    std::memory_order_relaxed)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 struct SamplerTlsState {
     uint64_t configured_interval = 0;
     PoissonSampler sampler;
@@ -402,7 +421,9 @@ SamplerTlsState* GetSamplerState() {
 PointerData::~PointerData() = default;
 
 bool PointerData::Initialize(const Config& config) {
-    pointers_.clear();
+    for (PointerShard& shard : shards_) {
+        shard.pointers.clear();
+    }
     key_to_index_.clear();
     frames_.clear();
     backtraces_info_.clear();
@@ -410,8 +431,12 @@ bool PointerData::Initialize(const Config& config) {
     // A hash index of kBacktraceEmptyIndex indicates that we tried to get
     // a backtrace, but there was nothing recorded.
     cur_hash_index_ = kBacktraceEmptyIndex + 1;
-    current_used = current_host = current_dma = 0;
-    peak_tot = peak_host = peak_dma = 0;
+    current_used.store(0, std::memory_order_relaxed);
+    current_host.store(0, std::memory_order_relaxed);
+    current_dma.store(0, std::memory_order_relaxed);
+    peak_tot.store(0, std::memory_order_relaxed);
+    peak_host.store(0, std::memory_order_relaxed);
+    peak_dma.store(0, std::memory_order_relaxed);
     for (auto& word : pointer_filter_) {
         word.store(0, std::memory_order_relaxed);
     }
@@ -421,7 +446,8 @@ bool PointerData::Initialize(const Config& config) {
     // total passed it earlier, so a sampler that has still not snapshotted is
     // one that never started or wedged. Below the floor this path stays silent,
     // which is what keeps a first-crossing run down to a single stack walk.
-    next_peak_record_threshold_ = config.backtrace_dump_peak_val();
+    next_peak_record_threshold_.store(
+            config.backtrace_dump_peak_val(), std::memory_order_relaxed);
     tracked_peak_once_ = config.peak_retention() == PeakRetention::FirstCrossing;
     peak_snapshot_final_ = false;
     peak_record_step_bytes_ = config.peak_record_step_bytes();
@@ -432,6 +458,24 @@ bool PointerData::Initialize(const Config& config) {
     observed_peak_active_.store(false, std::memory_order_relaxed);
 
     return true;
+}
+
+PointerData::PointerShard& PointerData::ShardFor(uintptr_t mangled_pointer) {
+    // Hashed rather than masked: allocator results are aligned, so the low bits
+    // of a pointer are constant and masking them would leave most shards empty.
+    return shards_[HashPointer(mangled_pointer) & (kPointerShards - 1)];
+}
+
+void PointerData::LockAllShards() {
+    for (PointerShard& shard : shards_) {
+        shard.mutex.lock();
+    }
+}
+
+void PointerData::UnlockAllShards() {
+    for (size_t i = kPointerShards; i-- > 0;) {
+        shards_[i].mutex.unlock();
+    }
 }
 
 bool PointerData::ShouldTrackAllocation(
@@ -462,13 +506,13 @@ bool PointerData::ShouldTrackAllocation(
 }
 
 void PointerData::LockForFork() {
-    pointer_mutex_.lock();
+    LockAllShards();
     frame_mutex_.lock();
 }
 
 void PointerData::UnlockAfterFork() {
     frame_mutex_.unlock();
-    pointer_mutex_.unlock();
+    UnlockAllShards();
 }
 
 bool PointerData::MightContain(const void* ptr) const {
@@ -518,17 +562,19 @@ void PointerData::MarkPointerFilter(const void* ptr) {
             1ULL << ((hash >> 22) & 63), std::memory_order_relaxed);
 }
 
-// Caller holds pointer_mutex_. Takes frame_mutex_ (pointer -> frame is the only
-// order used anywhere in this file).
-void PointerData::MaybeRecordPeakSnapshotLocked() {
-    // A final snapshot is never replaced, not even by a stalled sampler's
-    // fallback below: first-crossing retention promises exactly one stack walk
-    // for the run, and the walk is the cost the mode exists to avoid.
-    if (peak_snapshot_final_) {
-        return;
-    }
+// Caller holds no shard lock. Takes every shard, then frame_mutex_ (shards ->
+// frame is the only order used anywhere in this file).
+//
+// Called after the allocation that crossed the threshold has already released
+// its shard, so the snapshot describes the tracker a moment later than that
+// allocation rather than exactly at it. That is the price of not holding a
+// process-wide lock on the allocation path, and it is within the slack the
+// report already documents: the tracked and observed criteria peak at different
+// instants anyway, and the totals stored beside the list are read here, under
+// every shard, so they stay consistent with the list itself.
+void PointerData::MaybeRecordPeakSnapshot(size_t tracked_total) {
     if (!(g_debug->config().options() & RECORD_MEMORY_PEAK) ||
-        peak_tot <= next_peak_record_threshold_) {
+        tracked_total <= next_peak_record_threshold_.load(std::memory_order_relaxed)) {
         return;
     }
     // Once the evaluator-visible footprint has produced a snapshot, it owns the
@@ -544,6 +590,24 @@ void PointerData::MaybeRecordPeakSnapshotLocked() {
         !ObservedPeakSamplerInstance().Stalled()) {
         return;
     }
+    AllShardsGuard shard_guard(this);
+    // Everything above was tested without a lock, so several threads can arrive
+    // here for the same crossing. Re-tested under the shards, both conditions
+    // are decided once: otherwise every one of those threads would walk the
+    // live set and rebuild the snapshot.
+    //
+    // A final snapshot is never replaced, not even by a stalled sampler's
+    // fallback above: first-crossing retention promises exactly one stack walk
+    // for the run, and the walk is the cost the mode exists to avoid. The hot
+    // path does not need to re-test this, because finalization pins the
+    // threshold out of reach.
+    if (peak_snapshot_final_) {
+        return;
+    }
+    const size_t peak_now = peak_tot.load(std::memory_order_relaxed);
+    if (peak_now <= next_peak_record_threshold_.load(std::memory_order_relaxed)) {
+        return;
+    }
     const bool retained =
             TakePeakSnapshotLocked(PeakSnapshotSource::Tracked, nullptr, nullptr);
     if (tracked_peak_once_) {
@@ -556,19 +620,18 @@ void PointerData::MaybeRecordPeakSnapshotLocked() {
             // describes the floor crossing from here on; the run's exact maximum
             // still comes from the counters, which keep updating.
             peak_snapshot_final_ = true;
-            next_peak_record_threshold_ = SIZE_MAX;
+            next_peak_record_threshold_.store(SIZE_MAX, std::memory_order_relaxed);
         }
         return;
     }
-    if (peak_record_step_bytes_ == 0) {
-        next_peak_record_threshold_ = peak_tot;
-    } else {
-        next_peak_record_threshold_ =
-                NextPeakThreshold(peak_tot, peak_record_step_bytes_);
-    }
+    next_peak_record_threshold_.store(
+            peak_record_step_bytes_ == 0
+                    ? peak_now
+                    : NextPeakThreshold(peak_now, peak_record_step_bytes_),
+            std::memory_order_relaxed);
 }
 
-// Caller holds pointer_mutex_.
+// Caller holds every shard lock.
 bool PointerData::TakePeakSnapshotLocked(
         PeakSnapshotSource source, const ObservedMemSample* observed,
         PeakProcContext* proc) {
@@ -589,9 +652,9 @@ bool PointerData::TakePeakSnapshotLocked(
         return false;
     }
     peak_list = std::move(next_peak_list);
-    peak_list_host = current_host;
-    peak_list_dma = current_dma;
-    peak_list_tot = current_used;
+    peak_list_host = current_host.load(std::memory_order_relaxed);
+    peak_list_dma = current_dma.load(std::memory_order_relaxed);
+    peak_list_tot = current_used.load(std::memory_order_relaxed);
     peak_snapshot_source_ = source;
     if (observed != nullptr) {
         peak_observed_rss_ = observed->rss_bytes;
@@ -610,8 +673,12 @@ bool PointerData::TakePeakSnapshotLocked(
         peak_mappings = std::move(proc->mappings);
         peak_map_totals = proc->totals;
     }
-    peak_live_pointers = pointers_.size();
-    peak_pointer_buckets = pointers_.bucket_count();
+    peak_live_pointers = 0;
+    peak_pointer_buckets = 0;
+    for (const PointerShard& shard : shards_) {
+        peak_live_pointers += shard.pointers.size();
+        peak_pointer_buckets += shard.pointers.bucket_count();
+    }
     peak_unique_stacks = frames_.size();
     peak_stack_pc_bytes = 0;
     for (const auto& frame : frames_) {
@@ -639,7 +706,7 @@ bool PointerData::RecordObservedPeak(const ObservedMemSample& sample) {
     // allocating thread a stall.
     PeakProcContext proc;
     CollectPeakProcContext(&proc);
-    std::lock_guard<std::mutex> pointer_guard(pointer_mutex_);
+    AllShardsGuard shard_guard(this);
     // Claimed before the snapshot is attempted, not after: a snapshot skipped
     // because nothing carries a stack yet must still stop the allocation path
     // from installing a tracked-bytes peak that the report would then present
@@ -678,48 +745,69 @@ void PointerData::Add(
     // A displaced entry's stack reference is released after the pointer lock is
     // dropped, matching Remove()/Remap()'s ordering.
     size_t displaced_hash_index = 0;
+    size_t tracked_total = 0;
+    bool raised_peak = false;
     {
-        std::lock_guard<std::mutex> pointer_guard(pointer_mutex_);
+        // Read before the shard is locked. gettimeofday() is a vDSO read rather
+        // than a syscall, but it still lengthened the one critical section every
+        // allocating thread contends for, and nothing about reading the clock
+        // needs the lock held.
         struct timeval tv;
         gettimeofday(&tv, NULL);
-        uintptr_t mangled_ptr = ManglePointer(reinterpret_cast<uintptr_t>(ptr));
+        const uintptr_t mangled_ptr = ManglePointer(reinterpret_cast<uintptr_t>(ptr));
+        PointerShard& shard = ShardFor(mangled_ptr);
+        std::lock_guard<std::mutex> shard_guard(shard.mutex);
 
         // This address may still carry a record: a DMA descriptor number gets
         // recycled by the kernel, and a free/munmap this build does not
         // interpose (a direct syscall, or one made before the hook installed)
-        // leaves a stale entry behind. A bare pointers_[key] assignment would
+        // leaves a stale entry behind. A bare pointers[key] assignment would
         // then add the new size without ever subtracting the old one, drifting
         // current_used upward for the rest of the run and leaking the old
         // stack's frames_ entry. Reverse the displaced record instead.
-        auto displaced = pointers_.find(mangled_ptr);
-        if (displaced != pointers_.end()) {
+        //
+        // The displaced entry is necessarily in this same shard: it is keyed by
+        // the same address.
+        auto displaced = shard.pointers.find(mangled_ptr);
+        if (displaced != shard.pointers.end()) {
             const size_t displaced_size = displaced->second.size;
-            current_used -= displaced_size;
-            size_t* displaced_current =
+            current_used.fetch_sub(displaced_size, std::memory_order_relaxed);
+            std::atomic<size_t>* displaced_current =
                     (displaced->second.mem_type == DMA) ? &current_dma : &current_host;
-            *displaced_current -= displaced_size;
+            displaced_current->fetch_sub(displaced_size, std::memory_order_relaxed);
             displaced_hash_index = displaced->second.hash_index;
-            pointers_.erase(displaced);
+            shard.pointers.erase(displaced);
         }
 
-        pointers_[mangled_ptr] = PointerInfoType{tracked_size, hash_index, type, tv};
+        shard.pointers[mangled_ptr] =
+                PointerInfoType{tracked_size, hash_index, type, tv};
         MarkPointerFilter(ptr);
-        current_used += tracked_size;
-        size_t* current = (type == DMA) ? &current_dma : &current_host;
-        size_t* peak = (type == DMA) ? &peak_dma : &peak_host;
-        *current += tracked_size;
-        if (*current > *peak) {
-            *peak = *current;
-        }
-        if (peak_tot < current_used) {
-            peak_tot = current_used;
-            // Deliberately not gated on this allocation having captured a stack.
-            // Requiring that made the snapshot depend on which allocation happened
-            // to cross the threshold, so with capture sampling enabled it almost
-            // never refreshed and the report's headline total stayed at an early,
-            // much lower moment.
-            MaybeRecordPeakSnapshotLocked();
-        }
+        tracked_total =
+                current_used.fetch_add(tracked_size, std::memory_order_relaxed) +
+                tracked_size;
+        std::atomic<size_t>* current = (type == DMA) ? &current_dma : &current_host;
+        std::atomic<size_t>* peak = (type == DMA) ? &peak_dma : &peak_host;
+        RaisePeak(
+                peak,
+                current->fetch_add(tracked_size, std::memory_order_relaxed) +
+                        tracked_size);
+        raised_peak = RaisePeak(&peak_tot, tracked_total);
+    }
+    // Both of these need a lock this thread must not be holding: the snapshot
+    // needs every shard, and releasing a stack needs frame_mutex_.
+    //
+    // Gated on this allocation being the one that raised the peak, not merely on
+    // the total being above the threshold: otherwise every allocation in flight
+    // when the threshold is crossed would take all the shards only to discover
+    // the snapshot was already refreshed.
+    //
+    // Deliberately not gated on this allocation having captured a stack.
+    // Requiring that made the snapshot depend on which allocation happened to
+    // cross the threshold, so with capture sampling enabled it almost never
+    // refreshed and the report's headline total stayed at an early, much lower
+    // moment.
+    if (raised_peak) {
+        MaybeRecordPeakSnapshot(tracked_total);
     }
     if (displaced_hash_index > kBacktraceEmptyIndex) {
         RemoveBacktrace(displaced_hash_index);
@@ -733,66 +821,80 @@ void PointerData::Remap(const void* old_ptr, const void* new_ptr, size_t new_siz
     // A displaced destination entry's stack reference is released after the
     // pointer lock is dropped, matching Remove()'s ordering.
     size_t displaced_hash_index = 0;
+    size_t tracked_total = 0;
+    bool raised_peak = false;
     {
-        std::lock_guard<std::mutex> pointer_guard(pointer_mutex_);
         const uintptr_t old_key = ManglePointer(reinterpret_cast<uintptr_t>(old_ptr));
-        auto entry = pointers_.find(old_key);
-        if (entry == pointers_.end()) {
+        const uintptr_t new_key = ManglePointer(reinterpret_cast<uintptr_t>(new_ptr));
+        // The only operation that spans two shards. Both are taken in ascending
+        // index order -- the same order LockAllShards() uses -- so it can never
+        // deadlock against another remap or against a whole-tracker lock.
+        PointerShard& old_shard = ShardFor(old_key);
+        PointerShard& new_shard = ShardFor(new_key);
+        std::unique_lock<std::mutex> first_guard;
+        std::unique_lock<std::mutex> second_guard;
+        if (&old_shard == &new_shard) {
+            first_guard = std::unique_lock<std::mutex>(old_shard.mutex);
+        } else if (&old_shard < &new_shard) {
+            first_guard = std::unique_lock<std::mutex>(old_shard.mutex);
+            second_guard = std::unique_lock<std::mutex>(new_shard.mutex);
+        } else {
+            first_guard = std::unique_lock<std::mutex>(new_shard.mutex);
+            second_guard = std::unique_lock<std::mutex>(old_shard.mutex);
+        }
+
+        auto entry = old_shard.pointers.find(old_key);
+        if (entry == old_shard.pointers.end()) {
             return;
         }
         PointerInfoType info = entry->second;
         const size_t old_size = info.size;
         info.size = new_size;
-        pointers_.erase(entry);
+        old_shard.pointers.erase(entry);
 
         // mremap with MREMAP_FIXED unmaps the destination range, so a tracked
         // mapping may already live there. Reverse its accounting instead of
         // letting the assignment drop it: otherwise its bytes stay in
         // current_used forever (permanent upward drift) and its unique-stack
         // entry is never released.
-        const uintptr_t new_key = ManglePointer(reinterpret_cast<uintptr_t>(new_ptr));
-        auto displaced = pointers_.find(new_key);
-        if (displaced != pointers_.end()) {
+        auto displaced = new_shard.pointers.find(new_key);
+        if (displaced != new_shard.pointers.end()) {
             const size_t displaced_size = displaced->second.size;
-            current_used -= displaced_size;
+            current_used.fetch_sub(displaced_size, std::memory_order_relaxed);
             if (displaced->second.mem_type == DMA) {
-                current_dma -= displaced_size;
+                current_dma.fetch_sub(displaced_size, std::memory_order_relaxed);
             } else {
-                current_host -= displaced_size;
+                current_host.fetch_sub(displaced_size, std::memory_order_relaxed);
             }
             displaced_hash_index = displaced->second.hash_index;
-            pointers_.erase(displaced);
+            new_shard.pointers.erase(displaced);
         }
 
-        pointers_[new_key] = info;
+        new_shard.pointers[new_key] = info;
+        std::atomic<size_t>* current =
+                info.mem_type == DMA ? &current_dma : &current_host;
+        std::atomic<size_t>* peak = info.mem_type == DMA ? &peak_dma : &peak_host;
         if (new_size >= old_size) {
-            current_used += new_size - old_size;
-            if (info.mem_type == DMA) {
-                current_dma += new_size - old_size;
-            } else {
-                current_host += new_size - old_size;
-            }
+            const size_t growth = new_size - old_size;
+            tracked_total =
+                    current_used.fetch_add(growth, std::memory_order_relaxed) + growth;
+            RaisePeak(
+                    peak,
+                    current->fetch_add(growth, std::memory_order_relaxed) + growth);
         } else {
-            current_used -= old_size - new_size;
-            if (info.mem_type == DMA) {
-                current_dma -= old_size - new_size;
-            } else {
-                current_host -= old_size - new_size;
-            }
+            const size_t shrink = old_size - new_size;
+            tracked_total =
+                    current_used.fetch_sub(shrink, std::memory_order_relaxed) - shrink;
+            current->fetch_sub(shrink, std::memory_order_relaxed);
         }
-        size_t* peak = info.mem_type == DMA ? &peak_dma : &peak_host;
-        size_t current = info.mem_type == DMA ? current_dma : current_host;
-        if (current > *peak) {
-            *peak = current;
-        }
-        if (current_used > peak_tot) {
-            peak_tot = current_used;
-            // Growing a mapping is the usual reason to call mremap, so a peak
-            // reached this way must be snapshotted too; otherwise the report
-            // keeps the pre-mremap mapping and understates the peak.
-            MaybeRecordPeakSnapshotLocked();
-        }
+        raised_peak = RaisePeak(&peak_tot, tracked_total);
         MarkPointerFilter(new_ptr);
+    }
+    if (raised_peak) {
+        // Growing a mapping is the usual reason to call mremap, so a peak
+        // reached this way must be snapshotted too; otherwise the report keeps
+        // the pre-mremap mapping and understates the peak.
+        MaybeRecordPeakSnapshot(tracked_total);
     }
     if (displaced_hash_index > kBacktraceEmptyIndex) {
         RemoveBacktrace(displaced_hash_index);
@@ -856,30 +958,36 @@ size_t PointerData::AddBacktrace(size_t num_frames, size_t size_bytes) {
 }
 
 bool PointerData::TakeEntry(const void* ptr, PointerInfoType* info) {
-    std::lock_guard<std::mutex> pointer_guard(pointer_mutex_);
     const uintptr_t mangled_ptr = ManglePointer(reinterpret_cast<uintptr_t>(ptr));
-    auto entry = pointers_.find(mangled_ptr);
-    if (entry == pointers_.end()) {
+    PointerShard& shard = ShardFor(mangled_ptr);
+    std::lock_guard<std::mutex> shard_guard(shard.mutex);
+    auto entry = shard.pointers.find(mangled_ptr);
+    if (entry == shard.pointers.end()) {
         // No tracked pointer.
         return false;
     }
     if (info != nullptr) {
         *info = entry->second;
     }
-    current_used -= entry->second.size;
-    size_t* target = (entry->second.mem_type == DMA) ? &current_dma : &current_host;
-    *target -= entry->second.size;
-    pointers_.erase(entry);
+    const size_t size = entry->second.size;
+    current_used.fetch_sub(size, std::memory_order_relaxed);
+    std::atomic<size_t>* target =
+            (entry->second.mem_type == DMA) ? &current_dma : &current_host;
+    target->fetch_sub(size, std::memory_order_relaxed);
+    shard.pointers.erase(entry);
     return true;
 }
 
 void PointerData::RestoreEntry(const void* ptr, const PointerInfoType& info) {
-    std::lock_guard<std::mutex> pointer_guard(pointer_mutex_);
-    pointers_[ManglePointer(reinterpret_cast<uintptr_t>(ptr))] = info;
+    const uintptr_t mangled_ptr = ManglePointer(reinterpret_cast<uintptr_t>(ptr));
+    PointerShard& shard = ShardFor(mangled_ptr);
+    std::lock_guard<std::mutex> shard_guard(shard.mutex);
+    shard.pointers[mangled_ptr] = info;
     MarkPointerFilter(ptr);
-    current_used += info.size;
-    size_t* current = (info.mem_type == DMA) ? &current_dma : &current_host;
-    *current += info.size;
+    current_used.fetch_add(info.size, std::memory_order_relaxed);
+    std::atomic<size_t>* current =
+            (info.mem_type == DMA) ? &current_dma : &current_host;
+    current->fetch_add(info.size, std::memory_order_relaxed);
     // Peaks are deliberately not re-evaluated: this restores a state that was
     // already accounted for, so it can never establish a new peak.
 }
@@ -919,44 +1027,53 @@ void PointerData::RemoveBacktrace(size_t hash_index) {
     }
 }
 
+// Caller holds every shard lock and frame_mutex_: this walks the whole live set.
 void PointerData::GetList(
         std::vector<ListInfoType>* list, bool only_with_backtrace, Pred pred,
         OmittedStats* omitted) {
-    for (auto& entry : pointers_) {
-        // 舍弃没有堆栈的 pointer
-        size_t hash_index = entry.second.hash_index;
-        if (hash_index <= kBacktraceEmptyIndex && only_with_backtrace) {
-            if (omitted != nullptr) {
-                ++omitted->count;
-                omitted->bytes += entry.second.RealSize();
+    for (const PointerShard& shard : shards_) {
+        for (const auto& entry : shard.pointers) {
+            // 舍弃没有堆栈的 pointer
+            size_t hash_index = entry.second.hash_index;
+            if (hash_index <= kBacktraceEmptyIndex && only_with_backtrace) {
+                if (omitted != nullptr) {
+                    ++omitted->count;
+                    omitted->bytes += entry.second.RealSize();
+                }
+                continue;
             }
-            continue;
+
+            uintptr_t pointer = DemanglePointer(entry.first);
+            auto frame_entry = frames_.find(hash_index);
+            FrameInfoType* frame_info =
+                    frame_entry == frames_.end() ? nullptr : &frame_entry->second;
+            auto backtrace_entry = backtraces_info_.find(hash_index);
+            std::shared_ptr<std::vector<SymbolizedFrame>> backtrace_info =
+                    backtrace_entry == backtraces_info_.end() ? nullptr
+                                                             : backtrace_entry->second;
+
+            list->emplace_back(ListInfoType{
+                    pointer,
+                    1,
+                    entry.second.RealSize(),
+                    entry.second.mem_type,
+                    frame_info,
+                    frame_info == nullptr
+                            ? std::shared_ptr<const std::vector<uintptr_t>>{}
+                            : frame_info->frames,
+                    std::move(backtrace_info),
+                    frame_info == nullptr ? StackCaptureState::Empty
+                                          : frame_info->capture_state,
+                    static_cast<uint8_t>(
+                            frame_info == nullptr ? 0 : frame_info->terminal_error),
+                    entry.second.alloc_time});
         }
-
-        uintptr_t pointer = DemanglePointer(entry.first);
-        auto frame_entry = frames_.find(hash_index);
-        FrameInfoType* frame_info =
-                frame_entry == frames_.end() ? nullptr : &frame_entry->second;
-        auto backtrace_entry = backtraces_info_.find(hash_index);
-        std::shared_ptr<std::vector<SymbolizedFrame>> backtrace_info =
-                backtrace_entry == backtraces_info_.end() ? nullptr : backtrace_entry->second;
-
-        list->emplace_back(ListInfoType{
-                pointer,
-                1,
-                entry.second.RealSize(),
-                entry.second.mem_type,
-                frame_info,
-                frame_info == nullptr
-                        ? std::shared_ptr<const std::vector<uintptr_t>>{}
-                        : frame_info->frames,
-                std::move(backtrace_info),
-                frame_info == nullptr ? StackCaptureState::Empty : frame_info->capture_state,
-                static_cast<uint8_t>(
-                        frame_info == nullptr ? 0 : frame_info->terminal_error),
-                entry.second.alloc_time});
     }
 
+    // Sorted after the walk rather than per shard: the shard a pointer lands in
+    // is an implementation detail, so a report must not depend on it. Every
+    // comparator here is a total order down to the pointer value, which keeps
+    // the output identical to the single-map version.
     std::sort(list->begin(), list->end(), pred);
 }
 
@@ -1004,7 +1121,7 @@ void PointerData::GetUniqueList(
 }
 
 void PointerData::DumpLiveToFile(int fd, bool dump_peak) {
-    std::lock_guard<std::mutex> pointer_guard(pointer_mutex_);
+    AllShardsGuard shard_guard(this);
     std::lock_guard<std::mutex> frame_guard(frame_mutex_);
 
     std::vector<ListInfoType> list;
@@ -1025,16 +1142,16 @@ void PointerData::DumpLiveToFile(int fd, bool dump_peak) {
         dma_use = peak_list_dma;
     } else {
         // Only allocations that carry a stack. Listing stack-less ones emitted a
-        // two-line block per live pointer through unbuffered dprintf while
-        // pointer_mutex_, frame_mutex_ and the concurrent read lock were all
-        // held, so a process with many small live allocations blocked every
-        // allocation for a multi-megabyte write. They are summarised in one line
-        // below instead; exact totals come from the counters, not from the list.
+        // two-line block per live pointer through unbuffered dprintf while every
+        // shard, frame_mutex_ and the concurrent read lock were all held, so a
+        // process with many small live allocations blocked every allocation for a
+        // multi-megabyte write. They are summarised in one line below instead;
+        // exact totals come from the counters, not from the list.
         GetList(&list, true, [](const ListInfoType& a, const ListInfoType& b) {
             return a.alloc_time < b.alloc_time;
         }, &omitted);
-        host_use = current_host;
-        dma_use = current_dma;
+        host_use = current_host.load(std::memory_order_relaxed);
+        dma_use = current_dma.load(std::memory_order_relaxed);
     }
 
     // Resolve module identity for raw PCs once for the whole report rather than
@@ -1089,8 +1206,10 @@ void PointerData::DumpLiveToFile(int fd, bool dump_peak) {
         dprintf(fd,
                 "process_peak: host=%fMB dma=%fMB total=%fMB "
                 "(snapshot_total=%fMB, step=%fMB)\n",
-                peak_host / 1024.0 / 1024.0, peak_dma / 1024.0 / 1024.0,
-                peak_tot / 1024.0 / 1024.0, peak_list_tot / 1024.0 / 1024.0,
+                peak_host.load(std::memory_order_relaxed) / 1024.0 / 1024.0,
+                peak_dma.load(std::memory_order_relaxed) / 1024.0 / 1024.0,
+                peak_tot.load(std::memory_order_relaxed) / 1024.0 / 1024.0,
+                peak_list_tot / 1024.0 / 1024.0,
                 peak_record_step_bytes_ / 1024.0 / 1024.0);
         // Which watermark the stack list describes. Under first-crossing
         // retention it is the floor, not the maximum, so process_peak above and
@@ -1283,13 +1402,18 @@ void PointerData::DumpLiveToFile(int fd, bool dump_peak) {
 
     // What the tool itself costs the traced process. Reported so a RSS
     // difference against an unhooked baseline can be attributed instead of
-    // guessed. pointers_ carries one entry per live tracked allocation, so it
-    // scales with allocation count, not with allocation size, and is unaffected
-    // by BACKTRACE_MIN_SIZE.
+    // guessed. The shard maps carry one entry per live tracked allocation, so
+    // the cost scales with allocation count, not with allocation size, and is
+    // unaffected by BACKTRACE_MIN_SIZE.
     {
-        const size_t live = have_peak_rss ? peak_live_pointers : pointers_.size();
-        const size_t buckets =
-                have_peak_rss ? peak_pointer_buckets : pointers_.bucket_count();
+        size_t live_now = 0;
+        size_t buckets_now = 0;
+        for (const PointerShard& shard : shards_) {
+            live_now += shard.pointers.size();
+            buckets_now += shard.pointers.bucket_count();
+        }
+        const size_t live = have_peak_rss ? peak_live_pointers : live_now;
+        const size_t buckets = have_peak_rss ? peak_pointer_buckets : buckets_now;
         const size_t stacks = have_peak_rss ? peak_unique_stacks : frames_.size();
         const size_t pc_bytes = peak_stack_pc_bytes;
         // unordered_map node: key + value + forward pointer, rounded by the
@@ -1412,12 +1536,15 @@ void PointerData::DumpLiveToFile(int fd, bool dump_peak) {
 }
 
 void PointerData::DumpPeakInfo() {
-    std::lock_guard<std::mutex> pointer_guard(pointer_mutex_);
+    // No tracker lock: every value printed here is an atomic counter. Taking
+    // all 64 shards to read six words would stall every allocating thread for
+    // the duration of a printf.
     printf("\n+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++"
            "++++++++++++++++\n");
     printf("host peak used: %fMB, dma peak used %fMB, total peak used: %fMB\n\n",
-           peak_host / 1024.0 / 1024.0, peak_dma / 1024.0 / 1024.0,
-           peak_tot / 1024.0 / 1024.0);
+           peak_host.load(std::memory_order_relaxed) / 1024.0 / 1024.0,
+           peak_dma.load(std::memory_order_relaxed) / 1024.0 / 1024.0,
+           peak_tot.load(std::memory_order_relaxed) / 1024.0 / 1024.0);
     const ObservedSamplerStats sampler = ObservedPeakSamplerInstance().stats();
     if (sampler.samples != 0) {
         // Printed next to the tracked totals because they are different
