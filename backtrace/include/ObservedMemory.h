@@ -72,77 +72,153 @@ enum class GpuMmapSource : uint8_t {
     // No GPU device node whose mappings escape both other signals exists here,
     // so the figure is structurally zero and nothing is read.
     NotApplicable,
-    // /proc/self/smaps, per-region Size minus Rss.
-    Smaps,
+    // Region sizes from /proc/self/maps, every sample. Nothing else is read.
+    Maps,
 };
 
 const char* GpuMmapSourceName(GpuMmapSource source);
 
 // GPU device memory mapped into this process that neither of the other two
-// signals can see, summed out of already-read /proc/self/smaps text.
+// signals can see.
 //
 // Some GPU drivers hand out device memory by mmap'ing a character device rather
-// than a dmabuf, and map it PFN/IO rather than with struct pages behind it. Such
-// a region is invisible twice over: it is not a dmabuf, so the descriptor and
-// mapping passes above never see it, and the kernel excludes PFN/IO pages from
-// VmRSS precisely because there is no page to account. It is therefore absent
-// from rss_bytes and from dma_bytes at the same time, while an evaluator that
-// reads it reports it as part of the process footprint.
+// than a dmabuf. Such a region is invisible twice over: it is not a dmabuf, so
+// the descriptor and mapping passes above never see it, and on the platforms
+// that need this dimension the kernel does not count it in VmRSS either. It is
+// therefore absent from rss_bytes and from dma_bytes at the same time, while an
+// evaluator reading the process's real footprint reports it.
 //
-// `Size - Rss` per region rather than Size: a PFN/IO region has Rss == 0 and so
-// contributes its whole size, while a region the kernel *does* count in VmRSS
-// contributes only the part that is not already in rss_bytes. Summing plain Size
-// would double-count the second kind against rss_bytes.
+// Two corrections to what an earlier version of this claimed, both measured:
+//
+//   * It is not true that these regions carry Rss 0 in smaps. On an Adreno
+//     target an OpenCL buffer's kgsl region reports Rss equal to its full Size
+//     while VmRSS does not move at all -- per-VMA Rss counts pages that
+//     mm->rss_stat does not, so the two genuinely disagree for these mappings.
+//     A `Size - Rss` figure therefore evaluates to zero exactly where the real
+//     contribution is the full size.
+//   * It is not a property of the vendor. A second Adreno target, on a newer
+//     kernel and allocating through the driver's ioctl rather than OpenCL,
+//     counts the same kind of mapping in VmRSS as it faults.
+//
+// So the sampler reads the mapped size from /proc/self/maps and decides what to
+// do with it from observed VmRSS behaviour; see GpuMmapCache. smaps is not read.
 //
 // Scoped to the kgsl node. This is a deliberate asymmetry and not an oversight:
-// other drivers, ARM Mali (/dev/mali0) in particular, reserve one very large
-// sparse virtual range whose mapped size has no relation to the pages actually
-// backed, and their real working buffers are dmabufs that dma_bytes already
-// counts -- adding either would inflate the total rather than complete it.
-//
-// Carried parse state for the GPU scan.
+// dma-buf backed paths -- including the vendor OpenCL host-pointer imports and
+// EGL dma-buf image imports -- are already counted by dma_bytes, and importing
+// one was measured to add no mapping of its own. Other drivers reserve large
+// sparse ranges whose mapped size has no relation to the pages backed. Both
+// cases are set out in docs/GPU_MEMORY_ACCOUNTING.md.
+
+// Carried parse state for the smaps scan below.
 //
 // A region's residency arrives on a line *after* its header, so a reader that
-// refills its buffer part-way through a region has to keep this across refills --
-// the same reason ReadDmaBytesFromMaps carries its partial line.
+// refills its buffer part-way through a region has to keep this across refills.
 struct GpuRegionScan {
     bool in_gpu_region = false;
     size_t region_size = 0;
 };
 
-// Bytes one /proc/self/smaps line contributes. `line` is modified in place and
-// `scan` carries region state between calls. Exposed for the same reason as
-// DmaBytesFromMapsLine: so the exact region text a device emits is covered by a
-// test rather than by inspection.
-size_t GpuMmapBytesFromSmapsLine(char* line, GpuRegionScan* scan);
+// Bytes one /proc/self/smaps line contributes, as per-region `Size - Rss`.
+//
+// NOT on the sampling path: see above for why that quantity is not the one this
+// dimension needs. Kept because it is the only way to read per-region residency,
+// which is what a cross-check against an external sampler's own figures needs,
+// and because the parse is worth having covered by a test. `scan` carries region
+// state between calls; `line` is only read, never written.
+size_t GpuMmapBytesFromSmapsLine(const char* line, GpuRegionScan* scan);
 
-// The whole-buffer form of the above, for text that is already contiguous.
+// The whole-buffer form of the above. Takes a mutable buffer because it splits
+// `text` on newlines in place.
 size_t GpuMmapBytesFromSmapsText(char* text);
 
-// Carried state for the GPU pass, the same shape and for the same reason as
-// DmaMapCache below: the pass is expensive, so it runs only when it can move the
-// peak, and how stale the carried figure may get is bounded and reported.
+// Sums the GPU regions in a smaps-format file. Returns false only when the file
+// could not be opened, so "opened and found nothing" stays distinguishable from
+// "no accounting available". Exposed with an explicit path for the same reason as
+// ReadIonProcInfoBytesFrom: the kernels that emit these regions are not the
+// kernels a host test runs on, and an unreadable path is how a test reaches the
+// read-failure path at all.
+bool ReadGpuMmapBytesFrom(const char* path, size_t* bytes);
+
+// The size one /proc/self/maps line contributes: the region's full mapped size
+// if it is one of the device nodes, else 0.
 //
-// The cost here is worse than the mapping pass, and structurally so.
-// /proc/self/smaps is the most expensive file in procfs: the kernel walks every
-// PTE of every VMA in the process to produce the per-region Rss this needs, and
-// holds mmap_lock for the walk. Measured at ~25 ms per read for a ~460 MB
-// arm64 process, against ~240 us for a small one -- it scales with the mapped
-// footprint, so it is cheapest exactly where it matters least.
+// maps carries the same header lines as smaps, with the same paths and the same
+// address ranges, and costs ~240x less to read because the kernel does not walk
+// page tables to produce it. What it does not carry is per-region residency,
+// which is the only thing smaps is needed for -- and residency is exactly the
+// part that barely moves. See GpuMmapCache.
+size_t GpuMappedBytesFromMapsLine(const char* line);
+
+// Sums the device regions' mapped sizes in a maps-format file.
+bool ReadGpuMappedBytesFrom(const char* path, size_t* bytes);
+
+// One smaps reading of the three quantities the figure is computed from.
 //
-// Which is why `probed_absent` exists. The per-region name filter inside the
-// parse can only reject regions the kernel has already been made to produce, so
-// on a platform with no such device node the entire walk is paid to return zero.
-// The device node is therefore checked before the file is opened, once, and a
-// negative answer disables the pass for the life of the process.
+// `VmRSS` is supposed to equal the sum of per-VMA `Rss`. Where a device mapping's
+// pages are counted by the page-table walk that produces per-VMA `Rss` but not by
+// the `mm->rss_stat` counters behind `VmRSS`, the two diverge by exactly the
+// amount that is invisible to `rss_bytes` -- which is the quantity this dimension
+// exists to report. Measured on two targets of the same vendor that disagree:
+//
+//   * one reports the region's `Rss` as its full size while `VmRSS` never moves,
+//     and the divergence grows by exactly that size;
+//   * the other faults the region in later, and its `Rss` and `VmRSS` grow
+//     together, so the divergence stays at zero throughout.
+//
+// Later parts of the same vendor create no device mapping at all, and the other
+// vendor's parts count theirs in `VmRSS` at creation. All four fall out of the
+// same arithmetic without being special-cased. See
+// docs/GPU_MEMORY_ACCOUNTING.md.
+struct GpuSmapsReading {
+    // Sum of per-VMA Rss over every region.
+    size_t all_rss_bytes = 0;
+    // Sum of per-VMA Rss over device-node regions only.
+    size_t device_rss_bytes = 0;
+    // Sum of mapped size over device-node regions.
+    size_t device_mapped_bytes = 0;
+    bool valid = false;
+};
+
+// Reads the three sums from a smaps-format file. Exposed with an explicit path so
+// device region text can be covered by a test.
+bool ReadGpuSmapsReading(const char* path, GpuSmapsReading* into);
+
+// The figure to report, given a reading and the process's VmRSS.
+//
+// Bounded by the device regions' own Rss, so an unrelated source of divergence
+// cannot inflate it, and floored at zero, so the reverse divergence measured on
+// one vendor's parts -- `VmRSS` counting pages the per-VMA walk does not -- reports
+// nothing rather than underflowing.
+size_t GpuBytesFromReading(const GpuSmapsReading& reading, size_t vmrss_bytes);
+
+// Carried state for the GPU pass.
+//
+// The mapped total comes from /proc/self/maps every sample, which is cheap. The
+// reading above needs smaps, which is not: measured 2.4-10 ms against 27 us for
+// maps, because the kernel walks every PTE of every VMA to produce per-region
+// Rss. So smaps is read only when the device mapped total changes -- the event
+// that can change the answer -- and the figure is carried between those events.
+//
+// On a platform with no device node the pass stops at `probed_absent` and reads
+// neither file. Where device mappings exist but never change size, the smaps read
+// happens once for the run.
 struct GpuMmapCache {
+    // Last figure reported, and the largest ever reported.
     size_t bytes = 0;
     size_t max_bytes = 0;
-    size_t refreshes = 0;
-    unsigned samples_since_refresh = 0;
-    bool ever_ran = false;
+    // Device mapped total at the last smaps read, and whether one has happened.
+    size_t mapped_at_read = 0;
+    bool have_read = false;
+    // How many smaps reads the run paid, and how many failed.
+    size_t reads = 0;
+    size_t read_failures = 0;
     bool probed_absent = false;
 };
+
+// Whether this sample must pay for a smaps read, given the mapped total it just
+// read from maps. Pure, so the policy is testable without a device.
+bool GpuSampleNeedsRead(const GpuMmapCache& cache, size_t mapped_bytes);
 
 // Scratch state for one dmabuf measurement pass.
 //
@@ -252,6 +328,21 @@ struct ObservedMemSample {
 
 ObservedMemSample ReadObservedMemory(DmaInodeSet* set);
 
+// Whether this sample must pay for a residency calibration, given the mapped
+// total it just read. Pure, so the policy that decides how often the expensive
+// read happens can be tested exhaustively -- the surrounding pass cannot be,
+// because on any machine without the device node it returns before reaching it,
+// which is every host CI runner.
+bool GpuSampleNeedsCalibration(const GpuMmapCache& cache, size_t mapped);
+
+// Folds a completed calibration into the cache. `unaccounted` is what smaps
+// reported for the same regions whose mapped total is `mapped`, so the residency
+// the kernel already counts in VmRSS is their difference.
+void ApplyGpuCalibration(GpuMmapCache* cache, size_t mapped, size_t unaccounted);
+
+// The figure a sample reports for a mapped total, given the carried correction.
+size_t GpuBytesForMapped(const GpuMmapCache& cache, size_t mapped);
+
 // Reads the GPU mapping figure, honouring the GpuMmapCache gate. A null cache
 // forces the read, which is what a one-shot sample and every test wants.
 size_t ReadSelfGpuMmapBytes(ObservedMemSample* into);
@@ -336,11 +427,17 @@ struct ObservedSamplerStats {
     // the gate above can be judged rather than trusted.
     size_t map_passes = 0;
     size_t max_map_only_bytes = 0;
-    // The same two figures for the GPU pass. It is the most expensive of the
-    // three, so how often it ran is the first thing to check when the achieved
-    // cadence is below the requested one.
-    size_t gpu_passes = 0;
+    // Largest GPU figure any sample reported, and what the run concluded about
+    // whether VmRSS counts these mappings. The latter is reported because the
+    // figure means different things under the two answers, and "Undetermined"
+    // says the run never saw the mapped total grow.
     size_t max_gpu_bytes_seen = 0;
+    // How many smaps reads the run paid. The only cost this dimension can incur
+    // beyond a maps read, so it is reported rather than assumed small.
+    size_t gpu_reads = 0;
+    // Attempted reads that failed. A carried figure stays labelled as the smaps
+    // measurement it is, so this is the only place a failure becomes visible.
+    size_t gpu_read_failures = 0;
     // Wall time from the first sample to the last, so the cadence actually
     // achieved is visible next to the one requested.
     uint64_t span_us = 0;

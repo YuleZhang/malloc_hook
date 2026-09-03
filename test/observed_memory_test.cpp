@@ -22,6 +22,7 @@
 
 #include "Config.h"
 #include "ObservedMemory.h"
+#include "debug_disable.h"
 
 namespace {
 
@@ -33,8 +34,25 @@ size_t MapsLineBytes(const char* text, bool* saw_any) {
     return DmaBytesFromMapsLine(line, &g_set, saw_any);
 }
 
+// A writable directory that exists on the target, not just on a build host.
+// Android has no /tmp, so hardcoding it made every test below unrunnable on a
+// device -- which is where the device-only formats these tests encode actually
+// come from. TMPDIR is set on Android; /data/local/tmp is the fallback for a
+// shell that does not set it.
+const char* TempDir() {
+    const char* env = getenv("TMPDIR");
+    if (env != nullptr && env[0] != '\0') {
+        return env;
+    }
+    if (access("/data/local/tmp", W_OK) == 0) {
+        return "/data/local/tmp";
+    }
+    return "/tmp";
+}
+
 std::string WriteTempFile(const char* name, const char* contents) {
-    std::string path = std::string("/tmp/") + name + "." + std::to_string(getpid());
+    std::string path = std::string(TempDir()) + "/" + name + "." +
+                       std::to_string(getpid());
     FILE* file = fopen(path.c_str(), "w");
     assert(file != nullptr);
     fputs(contents, file);
@@ -174,9 +192,15 @@ void TestObservedSample() {
     assert(sample.rss_bytes > 0);
     assert(sample.total() >= sample.rss_bytes);
     // A host kernel exposes no dmabuf to this process, and that has to be
-    // reported as "no such accounting" rather than as a measured zero.
+    // reported as "no such accounting" rather than as a measured zero. All three
+    // real sources are accepted: a host runner reports None, Android reports
+    // FdAndMaps, and a HarmonyOS target reports IonProcInfo because it publishes
+    // the process-wide ION file. Omitting the third aborted this test on the only
+    // platform that takes that branch, which is also the only place it has ever
+    // run.
     assert(sample.dma_source == DmaSource::None ||
-           sample.dma_source == DmaSource::FdAndMaps);
+           sample.dma_source == DmaSource::FdAndMaps ||
+           sample.dma_source == DmaSource::IonProcInfo);
     if (sample.dma_source == DmaSource::None) {
         assert(sample.dma_bytes == 0);
     }
@@ -394,12 +418,19 @@ void TestSamplerLifecycle() {
     assert(stats.valid_samples >= 1);
     assert(stats.snapshots >= 1);
     assert(stats.peak_total_bytes > 0);
+    // Every part of the sum, not just the first two. This assertion is the only
+    // thing that ties ObservedMemSample::total() to what the sampler records, so
+    // omitting a term here lets that term be silently dropped from the peak
+    // criterion on the one platform where it is non-zero -- and pass on every
+    // platform where it is not.
     assert(stats.peak_total_bytes ==
-           stats.peak_total_rss_bytes + stats.peak_total_dma_bytes);
-    // The maximum of the sum can only be reached with each half at or below its
+           stats.peak_total_rss_bytes + stats.peak_total_dma_bytes +
+                   stats.peak_total_gpu_bytes);
+    // The maximum of the sum can only be reached with each part at or below its
     // own maximum.
     assert(stats.peak_total_rss_bytes <= stats.max_rss_bytes);
     assert(stats.peak_total_dma_bytes <= stats.max_dma_bytes);
+    assert(stats.peak_total_gpu_bytes <= stats.max_gpu_bytes);
     assert(!stats.dedup_overflowed);
 
     // Stop() is idempotent; finalization calls it on paths that may never have
@@ -478,6 +509,15 @@ void TestMapPassGate() {
     forced.rss_bytes = 1;
     ReadSelfDmaBytesGated(&g_set, &forced, nullptr, 0);
 
+    // Where the kernel publishes process-wide ION accounting, that one file is
+    // the whole answer and the descriptor and mapping passes never run -- so the
+    // gate below does not exist to be tested. A HarmonyOS target takes this
+    // branch, and it is the only platform that does, which is why asserting on
+    // the gate unconditionally aborted only there.
+    if (forced.dma_source == DmaSource::IonProcInfo) {
+        return;
+    }
+
     DmaMapCache cache;
     // First gated read must run the pass: nothing is carried yet, so skipping
     // would report a DMA figure of zero for a process that has buffers.
@@ -524,6 +564,96 @@ void TestMapPassGate() {
     assert(cache.refreshes > before);
     // ...and far less often than every sample, which is the point.
     assert(cache.refreshes - before <= 8);
+}
+
+void TestGpuNodePathMatching() {
+    // The path is matched as the region's whole sixth field, not as a substring
+    // of the line, because a substring test accepts regions that are not the
+    // device at all.
+
+    // An anonymous region named through PR_SET_VMA_ANON_NAME. The name is chosen
+    // by whoever mapped it and lands verbatim in the header line, so a substring
+    // test counts it -- and being a sparse reservation with Rss 0, it is counted
+    // in full. 512 MB of pure fiction, which is precisely the over-report the
+    // scan excludes Mali to avoid.
+    char anon_named[] =
+            "7000000000-7020000000 rw-p 00000000 00:00 0 "
+            "[anon:/dev/kgsl-3d0 shadow]\n"
+            "Rss:                   0 kB\n";
+    assert(GpuMmapBytesFromSmapsText(anon_named) == 0);
+
+    // An ordinary file whose name merely starts like the node.
+    char shim[] =
+            "7a1c000000-7a1c0f0000 r--p 00000000 fe:0b 4242 "
+            "/dev/kgsl-3d0-shim.bin\n"
+            "Rss:                   0 kB\n";
+    assert(GpuMmapBytesFromSmapsText(shim) == 0);
+
+    // A directory of that name, the case the earlier prefix match already
+    // rejected; kept so a future loosening cannot reintroduce it silently.
+    char kgsl_dir[] =
+            "72cba64000-72cbb64000 r--p 00000000 fe:0b 41709180 "
+            "/vendor/lib64/kgsl/libfoo.so\n"
+            "Rss:                  64 kB\n";
+    assert(GpuMmapBytesFromSmapsText(kgsl_dir) == 0);
+
+    // The real node still counts, in both spellings and with the suffix the
+    // kernel appends once the node has been unlinked.
+    char node[] =
+            "7a1c000000-7a1c800000 rw-s 00000000 00:0d 12345 /dev/kgsl-3d0\n"
+            "Rss:                   0 kB\n";
+    assert(GpuMmapBytesFromSmapsText(node) == 8u * 1024 * 1024);
+    char parent_node[] =
+            "7a1c000000-7a1c800000 rw-s 00000000 00:0d 12345 /dev/kgsl\n"
+            "Rss:                   0 kB\n";
+    assert(GpuMmapBytesFromSmapsText(parent_node) == 8u * 1024 * 1024);
+    char deleted[] =
+            "7a1c000000-7a1c800000 rw-s 00000000 00:0d 12345 "
+            "/dev/kgsl-3d0 (deleted)\n"
+            "Rss:                   0 kB\n";
+    assert(GpuMmapBytesFromSmapsText(deleted) == 8u * 1024 * 1024);
+
+    // A malformed Rss value drops the region. Counting it in full instead would
+    // read a parse failure as "nothing is resident", which is the most
+    // inflationary reading available.
+    char bad_rss[] =
+            "7a1c000000-7a1c800000 rw-s 00000000 00:0d 12345 /dev/kgsl-3d0\n"
+            "Rss:                  ?? kB\n";
+    assert(GpuMmapBytesFromSmapsText(bad_rss) == 0);
+    // ...and the dropped region must not leave the scan open, or the *next*
+    // field line would be taken for its residency.
+    char bad_rss_then_field[] =
+            "7a1c000000-7a1c800000 rw-s 00000000 00:0d 12345 /dev/kgsl-3d0\n"
+            "Rss:                  ?? kB\n"
+            "Rss:                   0 kB\n";
+    assert(GpuMmapBytesFromSmapsText(bad_rss_then_field) == 0);
+}
+
+void TestGpuReadFailurePath() {
+    // A path that cannot be opened is how a run reaches the read-failure branch
+    // without a device.
+    size_t bytes = 12345;
+    assert(!ReadGpuMmapBytesFrom("/nonexistent/smaps", &bytes));
+
+    // Reading a file that exists but holds no GPU region is a measured zero, and
+    // must be reported as success rather than as "no accounting available".
+    const std::string path = WriteTempFile(
+            "observed_gpu_probe",
+            "5566000000-5566100000 rw-p 00000000 00:00 0 \n"
+            "Rss:                1024 kB\n");
+    bytes = 999;
+    assert(ReadGpuMmapBytesFrom(path.c_str(), &bytes));
+    assert(bytes == 0);
+
+    // With a device region present the same reader returns it.
+    const std::string gpu_path = WriteTempFile(
+            "observed_gpu_probe_node",
+            "7a1c000000-7a1c800000 rw-s 00000000 00:0d 12345 /dev/kgsl-3d0\n"
+            "Rss:                   0 kB\n");
+    assert(ReadGpuMmapBytesFrom(gpu_path.c_str(), &bytes));
+    assert(bytes == 8u * 1024 * 1024);
+    unlink(path.c_str());
+    unlink(gpu_path.c_str());
 }
 
 void TestGpuMmapAccounting() {
@@ -644,11 +774,133 @@ void TestGpuMmapAccounting() {
     assert(GpuMmapBytesFromSmapsLine(orphan_rss, &orphaned) == 0);
 }
 
+void TestGpuBytesFromReading() {
+    // The figures below are the measured readings from four targets, so the
+    // arithmetic is checked against what devices actually report rather than
+    // against invented numbers. kB as reported, converted here.
+    const size_t K = 1024;
+
+    // Target A: the region's Rss is its full size and VmRSS never moves, so the
+    // per-VMA walk and VmRSS diverge by exactly the allocation. That divergence is
+    // the memory rss_bytes cannot see, and is what must be reported.
+    GpuSmapsReading a;
+    a.valid = true;
+    a.all_rss_bytes = 83332 * K;
+    a.device_rss_bytes = 65576 * K;
+    a.device_mapped_bytes = 74064 * K;
+    assert(GpuBytesFromReading(a, 17740 * K) == 65576u * K);
+
+    // Target B, before the region is faulted in: it has a mapping but no
+    // residency, and nothing diverges. Reporting its mapped size here would
+    // invent memory that is not backed yet.
+    GpuSmapsReading b1;
+    b1.valid = true;
+    b1.all_rss_bytes = 21520 * K;
+    b1.device_rss_bytes = 40 * K;
+    b1.device_mapped_bytes = 72000 * K;
+    // Bounded by the region's own Rss (40 kB), not by the 112 kB of unrelated
+    // divergence the process happens to carry.
+    assert(GpuBytesFromReading(b1, 21408 * K) == 40u * K);
+
+    // Target B, after faulting: its Rss and VmRSS grew together, so the
+    // divergence stays near zero. This is the case an inference over consecutive
+    // samples got wrong -- the mapping appears in one sample and the faulting
+    // happens in a later one, so at the growth step this target is
+    // indistinguishable from target A.
+    GpuSmapsReading b2;
+    b2.valid = true;
+    b2.all_rss_bytes = 87060 * K;
+    b2.device_rss_bytes = 65576 * K;
+    b2.device_mapped_bytes = 72000 * K;
+    const size_t b2_bytes = GpuBytesFromReading(b2, 86868 * K);
+    assert(b2_bytes == 192u * K);
+    assert(b2_bytes < 1u * 1024 * 1024);
+
+    // Target C, the other vendor: the divergence runs the *other* way, VmRSS
+    // counting pages the per-VMA walk does not. That is not this dimension's
+    // memory, and the figure must floor at zero rather than underflow.
+    GpuSmapsReading c;
+    c.valid = true;
+    c.all_rss_bytes = 30340 * K;
+    c.device_rss_bytes = 0;
+    c.device_mapped_bytes = 67984 * K;
+    assert(GpuBytesFromReading(c, 100680 * K) == 0);
+
+    // Bounded by the device regions' own Rss: an unrelated source of divergence
+    // must not be attributed here.
+    GpuSmapsReading d;
+    d.valid = true;
+    d.all_rss_bytes = 500 * K;
+    d.device_rss_bytes = 8 * K;
+    assert(GpuBytesFromReading(d, 100 * K) == 8u * K);
+
+    // An invalid reading is not a measured zero.
+    GpuSmapsReading none;
+    assert(GpuBytesFromReading(none, 100 * K) == 0);
+}
+
+void TestGpuReadPolicy() {
+    // Nothing mapped and nothing read: the expensive read buys nothing, which is
+    // what keeps a process that merely has the device node from paying for a
+    // dimension it does not use.
+    GpuMmapCache fresh;
+    assert(!GpuSampleNeedsRead(fresh, 0));
+
+    // First device mapping seen: read.
+    assert(GpuSampleNeedsRead(fresh, 64 * 1024 * 1024));
+
+    // After a read, a steady mapped total does not re-pay. This is the common
+    // case: a driver maps its working set once and holds it.
+    GpuMmapCache warm;
+    warm.have_read = true;
+    warm.mapped_at_read = 64 * 1024 * 1024;
+    assert(!GpuSampleNeedsRead(warm, 64 * 1024 * 1024));
+    for (int i = 0; i < 100; ++i) {
+        assert(!GpuSampleNeedsRead(warm, 64 * 1024 * 1024));
+    }
+
+    // Any change in the mapped total is the event that can change the answer, in
+    // either direction.
+    assert(GpuSampleNeedsRead(warm, 128 * 1024 * 1024));
+    assert(GpuSampleNeedsRead(warm, 32 * 1024 * 1024));
+    assert(GpuSampleNeedsRead(warm, 0));
+}
+
+void TestGpuMappedFromMaps() {
+    // maps carries the same header lines as smaps, so the same path rule applies
+    // -- including the rejections, which is what keeps the cheap per-sample read
+    // from admitting regions that are not the device.
+    assert(GpuMappedBytesFromMapsLine(
+                   "7a1c000000-7a1c800000 rw-s 00000000 00:0d 12345 "
+                   "/dev/kgsl-3d0") == 8u * 1024 * 1024);
+    assert(GpuMappedBytesFromMapsLine(
+                   "7000000000-7020000000 rw-p 00000000 00:00 0 "
+                   "[anon:/dev/kgsl-3d0 shadow]") == 0);
+    assert(GpuMappedBytesFromMapsLine(
+                   "7a1c000000-7a1c0f0000 r--p 00000000 fe:0b 4242 "
+                   "/dev/kgsl-3d0-shim.bin") == 0);
+    assert(GpuMappedBytesFromMapsLine(
+                   "7f0000000000-7f0000001000 rw-p 00000000 00:00 0") == 0);
+    assert(GpuMappedBytesFromMapsLine("garbage") == 0);
+    assert(GpuMappedBytesFromMapsLine(nullptr) == 0);
+
+    // Several device regions sum; unlike dmabufs they must not be deduplicated,
+    // since every mapping of a character device shares one inode.
+    const std::string path = WriteTempFile(
+            "observed_gpu_maps",
+            "7a1c000000-7a1c800000 rw-s 00000000 00:0d 12345 /dev/kgsl-3d0\n"
+            "7a2c000000-7a2c800000 rw-s 00000000 00:0d 12345 /dev/kgsl-3d0\n"
+            "5566000000-5566100000 rw-p 00000000 00:00 0 \n");
+    size_t bytes = 0;
+    assert(ReadGpuMappedBytesFrom(path.c_str(), &bytes));
+    assert(bytes == 16u * 1024 * 1024);
+    assert(!ReadGpuMappedBytesFrom("/nonexistent/maps", &bytes));
+    unlink(path.c_str());
+}
+
 void TestGpuPassGate() {
-    // On a host with no such device node the pass must report itself structurally
-    // inapplicable and, critically, never open /proc/self/smaps: the per-region
-    // name filter can only reject regions the kernel has already walked page
-    // tables to produce, so a "no match" answer there still costs the whole walk.
+    // On a host with no device node the pass must report itself structurally
+    // inapplicable and read neither /proc file.
     ObservedMemSample sample;
     sample.rss_bytes = 1;
     GpuMmapCache cache;
@@ -657,44 +909,25 @@ void TestGpuPassGate() {
         assert(bytes == 0);
         assert(sample.gpu_bytes == 0);
         assert(cache.probed_absent);
-        assert(cache.refreshes == 0);
-        // Once probed absent the pass is disabled for the run, so a later sample
-        // costs nothing at all rather than one access() each.
+        assert(!cache.have_read);
         ObservedMemSample again;
         again.rss_bytes = 1;
         assert(ReadSelfGpuMmapBytesGated(&again, &cache, 0) == 0);
-        assert(cache.refreshes == 0);
+        assert(!cache.have_read);
         return;
     }
-
-    // On a machine that does have the node, the gate must behave like the mapping
-    // pass: skip samples that cannot become the snapshot instant, refresh the ones
-    // that can, and never let the carried figure go stale for a whole run.
-    assert(cache.ever_ran);
-    assert(cache.refreshes == 1);
-    const size_t high_peak = static_cast<size_t>(1) << 60;
-    ObservedMemSample skipped;
-    skipped.rss_bytes = 1;
-    ReadSelfGpuMmapBytesGated(&skipped, &cache, high_peak);
-    assert(cache.refreshes == 1);
-    assert(skipped.gpu_bytes == cache.bytes);
-
-    ObservedMemSample candidate;
-    candidate.rss_bytes = 1;
-    ReadSelfGpuMmapBytesGated(&candidate, &cache, 0);
-    assert(cache.refreshes == 2);
-    assert(cache.samples_since_refresh == 0);
-
-    const size_t before = cache.refreshes;
-    for (int i = 0; i < 128; ++i) {
-        ObservedMemSample s;
-        s.rss_bytes = 1;
-        ReadSelfGpuMmapBytesGated(&s, &cache, high_peak);
+    // On a machine that does have the node, the sample reads maps. Whether it
+    // also paid for smaps depends on whether this process holds any device
+    // mapping at all -- a test binary holds none, and not paying there is the
+    // point, so both outcomes are correct and the figure must agree with them.
+    assert(sample.gpu_source == GpuMmapSource::Maps);
+    if (!cache.have_read) {
+        assert(sample.gpu_bytes == 0);
+        assert(cache.reads == 0);
+    } else {
+        assert(cache.reads >= 1);
+        assert(sample.gpu_bytes == cache.bytes);
     }
-    // Refreshed on its own, but far less often than every sample: this pass is the
-    // most expensive of the three and the quantity it reads moves in large steps.
-    assert(cache.refreshes > before);
-    assert(cache.refreshes - before <= 128 / 32 + 1);
 }
 
 }  // namespace
@@ -828,10 +1061,26 @@ void TestZeroIntervalDoesNotDivideByZero() {
 }
 
 int main() {
+    // The sampler thread calls DebugDisableSet so its own allocations stay out of
+    // the tracked totals, and that needs the pthread key the hook library creates
+    // at load. A standalone test is not loaded that way, so it has to create the
+    // key itself -- as task10_hook_boundary_test already does. Without it the key
+    // is an uninitialised pthread_key_t: bionic tolerates that, musl faults on it,
+    // so the sampler crashed only on the OHOS target.
+    if (!DebugDisableInitialize()) {
+        fprintf(stderr, "DebugDisableInitialize failed\n");
+        return 1;
+    }
+
     TestStatusFieldParsing();
     TestSelfRss();
     TestMapsDmaBufAccounting();
     TestGpuMmapAccounting();
+    TestGpuNodePathMatching();
+    TestGpuReadFailurePath();
+    TestGpuBytesFromReading();
+    TestGpuReadPolicy();
+    TestGpuMappedFromMaps();
     TestGpuPassGate();
     TestIonProcInfoAccounting();
     TestObservedSample();

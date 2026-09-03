@@ -350,6 +350,11 @@ bool ShouldBypassLibcInternalMmap(const void* caller) {
 
 }  // namespace
 
+// Cleared by the constructor below, once the loader has finished with this
+// library. Allocations that arrive before that point are still tracked, but any
+// work that needs a working libc runtime has to wait for it.
+static volatile bool in_preinit_phase = true;
+
 class AllocHook {
 public:
     AllocHook() {
@@ -426,9 +431,12 @@ AllocHook& AllocHook::inst() {
     return hook;
 }
 
-static volatile bool in_preinit_phase = true;
 __attribute__((constructor(201))) void mark_init_done() {
     in_preinit_phase = false;
+    // The loader is done with us, so pthread_create works from here on. If a
+    // preinit allocation already built the tracker, this is where its threads
+    // start; if not, AllocHook's constructor starts them itself.
+    debug_start_helper_threads();
 }
 
 // Hook-source capability contract:

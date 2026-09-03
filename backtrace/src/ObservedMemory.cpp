@@ -23,24 +23,65 @@ constexpr size_t kMinPeakStepBytes = 64 * 1024;
 // How many samples the carried mapping-pass figure may be reused for before it
 // is refreshed regardless of the peak gate.
 constexpr unsigned kMapRefreshSamples = 8;
-// The same bound for the GPU pass. Larger because that pass costs an order of
-// magnitude more than the mapping pass and the quantity it reads moves in a few
-// large steps rather than continuously: a driver maps its working set once and
-// holds it. The bound is what makes the staleness visible instead of unbounded --
-// GpuMmapCache::max_bytes reports how much was ever at stake.
-constexpr unsigned kGpuRefreshSamples = 32;
+// How many consistent growth steps decide whether VmRSS counts these mappings.
+// More than one, so a single step where a mapping appears in the same tick as
+// unrelated host allocation cannot settle it the wrong way.
+constexpr unsigned kGpuInclusionEvidence = 2;
 
 // Device nodes whose mappings escape both other signals. Only kgsl qualifies;
 // see GpuMmapBytesFromSmapsText for why adding Mali here would inflate rather
 // than complete the total.
 //
-// Matched with the "/dev/" prefix, not on "/kgsl" alone. A bare "/kgsl" also
-// matches any *directory* of that name -- "/vendor/lib64/kgsl/libfoo.so" -- and
-// such a mapping is file-backed, so the part of it that is not resident would be
-// added here as if it were unaccounted device memory. The device node itself is
-// always under /dev, including in the "(deleted)" spelling the kernel appends
-// when the node has been unlinked, so the longer needle loses nothing.
-constexpr char kGpuRegionNeedle[] = "/dev/kgsl";
+// Matched as the region's whole pathname, not as a substring of the line. A
+// substring test accepts two things that are not the device:
+//   "/dev/kgsl-3d0-shim.bin"      an ordinary file whose name starts the same way
+//   "[anon:/dev/kgsl-3d0 shadow]" an anonymous region named through
+//                                 PR_SET_VMA_ANON_NAME, whose name is chosen by
+//                                 whoever mapped it and lands verbatim in the
+//                                 header line
+// The second is the dangerous one: such a region can be a large sparse
+// reservation with Rss 0, which is counted in full -- exactly the over-report
+// this scan excludes ARM Mali to avoid, reintroduced through the name.
+constexpr char kGpuNodePaths[][16] = {"/dev/kgsl-3d0", "/dev/kgsl"};
+
+// Whether `path` names one of the device nodes above, allowing the " (deleted)"
+// suffix the kernel appends once the node has been unlinked.
+bool IsGpuNodePath(const char* path) {
+    for (const char* node : kGpuNodePaths) {
+        const size_t length = strlen(node);
+        if (strncmp(path, node, length) != 0) {
+            continue;
+        }
+        const char* rest = path + length;
+        if (*rest == '\0' || strcmp(rest, " (deleted)") == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// The pathname of a /proc maps-style header line: the sixth field, which begins
+// after the inode and runs to end of line. Returns nullptr when the region is
+// anonymous, i.e. when there is no sixth field at all.
+//
+// Taken positionally rather than by searching the line, so no text appearing in
+// an earlier field -- a device number, an offset -- can be mistaken for a path.
+const char* MapsLinePath(const char* line) {
+    // "start-end perms offset dev inode path": skip five whitespace-delimited
+    // fields, then the whitespace padding before the sixth.
+    for (int field = 0; field < 5; ++field) {
+        while (*line != '\0' && *line != ' ' && *line != '\t') {
+            ++line;
+        }
+        while (*line == ' ' || *line == '\t') {
+            ++line;
+        }
+        if (*line == '\0') {
+            return nullptr;
+        }
+    }
+    return line;
+}
 
 // Whether a device node this scan counts exists at all.
 //
@@ -65,55 +106,9 @@ bool GpuDeviceNodePresent() {
     return known == 1;
 }
 
-// Reads /proc/self/smaps and sums the GPU regions in it. Returns false only when
-// the file could not be opened, so "opened and found nothing" stays
-// distinguishable from "no accounting available".
-//
-// Streamed through a stack buffer rather than slurped whole, matching
-// ReadDmaBytesFromMaps: smaps for a process with thousands of mappings runs to
-// megabytes, and a shared static buffer large enough for it would both sit in
-// .bss for the life of every process and be corrupted by any second caller.
-// GpuRegionScan carries the only state a refill can split.
+// Convenience wrapper naming the only path the sampler ever reads.
 bool ReadGpuMmapBytesFromSmaps(size_t* bytes) {
-    const int fd = open("/proc/self/smaps", O_RDONLY | O_CLOEXEC);
-    if (fd < 0) {
-        return false;
-    }
-    size_t total = 0;
-    GpuRegionScan scan;
-    char buffer[16384];
-    size_t held = 0;
-    for (;;) {
-        const ssize_t bytes_read = read(fd, buffer + held, sizeof(buffer) - held - 1);
-        if (bytes_read <= 0) {
-            break;
-        }
-        const size_t available = held + static_cast<size_t>(bytes_read);
-        buffer[available] = '\0';
-        size_t start = 0;
-        for (;;) {
-            char* newline = static_cast<char*>(
-                    memchr(buffer + start, '\n', available - start));
-            if (newline == nullptr) {
-                break;
-            }
-            *newline = '\0';
-            total += GpuMmapBytesFromSmapsLine(buffer + start, &scan);
-            start = static_cast<size_t>(newline - buffer) + 1;
-        }
-        held = available - start;
-        if (held >= sizeof(buffer) - 1) {
-            // A single line longer than the buffer. Dropping it is preferable to
-            // parsing a fragment as if it were a whole region header.
-            held = 0;
-            scan = GpuRegionScan{};
-        } else if (held > 0) {
-            memmove(buffer, buffer + start, held);
-        }
-    }
-    close(fd);
-    *bytes = total;
-    return true;
+    return ReadGpuMmapBytesFrom("/proc/self/smaps", bytes);
 }
 
 // The kernel's getdents64 record layout. Declared here rather than taken from
@@ -365,15 +360,15 @@ const char* GpuMmapSourceName(GpuMmapSource source) {
     switch (source) {
         case GpuMmapSource::NotApplicable:
             return "not_applicable";
-        case GpuMmapSource::Smaps:
-            return "smaps";
+        case GpuMmapSource::Maps:
+            return "maps";
         case GpuMmapSource::Unprobed:
             break;
     }
     return "unprobed";
 }
 
-size_t GpuMmapBytesFromSmapsLine(char* line, GpuRegionScan* scan) {
+size_t GpuMmapBytesFromSmapsLine(const char* line, GpuRegionScan* scan) {
     if (line == nullptr || scan == nullptr) {
         return 0;
     }
@@ -383,7 +378,8 @@ size_t GpuMmapBytesFromSmapsLine(char* line, GpuRegionScan* scan) {
     // '-'. Field lines ("Size:", "Rss:", "VmFlags:") begin with a letter and
     // cannot.
     if (sscanf(line, "%" SCNxPTR "-%" SCNxPTR, &start, &end) == 2) {
-        scan->in_gpu_region = strstr(line, kGpuRegionNeedle) != nullptr;
+        const char* path = MapsLinePath(line);
+        scan->in_gpu_region = path != nullptr && IsGpuNodePath(path);
         scan->region_size = end > start ? static_cast<size_t>(end - start) : 0;
         return 0;
     }
@@ -391,11 +387,18 @@ size_t GpuMmapBytesFromSmapsLine(char* line, GpuRegionScan* scan) {
         return 0;
     }
     long rss_kb = 0;
-    sscanf(line + 4, "%ld", &rss_kb);
-    const size_t resident = static_cast<size_t>(rss_kb < 0 ? 0 : rss_kb) * 1024;
     // One Rss line per region; clearing here keeps a later field line of the same
-    // region from being read as a second one.
+    // region from being read as a second one. Done before the parse check so a
+    // line that fails to parse still closes the region rather than leaving it
+    // open for the next field line to be read as its residency.
     scan->in_gpu_region = false;
+    if (sscanf(line + 4, "%ld", &rss_kb) != 1) {
+        // No number where the kernel always puts one. Counting the region in
+        // full here would treat a parse failure as "nothing is resident", which
+        // is the most inflationary reading available; drop the region instead.
+        return 0;
+    }
+    const size_t resident = static_cast<size_t>(rss_kb < 0 ? 0 : rss_kb) * 1024;
     // Only the part VmRSS does not already hold, so rss_bytes + gpu_bytes never
     // counts the same page twice, and a fully resident region cannot underflow.
     return scan->region_size > resident ? scan->region_size - resident : 0;
@@ -422,15 +425,222 @@ size_t GpuMmapBytesFromSmapsText(char* text) {
     return total;
 }
 
+// Streamed through a stack buffer rather than slurped whole, matching
+// ReadDmaBytesFromMaps: smaps for a process with thousands of mappings runs to
+// megabytes, and a shared static buffer large enough for it would both sit in
+// .bss for the life of every process and be corrupted by any second caller.
+// GpuRegionScan carries the only state a refill can split.
+bool ReadGpuMmapBytesFrom(const char* path, size_t* bytes) {
+    const int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        return false;
+    }
+    size_t total = 0;
+    GpuRegionScan scan;
+    char buffer[16384];
+    size_t held = 0;
+    for (;;) {
+        const ssize_t bytes_read = read(fd, buffer + held, sizeof(buffer) - held - 1);
+        if (bytes_read <= 0) {
+            break;
+        }
+        const size_t available = held + static_cast<size_t>(bytes_read);
+        buffer[available] = '\0';
+        size_t start = 0;
+        for (;;) {
+            char* newline = static_cast<char*>(
+                    memchr(buffer + start, '\n', available - start));
+            if (newline == nullptr) {
+                break;
+            }
+            *newline = '\0';
+            total += GpuMmapBytesFromSmapsLine(buffer + start, &scan);
+            start = static_cast<size_t>(newline - buffer) + 1;
+        }
+        held = available - start;
+        if (held >= sizeof(buffer) - 1) {
+            // A single line longer than the buffer. Dropping it is preferable to
+            // parsing a fragment as if it were a whole region header.
+            held = 0;
+            scan = GpuRegionScan{};
+        } else if (held > 0) {
+            memmove(buffer, buffer + start, held);
+        }
+    }
+    close(fd);
+    *bytes = total;
+    return true;
+}
+
+size_t GpuMappedBytesFromMapsLine(const char* line) {
+    if (line == nullptr) {
+        return 0;
+    }
+    uintptr_t start = 0;
+    uintptr_t end = 0;
+    if (sscanf(line, "%" SCNxPTR "-%" SCNxPTR, &start, &end) != 2 || end <= start) {
+        return 0;
+    }
+    const char* path = MapsLinePath(line);
+    if (path == nullptr || !IsGpuNodePath(path)) {
+        return 0;
+    }
+    return static_cast<size_t>(end - start);
+}
+
+bool ReadGpuMappedBytesFrom(const char* path, size_t* bytes) {
+    const int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        return false;
+    }
+    size_t total = 0;
+    char buffer[16384];
+    size_t held = 0;
+    for (;;) {
+        const ssize_t bytes_read = read(fd, buffer + held, sizeof(buffer) - held - 1);
+        if (bytes_read <= 0) {
+            break;
+        }
+        const size_t available = held + static_cast<size_t>(bytes_read);
+        buffer[available] = '\0';
+        size_t start = 0;
+        for (;;) {
+            char* newline = static_cast<char*>(
+                    memchr(buffer + start, '\n', available - start));
+            if (newline == nullptr) {
+                break;
+            }
+            *newline = '\0';
+            total += GpuMappedBytesFromMapsLine(buffer + start);
+            start = static_cast<size_t>(newline - buffer) + 1;
+        }
+        held = available - start;
+        if (held >= sizeof(buffer) - 1) {
+            // A single line longer than the buffer. Dropping it is preferable to
+            // parsing a fragment as if it were a whole region header.
+            held = 0;
+        } else if (held > 0) {
+            memmove(buffer, buffer + start, held);
+        }
+    }
+    close(fd);
+    *bytes = total;
+    return true;
+}
+
+bool ReadGpuSmapsReading(const char* path, GpuSmapsReading* into) {
+    if (into == nullptr) {
+        return false;
+    }
+    *into = GpuSmapsReading{};
+    const int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        return false;
+    }
+    char buffer[16384];
+    size_t held = 0;
+    bool in_device = false;
+    for (;;) {
+        const ssize_t got = read(fd, buffer + held, sizeof(buffer) - held - 1);
+        if (got <= 0) {
+            break;
+        }
+        const size_t available = held + static_cast<size_t>(got);
+        buffer[available] = '\0';
+        size_t start = 0;
+        for (;;) {
+            char* newline =
+                    static_cast<char*>(memchr(buffer + start, '\n', available - start));
+            if (newline == nullptr) {
+                break;
+            }
+            *newline = '\0';
+            char* line = buffer + start;
+            start = static_cast<size_t>(newline - buffer) + 1;
+            uintptr_t lo = 0, hi = 0;
+            if (sscanf(line, "%" SCNxPTR "-%" SCNxPTR, &lo, &hi) == 2) {
+                const char* p = MapsLinePath(line);
+                in_device = p != nullptr && IsGpuNodePath(p);
+                if (in_device && hi > lo) {
+                    into->device_mapped_bytes += static_cast<size_t>(hi - lo);
+                }
+                continue;
+            }
+            if (strncmp(line, "Rss:", 4) != 0) {
+                continue;
+            }
+            long rss_kb = 0;
+            if (sscanf(line + 4, "%ld", &rss_kb) != 1 || rss_kb < 0) {
+                continue;
+            }
+            const size_t rss = static_cast<size_t>(rss_kb) * 1024;
+            into->all_rss_bytes += rss;
+            if (in_device) {
+                into->device_rss_bytes += rss;
+            }
+        }
+        held = available - start;
+        if (held >= sizeof(buffer) - 1) {
+            held = 0;
+            in_device = false;
+        } else if (held > 0) {
+            memmove(buffer, buffer + start, held);
+        }
+    }
+    close(fd);
+    into->valid = true;
+    return true;
+}
+
+size_t GpuBytesFromReading(const GpuSmapsReading& reading, size_t vmrss_bytes) {
+    if (!reading.valid) {
+        return 0;
+    }
+    // How much of what the per-VMA walk counted is absent from VmRSS. Floored at
+    // zero: on one vendor's parts the divergence runs the other way, VmRSS
+    // counting pages the walk does not, and that is not this dimension's memory.
+    const size_t divergence = reading.all_rss_bytes > vmrss_bytes
+            ? reading.all_rss_bytes - vmrss_bytes
+            : 0;
+    // Bounded by the device regions' own Rss, so any other source of divergence
+    // cannot be attributed here.
+    return divergence < reading.device_rss_bytes ? divergence
+                                                 : reading.device_rss_bytes;
+}
+
+bool GpuSampleNeedsRead(const GpuMmapCache& cache, size_t mapped_bytes) {
+    // Nothing mapped and nothing read: there is no device memory to attribute, so
+    // the expensive read buys nothing. This is what keeps a process that merely
+    // has the device node from paying for a dimension it does not use.
+    if (mapped_bytes == 0 && !cache.have_read) {
+        return false;
+    }
+    if (!cache.have_read) {
+        return true;
+    }
+    // The mapped total changing is the event that can change the answer.
+    return mapped_bytes != cache.mapped_at_read;
+}
+
 size_t ReadSelfGpuMmapBytes(ObservedMemSample* into) {
+    if (into == nullptr) {
+        return 0;
+    }
     return ReadSelfGpuMmapBytesGated(into, nullptr, 0);
 }
 
 size_t ReadSelfGpuMmapBytesGated(
         ObservedMemSample* into, GpuMmapCache* cache, size_t peak_total_bytes) {
-    // Every gate below is checked before the clock is read: on a platform without
-    // the device node this pass must cost nothing at all, and a clock_gettime per
-    // sample to time a no-op is exactly the kind of cost that accumulates unseen.
+    // peak_total_bytes is no longer consulted, and there is no longer a pass
+    // expensive enough to want gating. What used to gate the smaps read on
+    // "could this sample move the peak" was true on every sample of a growing
+    // run, so the costliest read in the sampler ran at full rate through the
+    // whole ramp to the peak. smaps is not read at all now: see GpuMmapCache.
+    (void)peak_total_bytes;
+
+    // Checked before the clock is read: on a platform without the device node
+    // this pass must cost nothing at all, and a clock_gettime per sample to time
+    // a no-op is exactly the kind of cost that accumulates unseen.
     if (cache != nullptr && cache->probed_absent) {
         into->gpu_source = GpuMmapSource::NotApplicable;
         into->gpu_bytes = 0;
@@ -444,43 +654,61 @@ size_t ReadSelfGpuMmapBytesGated(
         into->gpu_bytes = 0;
         return 0;
     }
-    if (cache != nullptr) {
-        // Compared against the peak *including* the carried figure, so the gate
-        // can only skip samples that stay below the peak even when credited with
-        // the last known GPU contribution.
-        const size_t provisional =
-                into->rss_bytes + into->dma_bytes + cache->bytes;
-        const bool run = !cache->ever_ran || provisional >= peak_total_bytes ||
-                         cache->samples_since_refresh >= kGpuRefreshSamples;
-        if (!run) {
-            into->gpu_bytes = cache->bytes;
-            into->gpu_source = GpuMmapSource::Smaps;
-            ++cache->samples_since_refresh;
-            return into->gpu_bytes;
-        }
-    }
+
     const uint64_t begin_us = MonotonicMicros();
-    size_t bytes = 0;
-    if (!ReadGpuMmapBytesFromSmaps(&bytes)) {
-        // The node exists but the file does not, which is not a real zero.
+    size_t mapped = 0;
+    const bool ok = ReadGpuMappedBytesFrom("/proc/self/maps", &mapped);
+    into->gpu_us = static_cast<uint32_t>(MonotonicMicros() - begin_us);
+    if (!ok) {
+        if (cache != nullptr) {
+            ++cache->read_failures;
+            if (cache->have_read) {
+                // A figure carried from an earlier successful read is still the
+                // measurement it was; labelling it Unprobed would report a real
+                // number as "nothing was measured", and because the sampler
+                // stores the source last-sample-wins, one transient failure
+                // would relabel the whole run.
+                into->gpu_bytes = cache->bytes;
+                into->gpu_source = GpuMmapSource::Maps;
+                return into->gpu_bytes;
+            }
+        }
+        // Nothing was ever read, so there is no figure -- and a zero here must
+        // not be mistaken for a measured zero.
+        into->gpu_bytes = 0;
         into->gpu_source = GpuMmapSource::Unprobed;
-        into->gpu_bytes = cache != nullptr ? cache->bytes : 0;
-        into->gpu_us = static_cast<uint32_t>(MonotonicMicros() - begin_us);
+        return 0;
+    }
+
+    into->gpu_source = GpuMmapSource::Maps;
+    if (cache == nullptr) {
+        // One-shot read with nowhere to carry state: pay smaps and answer exactly.
+        GpuSmapsReading r;
+        if (!ReadGpuSmapsReading("/proc/self/smaps", &r)) {
+            into->gpu_bytes = 0;
+            into->gpu_source = GpuMmapSource::Unprobed;
+            return 0;
+        }
+        into->gpu_bytes = GpuBytesFromReading(r, into->rss_bytes);
         return into->gpu_bytes;
     }
-    into->gpu_bytes = bytes;
-    into->gpu_source = GpuMmapSource::Smaps;
-    into->gpu_us = static_cast<uint32_t>(MonotonicMicros() - begin_us);
-    if (cache != nullptr) {
-        cache->bytes = bytes;
-        cache->ever_ran = true;
-        cache->samples_since_refresh = 0;
-        ++cache->refreshes;
-        if (bytes > cache->max_bytes) {
-            cache->max_bytes = bytes;
+    if (GpuSampleNeedsRead(*cache, mapped)) {
+        GpuSmapsReading r;
+        if (ReadGpuSmapsReading("/proc/self/smaps", &r)) {
+            cache->bytes = GpuBytesFromReading(r, into->rss_bytes);
+            cache->mapped_at_read = mapped;
+            cache->have_read = true;
+            ++cache->reads;
+            if (cache->bytes > cache->max_bytes) {
+                cache->max_bytes = cache->bytes;
+            }
+        } else {
+            ++cache->read_failures;
         }
     }
-    return bytes;
+    into->gpu_bytes = cache->bytes;
+    into->gpu_us = static_cast<uint32_t>(MonotonicMicros() - begin_us);
+    return into->gpu_bytes;
 }
 
 SampleSchedule NextSampleSchedule(
@@ -795,8 +1023,9 @@ ObservedSamplerStats ObservedPeakSampler::stats() const {
     out.total_gpu_us = total_gpu_us_.load(std::memory_order_relaxed);
     out.map_passes = map_cache_.refreshes;
     out.max_map_only_bytes = map_cache_.max_bytes;
-    out.gpu_passes = gpu_cache_.refreshes;
     out.max_gpu_bytes_seen = gpu_cache_.max_bytes;
+    out.gpu_reads = gpu_cache_.reads;
+    out.gpu_read_failures = gpu_cache_.read_failures;
     out.gpu_source =
             static_cast<GpuMmapSource>(gpu_source_.load(std::memory_order_relaxed));
     const uint64_t first = first_sample_us_.load(std::memory_order_relaxed);

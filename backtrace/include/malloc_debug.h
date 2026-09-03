@@ -4,6 +4,11 @@
 #include <cstddef>
 
 bool debug_initialize(void* init_space[]);
+// Starts the hook's helper threads. Separate from debug_initialize() because
+// pthread_create is not callable while the loader is still bringing the process
+// up, and the first tracked allocation can land in that window. The adapter owns
+// the timing; see the definition for what breaks otherwise. Idempotent.
+void debug_start_helper_threads();
 void debug_finalize();
 void debug_dump_heap(const char* file_name);
 void* debug_malloc(size_t size);

@@ -57,8 +57,15 @@ C/C++ 和当前线程；托管运行时栈、远程线程上下文和完整离�
 
 [`docs/USAGE.zh-CN.md`](docs/USAGE.zh-CN.md)
 
-英文入口仍为 [`README.md`](README.md)、[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
-和 [`docs/USAGE.md`](docs/USAGE.md)。
+GPU 设备内存的记账方式会随操作系统、厂商、驱动分配路径和内核版本变化，而采样器
+相加的那三个信号并没有干净地切分它。哪条路落在哪个信号里，以及确立这件事时踩到的
+厂商 API 坑：
+
+[`docs/GPU_MEMORY_ACCOUNTING.zh-CN.md`](docs/GPU_MEMORY_ACCOUNTING.zh-CN.md)
+
+英文入口仍为 [`README.md`](README.md)、[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)、
+[`docs/USAGE.md`](docs/USAGE.md) 和
+[`docs/GPU_MEMORY_ACCOUNTING.md`](docs/GPU_MEMORY_ACCOUNTING.md)。
 
 ## 配置项
 
