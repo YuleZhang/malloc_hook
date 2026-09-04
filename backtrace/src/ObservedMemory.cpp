@@ -32,6 +32,19 @@ constexpr unsigned kGpuInclusionEvidence = 2;
 // see GpuMmapBytesFromSmapsText for why adding Mali here would inflate rather
 // than complete the total.
 //
+// Two spellings, and the second is where the memory actually is. Measured on an
+// arm64/Adreno device running an OpenCL workload, /proc/self/maps carries both
+// of these at the same instant:
+//
+//   7a561d0000-7a561d8000 r--s 00000000 00:13 2348   /dev/kgsl-3d0
+//   77ba680000-77bb286000 rw-s 00000000 00:01 40690  /kgsl-3d0 (deleted)
+//
+// The first is the control node the process opened, 32 kB of it. The second is
+// the 12 MB the driver handed out: an unlinked inode on the driver's own
+// internal filesystem, which is why its device number differs and why its path
+// has no /dev component to match. Listing only the /dev spellings counted the
+// control node and missed the entire allocation.
+//
 // Matched as the region's whole pathname, not as a substring of the line. A
 // substring test accepts two things that are not the device:
 //   "/dev/kgsl-3d0-shim.bin"      an ordinary file whose name starts the same way
@@ -41,8 +54,11 @@ constexpr unsigned kGpuInclusionEvidence = 2;
 //                                 header line
 // The second is the dangerous one: such a region can be a large sparse
 // reservation with Rss 0, which is counted in full -- exactly the over-report
-// this scan excludes ARM Mali to avoid, reintroduced through the name.
-constexpr char kGpuNodePaths[][16] = {"/dev/kgsl-3d0", "/dev/kgsl"};
+// this scan excludes ARM Mali to avoid, reintroduced through the name. Adding
+// the driver-internal spellings keeps that rule: they are whole pathnames too,
+// so neither an "[anon:" name nor a longer filename can reach them.
+constexpr char kGpuNodePaths[][16] = {
+        "/dev/kgsl-3d0", "/dev/kgsl", "/kgsl-3d0", "/kgsl"};
 
 // Whether `path` names one of the device nodes above, allowing the " (deleted)"
 // suffix the kernel appends once the node has been unlinked.
