@@ -49,7 +49,9 @@ The completion callback receives a `StackResult` with the raw record, resolution
 
 `PointerData` owns the live-allocation table and peak counters. Host allocations may use Fast-only Poisson byte sampling; resource paths remain exact. A sampled host record stores an estimated tracked size and is removed through the same pointer identity path when the allocation is freed.
 
-Checkpoint reports are emitted by the exported `checkpoint(const char*)` entry point or by the configured signal. Peak snapshots are enabled by either `DUMP_PEAK_VALUE_MB`, which retains only the first crossing of that floor, or `ALLOC_HOOK_PEAK_SAMPLE_MS`, which chases the maximum and is throttled by `DUMP_PEAK_STEP_MB`.
+Checkpoint reports are emitted by the exported `checkpoint(const char*)` entry point or by the configured signal. Peak snapshots are enabled by either `DUMP_PEAK_VALUE_MB`, which retains only the first crossing of that floor, or `ALLOC_HOOK_PEAK_SAMPLE_MS` together with `DUMP_PEAK_STEP_MB`, which chases the maximum and rebuilds per step.
+
+A sampling interval on its own enables neither, and selects the observe-only probe instead: the sampler runs with no peak callback, the tracker is never constructed, and every interposer forwards to libc behind one latched gate, so what interposition costs follows what the run produces. Its boundary is in `backtrace/include/ObserveOnlyProbe.h`.
 
 The peak criterion is the maximum same-cycle sum of current `VmRSS`, dmabuf
 bytes, and GPU mappings covered by neither. The sampler runs on its own thread

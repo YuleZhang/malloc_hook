@@ -85,9 +85,9 @@ Additional public controls:
 
 | Variable | Purpose |
 | --- | --- |
-| `DUMP_PEAK_VALUE_MB` | Select first-crossing mode: enable peak recording and dump on exit, and retain one snapshot, taken the first time the peak criterion passes this floor. `0` means no floor and selects peak chasing. |
-| `DUMP_PEAK_STEP_MB` | Peak-chasing mode only: upper bound on growth before another peak snapshot; small peaks use 25% growth with a 64 KB floor. `0` snapshots every new peak. Unused in first-crossing mode. |
-| `ALLOC_HOOK_PEAK_SAMPLE_MS` | Millisecond interval for sampling the observed `VmRSS + DMA + GPU` total, which is the peak criterion in both modes. Setting it alone selects peak-chasing mode and enables peak recording and dump on exit. Defaults to the framework-published interval, else 50 ms. `0` forces the sampler off. |
+| `DUMP_PEAK_VALUE_MB` | A positive floor selects first-crossing mode: enable peak recording and dump on exit, and retain one snapshot, taken the first time the peak criterion passes it. `0` turns first-crossing off. |
+| `DUMP_PEAK_STEP_MB` | A positive step with `ALLOC_HOOK_PEAK_SAMPLE_MS` selects peak-chasing; alone it does nothing, and `0` (the default) turns chasing off. Upper bound on growth before the snapshot is rebuilt; small peaks use 25% growth with a 64 KB floor. Unused in first-crossing mode. |
+| `ALLOC_HOOK_PEAK_SAMPLE_MS` | Millisecond interval for sampling the observed `VmRSS + DMA + GPU` total, which is the peak criterion in every mode. Alone it selects the observe-only probe (section 3.1): measured and logged, nothing tracked. Defaults to the framework-published interval, else 50 ms once a report is configured. `0` forces the sampler off. |
 | `ALLOC_HOOK_DUMP_PREFIX` | Set the report path prefix. |
 | `BACKTRACE_DUMP_SIGNAL` | Override the platform-selected checkpoint signal. |
 | `ALLOC_HOOK_DEBUG` | Enable hook diagnostics on stderr. |
@@ -101,13 +101,15 @@ different mechanisms. The first probabilistically reduces host stack capture.
 The second starts a dedicated observer thread and does not change which
 allocations are tracked.
 
-Peak recording has two modes over one criterion. `DUMP_PEAK_VALUE_MB` selects
+The variables that are set decide whether this run tracks allocations at all.
+`ALLOC_HOOK_PEAK_SAMPLE_MS` alone measures the footprint and logs it at exit
+without tracking anything (section 3.1). Adding `DUMP_PEAK_STEP_MB` selects peak
+chasing, where the snapshot is rebuilt per step so it ends up at the run's
+maximum without knowing that maximum in advance. `DUMP_PEAK_VALUE_MB` selects
 first crossing: one snapshot per run, taken the first time the criterion passes
-the floor, after which no allocating thread is stalled by a snapshot again.
-`ALLOC_HOOK_PEAK_SAMPLE_MS` alone selects peak chasing: the snapshot is refreshed
-per `DUMP_PEAK_STEP_MB` so it ends up at the run's maximum, without needing to
-know that maximum in advance. Both write a report on exit and create the report
-directory.
+the floor, after which no allocating thread is stalled by a snapshot again. The
+two report modes write to the dump prefix on exit and create its directory; the
+probe writes no file.
 
 Each observer cycle reads current `VmRSS` from `/proc/self/status`, dmabuf bytes,
 and GPU device mappings covered by neither; the maximum of that same-cycle sum is
@@ -125,11 +127,11 @@ from `/proc/self/smaps`, and copies the live stack table. These operations are
 sequential, so `at_peak` means the same callback window rather than an atomic
 kernel snapshot.
 
-To retain a stack snapshot for every newly sampled maximum:
+To keep the snapshot close to the sampled maximum:
 
 ```sh
 export ALLOC_HOOK_PEAK_SAMPLE_MS=5   # use the external sampler's interval
-export DUMP_PEAK_STEP_MB=0
+export DUMP_PEAK_STEP_MB=1           # smallest useful step; 0 would turn chasing off
 export BACKTRACE_MIN_SIZE=1024
 ```
 
@@ -143,11 +145,42 @@ export BACKTRACE_MIN_SIZE=1024
 `snapshot_lag` in the report is how much the criterion kept growing after that
 snapshot, which is how much higher the floor could be set next run.
 
-`DUMP_PEAK_STEP_MB=0` is the exact but more expensive mode. Keep the default
-step when a bounded gap between `at_snapshot` and `max_of_sum` is acceptable.
-Set `BACKTRACE_MIN_SIZE=0` only if stacks for allocations below 1 KB are worth
-the extra overhead. Leave both byte-sampling variables unset (effective value
-`1`) for exact host attribution and unsuppressed eligible stacks.
+`0` turns each of these off rather than enabling it without a limit, so
+`DUMP_PEAK_STEP_MB=0` asks for no chasing and `DUMP_PEAK_VALUE_MB=0` for no
+first-crossing snapshot. A small positive step keeps the snapshot near the
+maximum, within the 25% growth the code applies to small peaks. Set
+`BACKTRACE_MIN_SIZE=0` only if stacks for allocations below 1 KB
+are worth the extra overhead. Leave both byte-sampling variables unset (effective
+value `1`) for exact host attribution and unsuppressed eligible stacks.
+
+### 3.1 Observe-only probe
+
+Set the sampling interval and nothing else to measure the footprint without
+tracking any allocation:
+
+```sh
+LD_PRELOAD="$PWD/out/lib/liballoc_hook.so" ALLOC_HOOK_PEAK_SAMPLE_MS=5 ./your_program
+```
+
+The summary goes to stderr at exit, in the shape and the yellow of the block a
+host framework prints for the same three quantities (see the README for the
+layout and how to read each row); colour is emitted only when stderr is a
+terminal. No report file is written, because nothing was tracked to put in one.
+
+Interposition still happens -- the loader has bound these symbols -- but every
+interposed call forwards straight to libc, so the run pays for the sampler thread
+plus one relaxed load per call instead of a tracked pointer and a captured stack
+per allocation: 68 ns per `malloc`/`free` pair against 60 ns unpreloaded, where
+tracking with no size filter costs 2762 ns.
+
+Use it to establish whether a process has a memory problem and how large it is.
+It captures no stacks, so it cannot attribute the total to a call site; it has no
+live allocation table, so `checkpoint()` writes the observed figures to the
+requested path instead of a heap report and the checkpoint signal is ignored
+rather than left to kill the process; a `fork` child prints nothing, and a process
+that leaves through `_exit()` or a fatal signal prints nothing at all. Add
+`DUMP_PEAK_STEP_MB` or `DUMP_PEAK_VALUE_MB` when the question becomes where the
+memory goes.
 
 ## 4. Preload a native process
 

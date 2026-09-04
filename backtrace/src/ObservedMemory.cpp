@@ -956,8 +956,7 @@ size_t NextPeakThreshold(size_t peak_bytes, size_t step_bytes) {
 bool ObservedPeakSampler::Start(
         unsigned interval_ms, size_t floor_bytes, size_t step_bytes, bool one_shot,
         PeakCallback on_new_peak) {
-    if (interval_ms == 0 || on_new_peak == nullptr ||
-        started_.load(std::memory_order_acquire)) {
+    if (interval_ms == 0 || started_.load(std::memory_order_acquire)) {
         return false;
     }
     interval_ms_ = interval_ms;
@@ -1073,7 +1072,13 @@ void ObservedPeakSampler::Run() {
     // Everything this thread allocates -- including the snapshot vector -- must
     // stay out of the tracked totals, or the sampler would show up in the
     // numbers it exists to measure.
-    DebugDisableSet(true);
+    //
+    // Skipped with no callback: nothing tracks in that mode, so there is nothing
+    // to exclude, and the tracker's thread-local key was never created -- writing
+    // to it would be a write to whatever key id 0 belongs to in this process.
+    if (on_new_peak_ != nullptr) {
+        DebugDisableSet(true);
+    }
 
     size_t next_threshold = floor_bytes_;
     // The grid the cadence is measured against. Anchored once here so every
@@ -1134,7 +1139,7 @@ void ObservedPeakSampler::Run() {
                         sample.dma_map_bytes, std::memory_order_relaxed);
                 peak_total_gpu_bytes_.store(
                         sample.gpu_bytes, std::memory_order_relaxed);
-                if (total > next_threshold) {
+                if (on_new_peak_ != nullptr && total > next_threshold) {
                     snapshots_.fetch_add(1, std::memory_order_relaxed);
                     const bool retained = on_new_peak_(sample);
                     // A one-shot run pins the threshold out of reach instead of

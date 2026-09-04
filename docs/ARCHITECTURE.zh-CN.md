@@ -48,8 +48,12 @@
 `PointerData` 管理存活分配表和峰值计数。Host 分配可以使用 Fast 专用 Poisson 字节采样；资源路径保持精确。采样 host 记录保存估算后的统计大小，释放时仍通过同一指针身份路径移除。
 
 检查点报告由导出的 `checkpoint(const char*)` 入口或配置的信号触发。峰值快照由
-`DUMP_PEAK_VALUE_MB` 或 `ALLOC_HOOK_PEAK_SAMPLE_MS` 任一启用：前者只保留首次越过该
-下限的那一张，后者追踪最大值并由 `DUMP_PEAK_STEP_MB` 限制重建频率。
+`DUMP_PEAK_VALUE_MB`，或 `ALLOC_HOOK_PEAK_SAMPLE_MS` 与 `DUMP_PEAK_STEP_MB` 一起启用：
+前者只保留首次越过该下限的那一张，后者追踪最大值并按步长重建。
+
+只给采样间隔时两者都不启用，选择的是只观测探测模式：采样器不带峰值回调运行，跟踪器
+根本不会被构造，所有插入点都在一个已锁定的开关后面直接转发给 libc，使符号插入的开销与
+这次运行的产出保持一致。该模式的边界见 `backtrace/include/ObserveOnlyProbe.h`。
 
 峰值判据是同一轮采样中当前 `VmRSS`、dmabuf 字节数和前两者未覆盖的 GPU 映射之和的
 最大值。采样器使用独立线程，因为页面驻留状态和设备内存所有权可能在没有任何分配

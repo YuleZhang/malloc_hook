@@ -103,10 +103,10 @@ build, run `cmake --build <build-dir> --target print_build_options`.
 
 | Variable | Default | Effect |
 | --- | --- | --- |
-| `DUMP_PEAK_VALUE_MB` | unset | Selects **first-crossing** mode: enables peak recording and dump on exit, and retains a single snapshot, taken the first time the peak criterion passes this many MB. One stack walk for the whole run, so nothing after the crossing stalls an allocating thread. `0` means no floor and selects peak-chasing instead. |
+| `DUMP_PEAK_VALUE_MB` | unset | A positive floor selects **first-crossing** mode: enables peak recording and dump on exit, and retains a single snapshot, taken the first time the peak criterion passes this many MB. One stack walk for the whole run, so nothing after the crossing stalls an allocating thread. `0` turns first-crossing off. |
 | `ALLOC_HOOK_DUMP_PREFIX` | `/data/local/tmp/trace/backtrace_heap` | Path prefix for reports. Files are named `<prefix>.exit.pid_<pid>.time_<t>.txt`, so a report can always be tied to the process that produced it. |
-| `DUMP_PEAK_STEP_MB` | `12` | Peak-chasing mode only: upper bound on the growth required before rebuilding the peak snapshot. For small peaks the code uses 25% growth, with a 64 KB floor; `0` snapshots on every new peak (much more expensive). Unused in first-crossing mode, which never rebuilds. |
-| `ALLOC_HOOK_PEAK_SAMPLE_MS` | the interval published by a host framework, else `50` when peak recording is on | Interval for sampling the process's *observed* footprint on a dedicated thread: current `VmRSS` from `/proc/self/status`, dmabuf bytes, and GPU device mappings covered by neither. Their same-sample sum is the peak criterion both modes compare against. Setting it without `DUMP_PEAK_VALUE_MB` selects **peak-chasing** mode, which also enables peak recording and dump on exit. `0` forces the sampler off, leaving the criterion on tracked allocation bytes. |
+| `DUMP_PEAK_STEP_MB` | `0` (off) | A positive step together with `ALLOC_HOOK_PEAK_SAMPLE_MS` selects **peak-chasing**; on its own it does nothing, and `0` turns chasing off. Upper bound on the growth required before the peak snapshot is rebuilt: a smaller step keeps the snapshot nearer the maximum and pays more stack walks, and for small peaks the code uses 25% growth with a 64 KB floor. Unused in first-crossing mode, which never rebuilds. |
+| `ALLOC_HOOK_PEAK_SAMPLE_MS` | the interval published by a host framework, else `50` when peak recording is on | Interval for sampling the process's *observed* footprint on a dedicated thread: current `VmRSS` from `/proc/self/status`, dmabuf bytes, and GPU device mappings covered by neither. Their same-sample sum is the peak criterion every mode compares against. **On its own it selects the observe-only probe**: the footprint is measured and logged, nothing is tracked. Add `DUMP_PEAK_STEP_MB` for peak-chasing, or `DUMP_PEAK_VALUE_MB` for first-crossing. `0` forces the sampler off, leaving the criterion on tracked allocation bytes. |
 | `BACKTRACE_MIN_SIZE` | OHOS: `40960`; elsewhere `1024` when peak recording is on, else `0` | Skip stack capture for allocations smaller than this. This is the main cost control: in a typical pipeline it filters >99% of allocations. |
 | `ALLOC_HOOK_CAPTURE_MODE` | `fast` | `fast` = bounded raw-PC capture with no symbolization on the allocation thread; the worker may resolve dynamic symbols. `accurate` = OS-specific backend. |
 | `ALLOC_HOOK_SAMPLING_INTERVAL_BYTES` | `1` (off) | Poisson-sample host allocations at this byte interval. Scales reported host sizes; does not affect DMA accounting. |
@@ -119,17 +119,29 @@ Naming note: the `DUMP_*` and `BACKTRACE_*` variables predate the
 `ALLOC_HOOK_*` prefix and are kept as-is because deployment scripts depend on
 them.
 
-### The two peak modes
+### Two kinds of hook behaviour
 
-Both modes measure the same criterion -- the observed total, `VmRSS` + dmabuf +
-GPU mappings, sampled from `/proc` on a dedicated thread -- and differ only in
-which crossing of it they keep the allocation stacks for. Which one runs is
-decided by which variable is set:
+Every mode measures the same criterion -- the observed total, `VmRSS` + dmabuf +
+GPU mappings, sampled from `/proc` on a dedicated thread. What differs is whether
+the run also *tracks allocations* to attribute that total to call sites, because
+that is where the cost is. Which one runs is decided entirely by which variables
+are set:
 
-| Set this | Mode | Snapshot kept | Cost |
-| --- | --- | --- | --- |
-| `DUMP_PEAK_VALUE_MB=N` | first crossing | the first sample above `N` MB | one stack walk per run |
-| `ALLOC_HOOK_PEAK_SAMPLE_MS=k` | peak chasing | the highest sample of the run, refreshed per `DUMP_PEAK_STEP_MB` | one stack walk per step of growth |
+| Set this | Mode | Interposed calls | Output | Answers |
+| --- | --- | --- | --- | --- |
+| `ALLOC_HOOK_PEAK_SAMPLE_MS=k` | observe-only probe | forwarded to libc untouched | a log block on stderr at exit | how much did this process hold, split into rss / dma / gpu |
+| `DUMP_PEAK_VALUE_MB=N` | first crossing | tracked, one stack walk per run | a report file | what was holding memory when it first passed `N` MB |
+| `ALLOC_HOOK_PEAK_SAMPLE_MS=k` + `DUMP_PEAK_STEP_MB=s` | peak chasing | tracked, one stack walk per `s` of growth | a report file | what was holding memory at the run's maximum |
+
+The probe answers *how much*; the two report modes answer *which call sites*, and
+charge for it. Nothing else enables a report: an interval without a step, or a
+step without an interval, produces the probe or nothing at all.
+
+`0` is how each of these is turned off, uniformly: `DUMP_PEAK_VALUE_MB=0` asks for
+no first-crossing snapshot, `DUMP_PEAK_STEP_MB=0` asks for no chasing, and
+`ALLOC_HOOK_PEAK_SAMPLE_MS=0` asks for no sampler at all. A run that zeroes both
+report switches keeps the probe; a run that zeroes all three tracks allocations
+for the on-demand checkpoint and produces nothing on its own.
 
 First crossing is the cheaper and steadier of the two: after its single walk no
 allocating thread is stalled again, which matters when the pipeline being
@@ -143,9 +155,63 @@ Peak chasing needs no such prior knowledge, so a first run gets a correct peak
 snapshot straight away, at the cost of a stack walk every time the peak grows
 past the step.
 
-Both modes write a report on normal exit and create the report directory if it
-does not exist. Setting both variables gives first crossing at the floor, with
-the interval you supplied.
+Both report modes write to `ALLOC_HOOK_DUMP_PREFIX` on normal exit and create the
+directory if it does not exist. Setting both variables gives first crossing at
+the floor, with the interval you supplied.
+
+#### The observe-only probe
+
+Interposition cannot be switched off at runtime -- `LD_PRELOAD` has already bound
+these symbols -- but whether an interposed call *does* anything can be, and
+tracking only pays for itself if a report consumes it. So a run that asks only for
+a cadence never builds the tracker:
+
+```sh
+LD_PRELOAD=/path/liballoc_hook.so ALLOC_HOOK_PEAK_SAMPLE_MS=5 ./your_program
+```
+
+```text
+alloc_hook: ============================================================
+alloc_hook:                 Memory Usage Summary
+alloc_hook: ------------------------------------------------------------
+alloc_hook:   DMA Max (sampling):                              0.00 MB
+alloc_hook:   RSS Max (sampling):                             61.27 MB
+alloc_hook:   GPU mmap Max (sampling):                        12.05 MB
+alloc_hook:   RSS Max (getrusage):                            61.54 MB
+alloc_hook:   DMA+RSS+GPU mmap Max (sampling):                73.29 MB
+alloc_hook:   not measured, so not a zero: dma
+alloc_hook: ------------------------------------------------------------
+alloc_hook:   Sampling Period:                                    1 ms
+alloc_hook:   Achieved Period:                                22.28 ms
+alloc_hook: ============================================================
+```
+
+The block keeps the shape, the column widths and the yellow of the summary a host
+framework prints for the same three quantities, so the two can be read side by
+side in one log; the colour is emitted only when stderr is a terminal. The cost
+is one sampler thread reading `/proc` plus one relaxed load per interposed call --
+68 ns per `malloc`/`free` pair against 60 ns with nothing preloaded, where a
+tracking mode with no size filter costs 2762 ns.
+
+Four rows to read carefully. The first three are each part's own maximum, so they
+need not have peaked together and their sum is not the combined row -- that row is
+the largest *same-cycle* sum, which is what an external evaluator reports as the
+process peak. `RSS Max (getrusage)` is the kernel's own high-water mark: standing
+well above the sampled RSS row, it means a resident peak happened between two
+samples. `Achieved Period` above `Sampling Period` means the `/proc` reads cost
+more than the interval and the sampler throttled itself to stay under half a core.
+And a part with no reachable interface is named on the `not measured` line rather
+than left to read as a measured zero.
+
+Use the probe to find out whether a process has a memory problem, and how big it
+is, without perturbing it: it captures no stacks, so it cannot say which call site
+is responsible. It has no live allocation table either, so `checkpoint()` writes
+these same figures to the requested path instead of a heap report, and the
+checkpoint signal is ignored rather than left to kill a process that is only being
+measured. A `fork` child prints nothing, and a process that leaves through
+`_exit()` or a fatal signal prints nothing at all -- the same limitation the
+tracked report has. When the answer is "yes, and here is how much", add
+`DUMP_PEAK_STEP_MB` or `DUMP_PEAK_VALUE_MB` to find out where it goes.
 
 #### Cadence
 
@@ -173,12 +239,12 @@ largest sum seen so far. When the sum also crosses the `DUMP_PEAK_VALUE_MB` and
 copy are sequential, not an atomic kernel snapshot; report labels such as
 `at_peak` mean the same peak callback window.
 
-For a retained snapshot at every newly observed maximum, a practical explicit
+For a snapshot that tracks the maximum closely, a practical explicit
 configuration is:
 
 ```sh
 export ALLOC_HOOK_PEAK_SAMPLE_MS=5   # peak chasing; preferably match the external sampler
-export DUMP_PEAK_STEP_MB=0           # exact sampled maximum; higher snapshot cost
+export DUMP_PEAK_STEP_MB=1           # smallest useful step: closest to the maximum, most walks
 export BACKTRACE_MIN_SIZE=1024       # use 0 only when every small stack is required
 ```
 

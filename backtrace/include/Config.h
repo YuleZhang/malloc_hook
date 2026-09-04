@@ -45,9 +45,13 @@ public:
     size_t backtrace_max_size_bytes() const { return backtrace_max_size_bytes_; }
 
     // Floor on the peak criterion, in bytes, below which no snapshot is taken.
-    // 0 means no floor. A floor selects PeakRetention::FirstCrossing, so this is
-    // also the watermark the retained snapshot describes in that mode.
+    // 0 means first-crossing was not asked for at all, so nothing consults this;
+    // a positive floor selects PeakRetention::FirstCrossing and is the watermark
+    // the retained snapshot describes.
     size_t backtrace_dump_peak_val() const { return backtrace_dump_peak_val_; }
+    // Growth required before the peak snapshot is rebuilt, in bytes. 0 means
+    // chasing was not asked for, so only PeakRetention::FirstCrossing can be in
+    // effect and nothing consults this.
     size_t peak_record_step_bytes() const { return peak_record_step_bytes_; }
     PeakRetention peak_retention() const { return peak_retention_; }
     // Interval, in milliseconds, at which the evaluator-visible footprint
@@ -63,6 +67,22 @@ public:
     StackCaptureMode capture_mode() const { return capture_mode_; }
 
     static StackCaptureMode ParseCaptureMode(const char* value);
+
+    // Selects the observe-only probe: a sampling cadence is available while
+    // nothing asks for a report. Fills `interval_ms` and returns true in that
+    // case. The inverse of the peak-recording gate in Init(), so exactly one of
+    // the two modes can apply to a process.
+    //
+    // Env-only, and deliberately free of both allocation and printf: this decides
+    // whether an interposed allocation does any work at all, so it is answered on
+    // the allocation path before any hook state exists, where a printf would
+    // re-enter malloc while the answer is still being computed.
+    static bool ObserveOnlyRequested(unsigned* interval_ms);
+
+    // The signal that triggers an on-demand report, as configured. Exposed
+    // separately from Init() because the observe-only probe needs it without
+    // building the rest of the configuration.
+    static int DumpSignal();
 
 private:
     int backtrace_dump_signal_ = 0;
