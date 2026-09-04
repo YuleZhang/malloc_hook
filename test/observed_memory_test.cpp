@@ -613,6 +613,41 @@ void TestGpuNodePathMatching() {
             "Rss:                   0 kB\n";
     assert(GpuMmapBytesFromSmapsText(deleted) == 8u * 1024 * 1024);
 
+    // The pair a real Adreno process holds at one instant, verbatim, with the
+    // sizes and residencies the kernel reported. The control node under /dev is
+    // 32 kB of it; the 12 MB the driver actually handed out is on an unlinked
+    // inode of the driver's own filesystem, whose path has no /dev component --
+    // so listing only the /dev spellings identified the node and left the
+    // driver's own regions out of the scan entirely.
+    char driver_inode_regions[] =
+            "7a561d0000-7a561d8000 r--s 00000000 00:13 2348      /dev/kgsl-3d0\n"
+            "Size:                 32 kB\n"
+            "Rss:                   0 kB\n"
+            "77ba680000-77bb286000 rw-s 00000000 00:01 40690     /kgsl-3d0 "
+            "(deleted)\n"
+            "Size:              12312 kB\n"
+            "Rss:                   0 kB\n"
+            // The same driver filesystem, fully resident: already inside VmRSS,
+            // so it must add nothing rather than be counted a second time.
+            "7a55e06000-7a55e1c000 rw-s 00000000 00:01 40691     /kgsl-3d0 "
+            "(deleted)\n"
+            "Size:                 88 kB\n"
+            "Rss:                  88 kB\n";
+    assert(GpuMmapBytesFromSmapsText(driver_inode_regions) ==
+           (32u + 12312u) * 1024);
+
+    // The driver-internal spelling is a whole pathname like the others, so the
+    // rule that keeps anonymous names out still holds for it.
+    char anon_named_driver_inode[] =
+            "7000000000-7020000000 rw-p 00000000 00:00 0 "
+            "[anon:/kgsl-3d0 shadow]\n"
+            "Rss:                   0 kB\n";
+    assert(GpuMmapBytesFromSmapsText(anon_named_driver_inode) == 0);
+    char driver_inode_lookalike[] =
+            "7a1c000000-7a1c0f0000 r--p 00000000 fe:0b 4242 /kgsl-3d0-shim.bin\n"
+            "Rss:                   0 kB\n";
+    assert(GpuMmapBytesFromSmapsText(driver_inode_lookalike) == 0);
+
     // A malformed Rss value drops the region. Counting it in full instead would
     // read a parse failure as "nothing is resident", which is the most
     // inflationary reading available.
@@ -772,6 +807,48 @@ void TestGpuMmapAccounting() {
     GpuRegionScan orphaned;
     char orphan_rss[] = "Rss:                8192 kB";
     assert(GpuMmapBytesFromSmapsLine(orphan_rss, &orphaned) == 0);
+}
+
+// The sampler takes its three sums from ReadGpuSmapsReading, so which regions
+// count has to be checked there and not only through the line helper above: a
+// spelling those sums do not see is invisible to the whole dimension, including
+// the maps-based gate that decides when a smaps read is worth paying for.
+void TestGpuSmapsReadingSeesDriverRegions() {
+    const size_t K = 1024;
+    // Verbatim from an Adreno process holding OpenCL device memory: the control
+    // node under /dev, then the two regions the driver allocated from, which live
+    // on an unlinked inode of its own filesystem and carry no /dev path at all.
+    const std::string path = WriteTempFile(
+            "observed_gpu_driver_inode",
+            "7a561d0000-7a561d8000 r--s 00000000 00:13 2348  /dev/kgsl-3d0\n"
+            "Size:                 32 kB\n"
+            "Rss:                   0 kB\n"
+            "77ba680000-77bb286000 rw-s 00000000 00:01 40690 /kgsl-3d0 (deleted)\n"
+            "Size:              12312 kB\n"
+            "Rss:                   0 kB\n"
+            "7a55e06000-7a55e1c000 rw-s 00000000 00:01 40691 /kgsl-3d0 (deleted)\n"
+            "Size:                 88 kB\n"
+            "Rss:                  88 kB\n");
+    GpuSmapsReading reading;
+    assert(ReadGpuSmapsReading(path.c_str(), &reading));
+    assert(reading.valid);
+    // All three are device regions. With only the /dev spellings listed, the sums
+    // held the 32 kB control node alone -- a region that never carries the
+    // driver's memory -- so the mapped total never moved and the dimension had
+    // nothing to react to on this driver.
+    assert(reading.device_mapped_bytes == (32u + 12312u + 88u) * K);
+    assert(reading.device_rss_bytes == 88u * K);
+    assert(reading.all_rss_bytes == 88u * K);
+
+    // What the arithmetic makes of them is unchanged by identifying them. The
+    // 12 MB region has a mapping and no residency, which is exactly the case the
+    // reading declines to report: nothing diverges, and mapped size alone is not
+    // evidence that memory is backed.
+    assert(GpuBytesFromReading(reading, 88u * K) == 0);
+    // On a target that keeps that residency out of VmRSS, the same regions do
+    // report, bounded by their own Rss.
+    assert(GpuBytesFromReading(reading, 0) == 88u * K);
+    unlink(path.c_str());
 }
 
 void TestGpuBytesFromReading() {
@@ -1078,6 +1155,7 @@ int main() {
     TestGpuMmapAccounting();
     TestGpuNodePathMatching();
     TestGpuReadFailurePath();
+    TestGpuSmapsReadingSeesDriverRegions();
     TestGpuBytesFromReading();
     TestGpuReadPolicy();
     TestGpuMappedFromMaps();
