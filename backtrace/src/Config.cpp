@@ -30,6 +30,8 @@ static constexpr char kFastCaptureIntervalEnv[] =
 static constexpr char kDumpPrefixEnv[] = "ALLOC_HOOK_DUMP_PREFIX";
 static constexpr char kPeakSampleIntervalEnv[] = "ALLOC_HOOK_PEAK_SAMPLE_MS";
 static constexpr char kDumpPeakValueEnv[] = "DUMP_PEAK_VALUE_MB";
+static constexpr char kPeakStepEnv[] = "DUMP_PEAK_STEP_MB";
+static constexpr char kDumpSignalEnv[] = "BACKTRACE_DUMP_SIGNAL";
 // Cadence used when peak recording is on but nothing published an interval. The
 // criterion is a watermark of the observed total, which only the sampler can
 // evaluate, so there is no "no sampler" fallback to take.
@@ -67,8 +69,16 @@ StackCaptureMode Config::ParseCaptureMode(const char* value) {
     return StackCaptureMode::Fast;
 }
 
-static bool ParseValue(const char* value, size_t* parsed_value) {
+// Parses a non-negative decimal, reporting *why* it failed instead of printing.
+//
+// The silent form is the primitive because the observe-only decision is answered
+// from the allocation path (see Config::ObserveOnlyRequested), where a printf
+// would re-enter malloc -- and would then print once per allocation for as long
+// as a malformed value stayed in the environment.
+static bool ParseValueQuiet(
+        const char* value, size_t* parsed_value, const char** error) {
     *parsed_value = 0;
+    *error = nullptr;
     if (value == nullptr) {
         return false;
     }
@@ -77,24 +87,28 @@ static bool ParseValue(const char* value, size_t* parsed_value) {
     char* end;
     long long_value = strtol(value, &end, 10);
     if (errno != 0) {
-        printf("Error %s:%s\n", value, strerror(errno));
-        return false;
-    }
-    if (end == value) {
-        printf("Error %s\n", value);
+        *error = strerror(errno);
         return false;
     }
     // 指针值相减
-    if (static_cast<size_t>(end - value) != strlen(value)) {
-        printf("Error %s\n", value);
-        return false;
-    }
-    if (long_value < 0) {
-        printf("Error %s\n", value);
+    if (end == value || static_cast<size_t>(end - value) != strlen(value) ||
+        long_value < 0) {
+        *error = "expected a non-negative decimal integer";
         return false;
     }
     *parsed_value = static_cast<size_t>(long_value);
     return true;
+}
+
+static bool ParseValue(const char* value, size_t* parsed_value) {
+    const char* error = nullptr;
+    if (ParseValueQuiet(value, parsed_value, &error)) {
+        return true;
+    }
+    if (error != nullptr) {
+        printf("Error %s:%s\n", value, error);
+    }
+    return false;
 }
 
 // Finds the sampling interval published by a host framework, if any. Only a
@@ -118,11 +132,56 @@ static bool FindExternalSampleIntervalMs(size_t* interval_ms) {
                     kExternalSampleIntervalSuffix, suffix_length) != 0) {
             continue;
         }
-        if (ParseValue(equals + 1, interval_ms) && *interval_ms > 0) {
+        // Quiet on purpose: this variable belongs to a host framework, so a
+        // value this library cannot parse is not this library's user's mistake
+        // to be told about on the allocation path.
+        const char* error = nullptr;
+        if (ParseValueQuiet(equals + 1, interval_ms, &error) && *interval_ms > 0) {
             return true;
         }
     }
     return false;
+}
+
+bool Config::ObserveOnlyRequested(unsigned* interval_ms) {
+    *interval_ms = 0;
+    const char* error = nullptr;
+    size_t value = 0;
+    // A floor asks for a first-crossing report, so tracking has something to
+    // produce. Mirrors Init()'s gate exactly, 0 and malformed values included:
+    // whatever Init() would refuse to record a peak for must also leave this off,
+    // or the two would disagree about which mode the process is in.
+    if (ParseValueQuiet(getenv(kDumpPeakValueEnv), &value, &error) && value > 0) {
+        return false;
+    }
+    size_t peak_sample_ms = 0;
+    const bool explicit_interval =
+            ParseValueQuiet(getenv(kPeakSampleIntervalEnv), &peak_sample_ms, &error);
+    if (explicit_interval && peak_sample_ms > 0 &&
+        ParseValueQuiet(getenv(kPeakStepEnv), &value, &error) && value > 0) {
+        // An interval and a positive step together are chasing, which is a report.
+        return false;
+    }
+    if (!explicit_interval && !FindExternalSampleIntervalMs(&peak_sample_ms)) {
+        return false;
+    }
+    // An explicit 0 is the opt-out: no sampler thread, and no probe either. A
+    // process with neither a cadence nor a report keeps the tracking it has
+    // always had, because the on-demand checkpoint still needs a live table.
+    if (peak_sample_ms == 0) {
+        return false;
+    }
+    *interval_ms = static_cast<unsigned>(peak_sample_ms);
+    return true;
+}
+
+int Config::DumpSignal() {
+    int signal_number = DefaultBacktraceSignal();
+    size_t dump_signal = 0;
+    if (ParseValue(getenv(kDumpSignalEnv), &dump_signal)) {
+        signal_number = static_cast<int>(dump_signal);
+    }
+    return signal_number;
 }
 
 bool Config::Init() {
@@ -188,25 +247,38 @@ bool Config::Init() {
     const bool adopted_sample_interval =
             !explicit_sample_interval && FindExternalSampleIntervalMs(&peak_sample_ms);
 
-    // A floor of 0 is no floor at all -- every run passes it on its first sample
-    // -- so it selects peak-chasing instead of first-crossing. It still enables
-    // peak recording: that is what this variable has always done, and a
-    // deployment that passed 0 to mean "enable with no floor" must not silently
-    // lose its report.
+    // 0 means off, for every variable in this group and not just for the cadence
+    // above: a value of 0 is how each of these is turned off individually, so a
+    // floor of 0 asks for no first-crossing snapshot and a step of 0 asks for no
+    // chasing. Neither is read as "on, with no limit".
     size_t peak_floor_mb = 0;
-    const bool peak_value_set =
-            ParseValue(getenv(kDumpPeakValueEnv), &peak_floor_mb);
-    const bool has_peak_floor = peak_value_set && peak_floor_mb > 0;
+    ParseValue(getenv(kDumpPeakValueEnv), &peak_floor_mb);
+    const bool has_peak_floor = peak_floor_mb > 0;
 
-    // Either mode's own variable enables peak recording: a floor selects
-    // first-crossing, an explicit interval selects peak-chasing. A framework's
-    // interval only ever supplies the cadence -- letting it enable recording
-    // would hand a sampler thread and an exit report to a process that set none
-    // of these variables and asked for neither.
+    // How much the peak must grow before the snapshot is rebuilt, and -- being
+    // positive at all -- whether chasing was asked for. Unset and 0 are the same
+    // answer here. There is deliberately no spelling for "rebuild on every new
+    // peak": a small positive step is within 25% of it (NextPeakThreshold scales
+    // for small peaks) without offering a value that reads like "off".
+    size_t peak_step_mb = 0;
+    ParseValue(getenv(kPeakStepEnv), &peak_step_mb);
+    peak_record_step_bytes_ = peak_step_mb * 1024 * 1024;
+    const bool has_peak_step = peak_step_mb > 0;
+
+    // What asks for a report, and nothing else does:
+    //   DUMP_PEAK_VALUE_MB=N                          -> first-crossing at N MB
+    //   ALLOC_HOOK_PEAK_SAMPLE_MS=k + DUMP_PEAK_STEP_MB=s -> chasing, rebuilt per s
+    //
+    // An interval on its own asks to *watch* the footprint, not to attribute it,
+    // and is answered by the observe-only probe: a log block at exit and no
+    // tracking (see ObserveOnlyProbe.h). A framework's published interval never
+    // reaches here either -- it supplies cadence to a run that asked for a report
+    // by other means, and on its own it selects the probe as well.
     const bool record_peak =
-            peak_value_set || (explicit_sample_interval && peak_sample_ms > 0);
+            has_peak_floor ||
+            (explicit_sample_interval && peak_sample_ms > 0 && has_peak_step);
 
-    backtrace_dump_peak_val_ = has_peak_floor ? peak_floor_mb * 1024 * 1024 : 0;
+    backtrace_dump_peak_val_ = peak_floor_mb * 1024 * 1024;
     peak_retention_ = has_peak_floor ? PeakRetention::FirstCrossing
                                      : PeakRetention::ChaseMax;
     if (record_peak) {
@@ -224,12 +296,6 @@ bool Config::Init() {
         backtrace_dump_on_exit_ = true;
     }
 
-    peak_record_step_bytes_ = DefaultPeakStepBytes();
-    size_t peak_step_mb = 0;
-    if (ParseValue(getenv("DUMP_PEAK_STEP_MB"), &peak_step_mb)) {
-        peak_record_step_bytes_ = peak_step_mb * 1024 * 1024;
-    }
-
     // An explicit interval always wins, including an explicit 0: that is the
     // opt-out for a caller that wants no extra thread and accepts a floor
     // compared against tracked allocation bytes instead.
@@ -244,11 +310,7 @@ bool Config::Init() {
 
     // 通过信号插入 check point
     options_ |= DUMP_ON_SINGAL;
-    backtrace_dump_signal_ = DefaultBacktraceSignal();
-    size_t dump_signal = 0;
-    if (ParseValue(getenv("BACKTRACE_DUMP_SIGNAL"), &dump_signal)) {
-        backtrace_dump_signal_ = static_cast<int>(dump_signal);
-    }
+    backtrace_dump_signal_ = DumpSignal();
 
     return true;
 }

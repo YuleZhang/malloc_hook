@@ -43,6 +43,24 @@ target_link_libraries(config_capture_mode_test PRIVATE
 add_test(NAME hook_source_policy COMMAND hook_source_policy_test)
 add_test(NAME config_capture_mode COMMAND config_capture_mode_test)
 
+add_executable(observe_only_probe_test
+    observe_only_probe_test.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../backtrace/src/Config.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../backtrace/src/ObserveOnlyProbe.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../backtrace/src/ObservedMemory.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../backtrace/src/debug_disable.cpp)
+target_compile_features(observe_only_probe_test PRIVATE cxx_std_17)
+target_include_directories(observe_only_probe_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../backtrace/include)
+if(ANDROID)
+    target_include_directories(observe_only_probe_test PRIVATE
+        ${MALLOC_HOOK_VENDORED_BIONIC_INCLUDE})
+endif()
+target_link_libraries(observe_only_probe_test PRIVATE
+    ${CMAKE_DL_LIBS} Threads::Threads)
+add_test(NAME observe_only_probe COMMAND observe_only_probe_test)
+set_tests_properties(observe_only_probe PROPERTIES TIMEOUT 30)
+
 add_executable(observed_memory_test
     observed_memory_test.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../backtrace/src/Config.cpp
@@ -152,6 +170,20 @@ if(NOT ANDROID AND NOT OHOS)
         helper Threads::Threads)
     add_test(NAME task10_hook_boundary COMMAND task10_hook_boundary_test)
     set_tests_properties(task10_hook_boundary PROPERTIES TIMEOUT 5)
+
+    # Preloads the built library into a real process, so what each mode costs and
+    # what it produces is checked end to end rather than per unit. Host-only by
+    # construction: it runs the library it just built.
+    add_executable(observe_only_workload observe_only_workload.cpp)
+    target_compile_features(observe_only_workload PRIVATE cxx_std_17)
+    add_test(
+        NAME observe_only_runtime
+        COMMAND ${CMAKE_COMMAND}
+            "-DLIBRARY=$<TARGET_FILE:alloc_hook>"
+            "-DWORKLOAD=$<TARGET_FILE:observe_only_workload>"
+            "-DTEST_BINARY_DIR=${CMAKE_CURRENT_BINARY_DIR}/observe_only_runtime"
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/observe_only_runtime_test.cmake)
+    set_tests_properties(observe_only_runtime PROPERTIES TIMEOUT 60)
 
     if(MALLOC_HOOK_TARGET_OS STREQUAL "linux")
         add_executable(linux_mmap_ioctl_regression_test

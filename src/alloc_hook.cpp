@@ -19,6 +19,7 @@
 #include <link.h>
 
 #include "DebugData.h"
+#include "ObserveOnlyProbe.h"
 #include "PointerData.h"
 #include "malloc_debug.h"
 #include "memory_hook.h"
@@ -437,6 +438,21 @@ __attribute__((constructor(201))) void mark_init_done() {
     // preinit allocation already built the tracker, this is where its threads
     // start; if not, AllocHook's constructor starts them itself.
     debug_start_helper_threads();
+    // The probe's own thread, for the same reason and at the same instant. A
+    // no-op unless this run asked for a cadence and no report; the two are
+    // mutually exclusive, so at most one of them starts a sampler.
+    observe_only::StartProbe();
+}
+
+// The probe's counterpart to AllocHook's destructor, which is what emits the exit
+// report in tracking mode. Exactly one of the two runs: the tracker is never
+// constructed in observe-only mode, and the probe never starts in any other one.
+//
+// This is the dlclose path only. Process exit is covered by the atexit()
+// registration in StartProbe(), because Bionic does not run a preloaded library's
+// .fini_array at exit; the report itself reports once either way.
+__attribute__((destructor(201))) void report_observe_only_probe() {
+    observe_only::ReportAtExit();
 }
 
 // Hook-source capability contract:
@@ -453,11 +469,18 @@ __attribute__((constructor(201))) void mark_init_done() {
 //   exported, and resource ioctl records are success/filter gated. Direct
 //   mremap syscalls remain outside the interposition boundary, as do
 //   managed-runtime/other-thread captures.
+//
+// Every interposer below also takes the observe-only gate. Interposition itself
+// cannot be switched off -- these symbols are exported and the loader has already
+// bound them -- but a run with no report to produce must not pay for the tracker,
+// so the gate sends the call straight to libc and the tracker is never
+// constructed at all. See ObserveOnlyProbe.h.
 extern "C" {
 // 程序初始化会间接调用 malloc 和 free
 void* malloc(size_t size) {
     RESOLVE(malloc);
-    if (InitState::allocHook_setup || g_resolving_symbols || m_sys_malloc == nullptr) {
+    if (InitState::allocHook_setup || g_resolving_symbols || m_sys_malloc == nullptr ||
+        observe_only::Bypassed()) {
         if (m_sys_malloc == nullptr) {
             return BootstrapMalloc(size);
         }
@@ -472,7 +495,8 @@ void free(void* ptr) {
         return;
     }
     RESOLVE(free);
-    if (InitState::allocHook_setup || g_resolving_symbols || m_sys_free == nullptr) {
+    if (InitState::allocHook_setup || g_resolving_symbols || m_sys_free == nullptr ||
+        observe_only::Bypassed()) {
         if (m_sys_free == nullptr) {
             return;
         }
@@ -484,7 +508,8 @@ void free(void* ptr) {
 // calloc 和 realloc 属于用户级函数
 void* calloc(size_t a, size_t b) {
     RESOLVE(calloc);
-    if (InitState::allocHook_setup || g_resolving_symbols || m_sys_calloc == nullptr) {
+    if (InitState::allocHook_setup || g_resolving_symbols || m_sys_calloc == nullptr ||
+        observe_only::Bypassed()) {
         if (m_sys_calloc == nullptr) {
             return BootstrapCalloc(a, b);
         }
@@ -496,7 +521,8 @@ void* calloc(size_t a, size_t b) {
 void* realloc(void* ptr, size_t size) {
     bool bootstrap_ptr = IsBootstrapPointer(ptr);
     RESOLVE(realloc);
-    if (InitState::allocHook_setup || g_resolving_symbols || m_sys_realloc == nullptr || bootstrap_ptr) {
+    if (InitState::allocHook_setup || g_resolving_symbols || m_sys_realloc == nullptr ||
+        bootstrap_ptr || observe_only::Bypassed()) {
         if (m_sys_realloc == nullptr || bootstrap_ptr) {
             return BootstrapRealloc(ptr, size);
         }
@@ -507,7 +533,8 @@ void* realloc(void* ptr, size_t size) {
 
 void* aligned_alloc(size_t alignment, size_t size) {
     RESOLVE(aligned_alloc);
-    if (InitState::allocHook_setup || g_resolving_symbols || m_sys_aligned_alloc == nullptr) {
+    if (InitState::allocHook_setup || g_resolving_symbols ||
+        m_sys_aligned_alloc == nullptr || observe_only::Bypassed()) {
         if (m_sys_aligned_alloc == nullptr) {
             if (!IsPowerOfTwo(alignment) || alignment < alignof(void*) ||
                 size % alignment != 0) {
@@ -523,7 +550,8 @@ void* aligned_alloc(size_t alignment, size_t size) {
 
 void* memalign(size_t alignment, size_t bytes)  {
     RESOLVE(memalign);
-    if (InitState::allocHook_setup || g_resolving_symbols || m_sys_memalign == nullptr) {
+    if (InitState::allocHook_setup || g_resolving_symbols || m_sys_memalign == nullptr ||
+        observe_only::Bypassed()) {
         if (m_sys_memalign == nullptr) {
             return BootstrapAlignedMalloc(alignment, bytes);
         }
@@ -536,7 +564,8 @@ void* memalign(size_t alignment, size_t bytes)  {
 int posix_memalign(void** ptr, size_t alignment, size_t size) {
     RESOLVE(memalign);
     RESOLVE(posix_memalign);
-    if (InitState::allocHook_setup || g_resolving_symbols || m_sys_posix_memalign == nullptr) {
+    if (InitState::allocHook_setup || g_resolving_symbols ||
+        m_sys_posix_memalign == nullptr || observe_only::Bypassed()) {
         if (m_sys_posix_memalign == nullptr) {
             if (ptr == nullptr || !IsPowerOfTwo(alignment) ||
                 alignment < sizeof(void*) || alignment % sizeof(void*) != 0) {
@@ -552,7 +581,8 @@ int posix_memalign(void** ptr, size_t alignment, size_t size) {
 
 #if MALLOC_HOOK_EXPORT_MMAP_HOOK
 void* mmap(void* addr, size_t size, int prot, int flags, int fd, off_t offset) {
-    if (in_preinit_phase || InitState::allocHook_setup) {
+    if (in_preinit_phase || InitState::allocHook_setup ||
+        observe_only::Bypassed()) {
         return CallRealMmap(addr, size, prot, flags, fd, offset);
     }
     if (fd < 0 && ShouldBypassLibcInternalMmap(__builtin_return_address(0))) {
@@ -563,7 +593,8 @@ void* mmap(void* addr, size_t size, int prot, int flags, int fd, off_t offset) {
 }
 
 int munmap(void* addr, size_t size) {
-    if (in_preinit_phase || InitState::allocHook_setup) {
+    if (in_preinit_phase || InitState::allocHook_setup ||
+        observe_only::Bypassed()) {
         return CallRealMunmap(addr, size);
     }
     return AllocHook::inst().munmap(addr, size);
@@ -578,7 +609,8 @@ void* mremap(
         new_addr = va_arg(ap, void*);
         va_end(ap);
     }
-    if (in_preinit_phase || InitState::allocHook_setup) {
+    if (in_preinit_phase || InitState::allocHook_setup ||
+        observe_only::Bypassed()) {
         return CallRealMremap(old_addr, old_size, new_size, flags, new_addr);
     }
     return AllocHook::inst().mremap(old_addr, old_size, new_size, flags, new_addr);
@@ -604,14 +636,16 @@ int ioctl(int fd, HookIoctlRequest request, ...) {
     void* arg = va_arg(ap, void*);
     va_end(ap);
 
-    if (in_preinit_phase || InitState::allocHook_setup) {
+    if (in_preinit_phase || InitState::allocHook_setup ||
+        observe_only::Bypassed()) {
         return CallRealIoctl(fd, request_value, arg);
     }
     return AllocHook::inst().ioctl(fd, request_value, arg);
 }
 
 int close(int fd) {
-    if (in_preinit_phase || InitState::allocHook_setup) {
+    if (in_preinit_phase || InitState::allocHook_setup ||
+        observe_only::Bypassed()) {
         return CallRealClose(fd);
     }
     return AllocHook::inst().close(fd);
@@ -620,7 +654,8 @@ int close(int fd) {
 
 #if MALLOC_HOOK_EXPORT_MMAP_HOOK && !defined(mmap64)
 void* mmap64(void* addr, size_t size, int prot, int flags, int fd, off_t offset) {
-    if (in_preinit_phase || InitState::allocHook_setup) {
+    if (in_preinit_phase || InitState::allocHook_setup ||
+        observe_only::Bypassed()) {
         return CallRealMmap64(addr, size, prot, flags, fd, offset);
     }
     if (fd < 0 && ShouldBypassLibcInternalMmap(__builtin_return_address(0))) {
@@ -632,6 +667,14 @@ void* mmap64(void* addr, size_t size, int prot, int flags, int fd, off_t offset)
 #endif
 
 void checkpoint(const char* file_name) {
+    // Observe-only runs have no live allocation table to report. Constructing the
+    // tracker now to answer this would report the allocations that happen from
+    // here on as if they were the process's, so the observed figures are written
+    // to the requested path instead.
+    if (observe_only::Bypassed()) {
+        observe_only::WriteReport(file_name);
+        return;
+    }
     AllocHook::inst().checkpoint(file_name);
 }
 }

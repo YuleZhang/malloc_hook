@@ -489,6 +489,11 @@ public:
     // `one_shot` keeps only the first crossing of the floor: the snapshot is
     // never refreshed, and `step_bytes` is unused. Sampling continues either
     // way, so the observed-peak statistics stay complete.
+    //
+    // A null `on_new_peak` starts the sampler with no tracker behind it: it keeps
+    // its statistics and never asks for a snapshot, so the floor, the step and
+    // `one_shot` are all inert. That is the mode the observe-only probe uses when
+    // no report is configured (see ObserveOnlyProbe.h).
     bool Start(
             unsigned interval_ms, size_t floor_bytes, size_t step_bytes,
             bool one_shot, PeakCallback on_new_peak);

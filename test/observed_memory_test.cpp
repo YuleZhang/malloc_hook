@@ -237,7 +237,9 @@ void TestIntervalResolution() {
     // Nothing asked for a peak report, so there is no sampler and no criterion.
     assert(config.observed_peak_sample_ms() == 0);
     assert(!(config.options() & RECORD_MEMORY_PEAK));
-    assert(config.peak_record_step_bytes() == DefaultPeakStepBytes());
+    // No step asked for is no step taken: the snapshot follows every new peak,
+    // which is the exact reading. A caller who wants a cheaper one says so.
+    assert(config.peak_record_step_bytes() == 0);
 
     // A host framework's interval alone must not switch peak recording on: the
     // framework publishes it for its own sampling, and a process that asked for
@@ -286,6 +288,27 @@ void TestIntervalResolution() {
     assert(config.peak_record_step_bytes() == 3ULL * 1024 * 1024);
     (void)initialized;
 
+    // An interval and a step are the second way to ask for a report, and they
+    // have to ask *together*, both positive: the interval alone selects the
+    // observe-only probe, which produces a log block and no report at all.
+    unsetenv("DUMP_PEAK_VALUE_MB");
+    unsetenv("PROBE_AUTO_SHOW_MEM_USE_DURATION_MS");
+    unsetenv("DUMP_PEAK_STEP_MB");
+    setenv("ALLOC_HOOK_PEAK_SAMPLE_MS", "5", 1);
+    initialized = config.Init();
+    assert(initialized);
+    assert(!(config.options() & RECORD_MEMORY_PEAK));
+    assert(!config.backtrace_dump_on_exit());
+    setenv("DUMP_PEAK_STEP_MB", "8", 1);
+    initialized = config.Init();
+    assert(initialized);
+    assert(config.options() & RECORD_MEMORY_PEAK);
+    assert(config.backtrace_dump_on_exit());
+    assert(config.observed_peak_sample_ms() == 5);
+    assert(config.peak_record_step_bytes() == 8ULL * 1024 * 1024);
+    // Peak-chasing: no floor was given, so nothing is retained on first crossing.
+    assert(config.backtrace_dump_peak_val() == 0);
+
     unsetenv("ALLOC_HOOK_PEAK_SAMPLE_MS");
     unsetenv("PROBE_AUTO_SHOW_MEM_USE_DURATION_MS");
     unsetenv("DUMP_PEAK_STEP_MB");
@@ -325,10 +348,16 @@ void TestMinSizeDefaults() {
     // platform default alone: enabling it must not start capturing stacks the
     // platform had decided to skip.
     setenv("ALLOC_HOOK_PEAK_SAMPLE_MS", "5", 1);
+    setenv("DUMP_PEAK_STEP_MB", "8", 1);
     assert(config.Init());
     assert(config.backtrace_min_size_bytes() ==
            (platform_default != 0 ? platform_default : 1024));
     assert(config.backtrace_min_size_bytes() >= platform_default);
+    // The probe records no peak, so it supplies no filter either: it captures no
+    // stacks at all, and a filter would suggest it captures some.
+    unsetenv("DUMP_PEAK_STEP_MB");
+    assert(config.Init());
+    assert(config.backtrace_min_size_bytes() == platform_default);
     unsetenv("ALLOC_HOOK_PEAK_SAMPLE_MS");
 }
 
@@ -354,23 +383,35 @@ void TestPeakModeSelection() {
     assert(config.observed_peak_sample_ms() == 50);
     assert(config.backtrace_dump_on_exit());
 
-    // A floor of 0 is no floor at all -- every run passes it on its first
-    // sample -- so it selects peak-chasing. It must still enable recording:
-    // deployments that passed 0 to mean "enable with no floor" would otherwise
-    // silently stop producing a report.
+    // 0 turns first-crossing off, the same way 0 turns off every other variable
+    // in this group. It is not read as "on, with no floor": a run that asked for
+    // no floor and no step asked for no report, and gets none.
     setenv("DUMP_PEAK_VALUE_MB", "0", 1);
     assert(config.Init());
-    assert(config.options() & RECORD_MEMORY_PEAK);
-    assert(config.peak_retention() == PeakRetention::ChaseMax);
+    assert(!(config.options() & RECORD_MEMORY_PEAK));
+    assert(!config.backtrace_dump_on_exit());
     assert(config.backtrace_dump_peak_val() == 0);
-    assert(config.observed_peak_sample_ms() == 50);
-    assert(config.backtrace_dump_on_exit());
     unsetenv("DUMP_PEAK_VALUE_MB");
 
-    // An interval on its own selects peak-chasing: no floor is needed because
-    // the maximum is discovered rather than declared. It must still report on
-    // exit, which is the only way that discovery leaves the process.
+    // An interval with a step selects peak-chasing: no floor is needed because
+    // the maximum is discovered rather than declared, and the step is what says
+    // how often the discovery is written down. It must still report on exit,
+    // which is the only way that discovery leaves the process.
+    //
+    // The interval *without* a step asks to watch the footprint and not to
+    // attribute it, and is answered by the observe-only probe instead -- a log
+    // line at exit, no tracking, no report. See Config::ObserveOnlyRequested.
     setenv("ALLOC_HOOK_PEAK_SAMPLE_MS", "5", 1);
+    assert(config.Init());
+    assert(!(config.options() & RECORD_MEMORY_PEAK));
+    assert(!config.backtrace_dump_on_exit());
+    // A step of 0 is that variable's own off switch, so it does not select
+    // chasing either -- there is no value of it that means "rebuild always".
+    setenv("DUMP_PEAK_STEP_MB", "0", 1);
+    assert(config.Init());
+    assert(!(config.options() & RECORD_MEMORY_PEAK));
+    assert(!config.backtrace_dump_on_exit());
+    setenv("DUMP_PEAK_STEP_MB", "8", 1);
     assert(config.Init());
     assert(config.options() & RECORD_MEMORY_PEAK);
     assert(config.peak_retention() == PeakRetention::ChaseMax);
@@ -389,6 +430,7 @@ void TestPeakModeSelection() {
     assert(config.backtrace_min_size_bytes() == 4096);
 
     unsetenv("ALLOC_HOOK_PEAK_SAMPLE_MS");
+    unsetenv("DUMP_PEAK_STEP_MB");
     unsetenv("BACKTRACE_MIN_SIZE");
 }
 
