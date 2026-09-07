@@ -6,275 +6,120 @@ PC，并生成检查点或峰值报告。
 
 [English README / 英文 README](README.md)
 
-## 通用 Hook 生命周期
+## Hook 流程
+
+拦截路径做三件事，分三段进行，只有第一段跑在分配线程上：
 
 ```mermaid
 flowchart LR
-    A[分配或资源 Hook] --> B[过滤和可选 Fast 采样]
-    B --> C{抓栈模式}
-    C -->|Fast| D[_Unwind_Backtrace 原始 PC]
-    C -->|Accurate| E[平台原生后端]
-    D --> F[后端无关的原始栈]
-    E --> F
-    F --> G[存活记账和有界异步队列]
-    G --> H[ModuleResolver]
-    H --> I[Symbolizer]
-    I --> J[检查点 / 峰值报告]
+    A[分配 / 资源 Hook] --> B[Capture 抓取]
+    B --> C[Light parse 轻解析]
+    C --> D[Generate report 出报告]
+    B -.-> B1[尺寸过滤 + 有界原始栈]
+    C -.-> C1[异步：模块快照 + 符号解析]
+    D -.-> D1[检查点 / 峰值报告]
 ```
 
-拦截热路径只执行过滤、记账决策和有界 native 抓栈。模块查找、worker
-线程中的 `dladdr`、符号化和报告格式化都在分配 Hook 之外执行。成功的
-`malloc`/`new`、匿名 `mmap` 和选定资源分配 `ioctl` 事件共享统一原始栈契约；
+- **Capture（抓取）**——在分配线程上。先按尺寸过滤，再抓一份有界的原始 PC 栈
+  （Fast 模式用帧指针回溯，Accurate 模式用 OS 后端）。不做模块查找、不做符号化、
+  不做动态分配。
+- **Light parse（轻解析）**——在 worker 线程上。对原始栈去重，快照已加载的 ELF
+  模块，解析动态符号名；符号不可用时保留原始 PC 和模块相对 PC。
+- **Generate report（出报告）**——按需的检查点，或退出时的峰值报告。
+
+成功的 `malloc`/`new`、匿名 `mmap` 和选定资源分配 `ioctl` 事件共享统一原始栈契约；
 释放路径复用已有的分配身份。
 
-## 当前架构
+## 架构
 
-实现由平台无关契约和平台后端组成：
+实现由平台无关契约和平台后端组成，上面三段流程对应到这些部件：
 
-- **Capture：** 当编译器运行时提供能力时，Fast 使用有界
-  `_Unwind_Backtrace`。Accurate 选择明确的 Android、Linux 或 OHOS 后端，
-  并保留部分栈及错误状态。
-- **异步解析：** `AsyncStackPipeline` 对原始栈去重，在 worker 中快照已加载
-  ELF 模块并解析动态符号；符号不可用时仍保留原始 PC 和模块相对 PC。
-- **报告地址：** 抓到的 PC 都是返回地址，因此报告中的模块相对 PC 会先回退到
-  调用指令，再做模块归属。`#<n> <addr> <module>` 行上的地址是调用点的 ELF
-  虚拟地址，可直接交给 `llvm-symbolizer --obj=<带符号的 ELF>`；每份报告的
-  `frame_pc:` 行都声明了这一约定。
-- **记账：** `PointerData` 管理存活分配身份、host 采样记账、资源记账和峰值
-  计数器。
-- **平台边界：** CMake 分离 OS、libc、架构、编译器 unwind 能力和导出策略。
-  OHOS 的 `mmap` 拦截默认关闭。
+- **Capture。** `CaptureStack()` 返回项目自有的 `RawStackRecord`，含抓栈状态、模式、
+  后端、终止错误、跳过帧数、模块代号和有界 PC。Fast 在 aarch64 上用有界帧指针回溯
+  （帧指针回溯不可用时退回 `_Unwind_Backtrace`）；Accurate 选择明确的 Android、Linux
+  或 OHOS 后端，并保留部分栈及错误状态。核心契约是原生 C/C++ 和当前线程；托管运行时栈、
+  远程线程上下文和完整离线 DWARF 展开属于未来的可选能力。
+- **Light parse。** `AsyncStackPipeline` 按原始 PC 和模块代号去重，在 worker 中通过
+  `dl_iterate_phdr` 快照已加载 ELF 段，并用 worker 侧 `dladdr` 解析动态符号名。它始终
+  保留原始 PC 和模块相对 PC，不承诺完整的 DWARF 或离线符号化。队列容量、去重、丢弃和
+  已处理结果通过 `AsyncStackStats` 暴露；hook 边界用 `AsyncStackWorkerThread()`，使解析器
+  自身的分配不被跟踪。
+- **报告地址。** 抓到的 PC 都是返回地址，因此报告中的模块相对 PC 会先回退到调用指令，
+  再做模块归属。`#<n> <addr> <module>` 行上的地址是调用点的 ELF 虚拟地址，可直接交给
+  `llvm-symbolizer --obj=<带符号的 ELF>`；每份报告的 `frame_pc:` 行都声明了这一约定。
+- **记账。** `PointerData` 管理存活分配表、资源记账和峰值计数器。每个满足条件的分配都按
+  精确尺寸跟踪；尺寸过滤（`BACKTRACE_MIN_SIZE`）是唯一的开销控制项。
+- **平台边界。** CMake 分离 OS、libc、架构、编译器 unwind 能力和导出策略。mmap 拦截是一个
+  由 `ENABLE_MMAP_HOOK_EXPORT` 控制的统一能力，Android 和 glibc Linux 默认开启，OHOS 默认
+  关闭以减少 loader 和厂商运行时受到的影响。只有在构建了 DMA 抓取时才导出资源 hook。
 
-详细架构契约见
-[`docs/ARCHITECTURE.zh-CN.md`](docs/ARCHITECTURE.zh-CN.md)。核心范围是原生
-C/C++ 和当前线程；托管运行时栈、远程线程上下文和完整离线 DWARF 展开属于
-未来的可选能力。
+## 文档
 
-## 使用说明
+| 文档 | 覆盖内容 |
+| --- | --- |
+| [`docs/get_hook_report.zh-CN.md`](docs/get_hook_report.zh-CN.md) | 两类 hook 行为——只观测探测模式与两种报告模式——以及如何读报告。 |
+| [`docs/EXAMPLE.zh-CN.md`](docs/EXAMPLE.zh-CN.md) | 构建前提、构建、预加载部署、检查点、故障排查和已知限制的端到端说明。 |
+| [`docs/GPU_MEMORY_ACCOUNTING.zh-CN.md`](docs/GPU_MEMORY_ACCOUNTING.zh-CN.md) | GPU 设备内存如何记账、哪条驱动路径落在哪个信号里、以及厂商 API 的坑。 |
 
-同语言使用说明是构建前提、构建、预加载部署、配置、检查点、故障排查和已知
-限制的统一入口：
-
-[`docs/USAGE.zh-CN.md`](docs/USAGE.zh-CN.md)
-
-GPU 设备内存的记账方式会随操作系统、厂商、驱动分配路径和内核版本变化，而采样器
-相加的那三个信号并没有干净地切分它。哪条路落在哪个信号里，以及确立这件事时踩到的
-厂商 API 坑：
-
-[`docs/GPU_MEMORY_ACCOUNTING.zh-CN.md`](docs/GPU_MEMORY_ACCOUNTING.zh-CN.md)
-
-英文入口仍为 [`README.md`](README.md)、[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)、
-[`docs/USAGE.md`](docs/USAGE.md) 和
+英文入口：[`README.md`](README.md)、[`docs/get_hook_report.md`](docs/get_hook_report.md)、
+[`docs/EXAMPLE.md`](docs/EXAMPLE.md) 和
 [`docs/GPU_MEMORY_ACCOUNTING.md`](docs/GPU_MEMORY_ACCOUNTING.md)。
 
 ## 配置项
 
-所有配置都在下面两张表里。除此之外没有其他开关：没有列在这里的行为就是不可
-调的。
+所有配置都在下面两张表里。除此之外没有其他开关：没有列在这里的行为就是不可调的。
 
 ### 构建选项（CMake）
 
 | 选项 | 默认值 | 作用 |
 | --- | --- | --- |
-| `MALLOC_HOOK_ENABLE_DMA_CAPTURE` | `ON` | 在 `malloc`/`mmap` 之外同时抓取 DMA-BUF/ION/GPU buffer（拦截 `ioctl`/`close`）。只有在没有任何驱动 UAPI 的宿主 smoke 构建里才关闭；真机上流水线的大部分内存都是 DMA，关掉会让报告看起来几乎是空的。 |
-| `MALLOC_HOOK_OHOS_MMAP_HOOK` | `OFF` | 在 OHOS 上导出 `mmap`/`munmap`。默认关闭以减少 loader 和厂商运行时受到的影响。 |
+| `MALLOC_HOOK_ENABLE_DMA_CAPTURE` | `ON` | 在 `malloc`/`mmap` 之外同时抓取 DMA-BUF/ION/GPU buffer（拦截 `ioctl`/`close`）。只有在没有任何驱动 UAPI 的宿主 smoke 构建里才关闭；真机上流水线的大部分内存都是 DMA，关掉会让报告看起来几乎是空的。它只控制被跟踪的拦截——实测内存采样器无论如何都从 `/proc` 读取 dmabuf。 |
+| `ENABLE_MMAP_HOOK_EXPORT` | `ON`（Android/Linux）、`OFF`（OHOS） | 导出 `mmap`/`munmap`/`mremap` hook。一个平台无关的统一开关；OHOS 默认关闭以减少 loader 和厂商运行时受到的影响。关闭时 mmap 家族会从版本脚本里被剔除，链接器不会导出未编译进来的 hook。 |
 | `MALLOC_HOOK_BUILD_TESTS` | `ON` | 构建测试程序并注册到 CTest。 |
 | `MALLOC_HOOK_BUILD_GL_TESTS` | Android 上为 `ON` | 构建 Android OpenGL 集成测试。 |
 
-`linux/dma-heap.h` 优先使用 sysroot 中的版本；没有时使用仓库内自带的一份
-UAPI，因此缺少该头文件的交叉工具链依然可以抓取 DMA。这一步不需要任何配置。
+`linux/dma-heap.h` 优先使用 sysroot 中的版本；没有时使用仓库内自带的一份 UAPI，因此缺少
+该头文件的交叉工具链依然可以抓取 DMA。这一步不需要任何配置。
 
-`build_android.sh`、`build_linux.sh` 和 `build_ohos.sh` 会在成功编译后打印实际
-生效的选项和派生出的导出策略。手工使用 CMake 构建时，可运行
+`build_android.sh`、`build_linux.sh` 和 `build_ohos.sh` 会在成功编译后打印实际生效的选项
+和派生出的导出策略。手工使用 CMake 构建时，可运行
 `cmake --build <build-dir> --target print_build_options` 查看同一份摘要。
 
 ### 运行选项（环境变量）
 
 | 变量 | 默认值 | 作用 |
 | --- | --- | --- |
-| `DUMP_PEAK_VALUE_MB` | 未设置 | 选择**首次越线**模式：打开峰值记录和退出时导出，只保留峰值判据首次越过该 MB 数时的那一张快照。整个运行只做一次栈遍历，越线之后不会再阻塞任何分配线程。设为 `0` 表示没有下限，转为峰值追踪模式。 |
-| `ALLOC_HOOK_DUMP_PREFIX` | `/data/local/tmp/trace/backtrace_heap` | 报告路径前缀。文件名为 `<prefix>.exit.pid_<pid>.time_<t>.txt`，因此报告始终能对应到产生它的进程。 |
-| `DUMP_PEAK_STEP_MB` | `0`（关闭） | 给正值并与 `ALLOC_HOOK_PEAK_SAMPLE_MS` 一起使用时选择**峰值追踪**；单独设置不起任何作用，`0` 表示关闭追踪。表示重新构建峰值快照所需增长量的上限：步长越小快照越贴近最大值、栈遍历越多，峰值较小时实际使用 25% 的增长量、下限 64 KB。首次越线模式不会重建快照，因此该值不生效。 |
-| `ALLOC_HOOK_PEAK_SAMPLE_MS` | 宿主框架公布的采样间隔；开启峰值记录而框架未公布时为 `50` | 在独立线程上采样进程**实测**占用的间隔：`/proc/self/status` 的当前 `VmRSS`、dmabuf 字节数，以及这两者都覆盖不到的 GPU 设备映射。所有模式共用的峰值判据都是同一轮采样中三者之和。**只设它一个即选择只观测探测模式**：测量并打印实测占用，不做任何跟踪。要归因到调用点，再加 `DUMP_PEAK_STEP_MB`（峰值追踪）或 `DUMP_PEAK_VALUE_MB`（首次越线）。`0` 表示强制不起采样线程，判据退回跟踪到的分配字节数。 |
-| `BACKTRACE_MIN_SIZE` | OHOS 为 `40960`；其他平台开启峰值记录时为 `1024`，否则为 `0` | 小于该尺寸的分配不抓堆栈。这是最主要的开销控制项：典型流水线里它会过滤掉 99% 以上的分配。 |
+| `DUMP_PEAK_VALUE_MB` | 未设置 | 正值下限选择**首次越线**模式：打开峰值记录和退出时导出，只保留峰值判据首次越过该 MB 数时的那一张快照。设为 `0` 表示关闭首次越线。 |
+| `DUMP_PEAK_STEP_MB` | `0`（关闭） | 给正值并与 `ALLOC_HOOK_PEAK_SAMPLE_MS` 一起使用时选择**峰值追踪**；单独设置不起作用。表示重建峰值快照所需增长量的上限；小峰值使用 25% 增长量、下限 64 KB。首次越线模式下不生效。 |
+| `ALLOC_HOOK_PEAK_SAMPLE_MS` | 宿主框架公布的间隔；开启峰值记录而框架未公布时为 `50` | 在独立线程上采样进程**实测**占用（`VmRSS` + dmabuf + 未被覆盖的 GPU 映射）的毫秒间隔。**只设它一个即选择只观测探测模式**：测量并打印，不做跟踪。`0` 表示强制不起采样线程。 |
+| `ALLOC_HOOK_DUMP_PREFIX` | `/data/local/tmp/trace/backtrace_heap` | 报告路径前缀。文件名为 `<prefix>.exit.pid_<pid>.time_<t>.txt`。 |
+| `BACKTRACE_MIN_SIZE` | OHOS 为 `40960`；其他平台开启峰值记录时为 `1024`，否则为 `0` | 小于该尺寸的分配不抓堆栈。最主要的开销控制项：典型流水线里它会过滤掉 99% 以上的分配。 |
 | `ALLOC_HOOK_CAPTURE_MODE` | `fast` | `fast` = 在分配线程中只抓有界原始 PC，不做符号化；worker 后续可解析动态符号。`accurate` = 使用操作系统特定后端。 |
-| `ALLOC_HOOK_SAMPLING_INTERVAL_BYTES` | `1`（关闭） | 按该字节间隔对 host 分配做 Poisson 采样。会缩放报告中的 host 尺寸，不影响 DMA 统计。 |
-| `ALLOC_HOOK_FAST_CAPTURE_INTERVAL_BYTES` | `1`（关闭） | 每分配这么多字节才抓一次堆栈。只抑制堆栈，不影响精确的尺寸统计。 |
-| `ALLOC_HOOK_FAST_UNWINDER` | 未设置 | 设为 `compiler` 时强制使用 `_Unwind_Backtrace`，而不是 aarch64 帧指针回溯。默认使用帧指针回溯，因为它更快，而且不会在某些 unwind 表会把 libgcc 带进指针认证路径、进而触发 `SIGILL` 的目标上崩溃。 |
-| `BACKTRACE_DUMP_SIGNAL` | `SIGRTMIN+6`（Bionic 为 `BIONIC_SIGNAL_BACKTRACE`；OHOS 为 `46`） | 触发按需导出报告的信号。 |
-| `ALLOC_HOOK_DEBUG` | 未设置 | 设为任意值即在 stderr 输出 hook 诊断信息（信号、unwind、ION/DMA 路径）。 |
+| `ENABLE_HOOK_DEBUG` | 未设置 | 设为任意值即在 stderr 输出 hook 诊断信息（信号、unwind、ION/DMA 路径）。 |
 
-命名说明：`DUMP_*` 和 `BACKTRACE_*` 这些变量早于 `ALLOC_HOOK_*` 前缀，因为部署
-脚本依赖它们，所以保持原样。
+触发报告的信号不可调：各平台使用其约定的 backtrace 信号（Android 为 Bionic 保留的
+backtrace 信号，OHOS 为 `46`，其他平台为 `SIGRTMIN+6`）。
 
-### 两类 hook 行为
+命名说明：`DUMP_*` 和 `BACKTRACE_*` 这些变量早于 `ALLOC_HOOK_*` 前缀，因为部署脚本依赖
+它们，所以保持原样。
 
-所有模式使用的判据完全相同——实测占用合计，即在独立线程上从 `/proc` 采样得到的
-`VmRSS` + dmabuf + GPU 映射。区别在于这次运行**是否同时跟踪分配**、把这个合计归因
-到调用点，因为开销全在这件事上。设置了哪些变量就完全决定了跑哪一种：
+## 获取报告
 
-| 设置 | 模式 | 被插入的调用 | 产出 | 回答的问题 |
-| --- | --- | --- | --- | --- |
-| `ALLOC_HOOK_PEAK_SAMPLE_MS=k` | 只观测探测 | 原样转发给 libc | 退出时 stderr 上一段**日志** | 这个进程占了多少，rss / dma / gpu 各多少 |
-| `DUMP_PEAK_VALUE_MB=N` | 首次越线 | 跟踪，整个运行一次栈遍历 | 一份**报告文件** | 首次超过 `N` MB 时是谁占着内存 |
-| `ALLOC_HOOK_PEAK_SAMPLE_MS=k` + `DUMP_PEAK_STEP_MB=s` | 峰值追踪 | 跟踪，每涨 `s` 一次栈遍历 | 一份**报告文件** | 运行期最大值时刻是谁占着内存 |
+设置了上面哪些变量，就完全决定了这次运行是哪一种：
 
-探测模式回答"多少"；两种报告模式回答"哪些调用点"，并为此付费。除此之外没有任何东西
-会开启报告：只给间隔、或只给步长，得到的是探测模式或什么都没有。
+- 只设 `ALLOC_HOOK_PEAK_SAMPLE_MS`——**只观测探测模式**：测量进程占了多少
+  （rss / dma / gpu），不跟踪任何东西，退出时打印一段日志。
+- 设 `DUMP_PEAK_VALUE_MB`——**首次越线**：一份报告、一次栈遍历，回答首次越过下限时是谁
+  占着内存。这是常用的报告模式。
+- 设 `ALLOC_HOOK_PEAK_SAMPLE_MS` + `DUMP_PEAK_STEP_MB`——**峰值追踪**：一份描述运行期
+  最大值的报告，每涨一个步长做一次栈遍历。
 
-`0` 是这一组变量统一的关闭方式：`DUMP_PEAK_VALUE_MB=0` 表示不要首次越线快照，
-`DUMP_PEAK_STEP_MB=0` 表示不要追踪，`ALLOC_HOOK_PEAK_SAMPLE_MS=0` 表示连采样线程都
-不要。两个报告开关都置 0 的运行仍然是探测模式；三个都置 0 的运行为按需 checkpoint
-保留跟踪，自己不产出任何东西。
-
-首次越线更省、也更稳：那一次遍历之后不会再有任何分配线程被快照阻塞，这对被测流水
-线本身对时序敏感的场景很重要。代价是堆栈描述的是下限那一刻而不是峰值时刻，所以要
-回答"峰值时刻是谁占着内存"就必须把下限设到接近峰值——通常来自上一次运行的报告。
-调参看 `snapshot_lag`：它就是下限还能往上抬多少。
-
-峰值追踪不需要这种先验知识，首次运行就能拿到正确的峰值快照，代价是峰值每涨过一个
-步长就要做一次栈遍历。
-
-两种报告模式都会在正常退出时写到 `ALLOC_HOOK_DUMP_PREFIX`，并在目录不存在时自动
-创建。两个变量同时设置时按首次越线处理，采样间隔用你给的值。
-
-#### 只观测探测模式
-
-符号插入无法在运行时关闭——`LD_PRELOAD` 已经完成绑定——但被插入的调用**做不做事**
-是可以的，而跟踪只有在报告会消费它时才划得来。所以只要求一个采样节奏的运行根本不会
-构造跟踪器：
-
-```sh
-LD_PRELOAD=/path/liballoc_hook.so ALLOC_HOOK_PEAK_SAMPLE_MS=5 ./your_program
-```
-
-```text
-alloc_hook: ============================================================
-alloc_hook:                 Memory Usage Summary
-alloc_hook: ------------------------------------------------------------
-alloc_hook:   DMA Max (sampling):                              0.00 MB
-alloc_hook:   RSS Max (sampling):                             61.27 MB
-alloc_hook:   GPU mmap Max (sampling):                        12.05 MB
-alloc_hook:   RSS Max (getrusage):                            61.54 MB
-alloc_hook:   DMA+RSS+GPU mmap Max (sampling):                73.29 MB
-alloc_hook:   not measured, so not a zero: dma
-alloc_hook: ------------------------------------------------------------
-alloc_hook:   Sampling Period:                                    1 ms
-alloc_hook:   Achieved Period:                                22.28 ms
-alloc_hook: ============================================================
-```
-
-这段日志沿用宿主框架为同样三项打印的摘要形状、列宽和黄色标识，便于在同一份日志里并排
-阅读；颜色只在 stderr 是终端时才输出。开销是一个读 `/proc` 的采样线程，加上每次被插入
-调用一次 relaxed 读——实测每对 `malloc`/`free` 68 ns，不预加载任何库时 60 ns，而没有尺寸
-过滤的跟踪模式是 2762 ns。
-
-四行需要注意。前三行是各项自己的最大值，它们不必同时见顶，所以它们的和不等于合计行；
-合计行是**同一轮采样**内三者之和的最大值，也就是外部评估者当作进程峰值上报的那个量。
-`RSS Max (getrusage)` 是内核自己的高水位，明显高于采样得到的 RSS 行就说明两次采样之间
-出现过一次驻留峰值。`Achieved Period` 高于 `Sampling Period` 说明读 `/proc` 的耗时超过
-了间隔，采样器为保证不超过半个核自行降频。而没有可用接口的那一项会在 `not measured`
-行里被点名，而不是让读者把 0.00 当成测得为零。
-
-用它来判断一个进程有没有内存问题、问题有多大，同时几乎不扰动它：它不抓任何栈，所以说
-不出是哪个调用点造成的。它也没有存活分配表，因此 `checkpoint()` 会把同样这些数据写到
-指定路径而不是堆报告，checkpoint 信号被忽略而不是放任它打死一个只是在被测量的进程。
-`fork` 出的子进程不打印，通过 `_exit()` 或致命信号离开的进程什么都不打印——这和跟踪模式
-的报告是同一个限制。当答案是"有，而且有这么多"时，再加 `DUMP_PEAK_STEP_MB` 或
-`DUMP_PEAK_VALUE_MB` 去看它花在哪。
-
-#### 采样节奏
-
-常见场景下 `ALLOC_HOOK_PEAK_SAMPLE_MS` 不需要显式赋值。采样本进程内存的宿主框架
-会把自己使用的间隔写在一个名字以 `AUTO_SHOW_MEM_USE_DURATION_MS` 结尾的环境变量
-里；hook 发现它被设为正值时就直接沿用该间隔，这样快照时刻就落在该框架报出峰值的
-同一瞬间，也不需要人工同步采样节奏。没有这个变量时，开启峰值记录后按 50ms 采样。
-显式设置 `ALLOC_HOOK_PEAK_SAMPLE_MS` 会覆盖以上两者，包括设为 `0`——那表示完全不
-起采样线程，改用跟踪到的分配字节数与下限比较；这是另一个量，报告会如实标注。
-
-框架的那个变量只提供节奏，永远不会单独打开峰值记录：一个什么都没设的进程，不应该
-因为环境里有它就凭空多出一个采样线程和一份退出报告。
-
-这里不会读取历史累计字段 `VmPeak` 或 `VmHWM`，因为它们无法告诉 hook 应在哪一刻
-复制存活堆栈。每一轮采样先读取当前 `VmRSS`，再读取 DMA 和 GPU 内存，并用同一轮
-三者之和与此前最大值比较。当总和还越过 `DUMP_PEAK_VALUE_MB` 和
-`DUMP_PEAK_STEP_MB` 的门槛时，回调会立即再次读取
-`VmRSS`/`RssAnon`/`RssFile`/`RssShmem`，从 `/proc/self/smaps` 收集驻留量最高的
-映射，并复制存活堆栈表。这些读取和堆栈复制是顺序执行的，不是内核提供的原子快照；
-报告中的 `at_peak` 表示它们来自同一个峰值回调窗口。
-
-如果希望快照紧跟实测最大值，可以显式配置：
-
-```sh
-export ALLOC_HOOK_PEAK_SAMPLE_MS=5   # 峰值追踪；最好与外部采样器保持一致
-export DUMP_PEAK_STEP_MB=1           # 最小的有效步长：最贴近最大值，栈遍历最多
-export BACKTRACE_MIN_SIZE=1024       # 只有确实需要每个小分配的栈时才设为 0
-```
-
-只要一张快照时，下限取自上一次运行报出的峰值：
-
-```sh
-export DUMP_PEAK_VALUE_MB=300        # 首次越过 300MB；整个运行一次栈遍历
-export BACKTRACE_MIN_SIZE=1024
-```
-
-需要精确 host 归因并为每个满足尺寸条件的分配抓栈时，应让
-`ALLOC_HOOK_SAMPLING_INTERVAL_BYTES` 和 `ALLOC_HOOK_FAST_CAPTURE_INTERVAL_BYTES`
-保持未设置（实际默认值均为 `1`）。在存在受支持 GPU 设备节点的平台上，实测判据是
-`rss + dma + gpu`；当前没有只排除这项未被其他统计覆盖的 GPU 内存、强制改为
-`rss + dma` 的运行时开关。
-
-报告会写明保留下来的快照描述的是哪一次越线、由哪种判据产生；如果是实测占用，还会
-写明快照那一刻的实测值、整个 run 的最大值，以及采样器本身的开销：
-
-```text
-peak_retention: chase_max (snapshot refreshed per step)
-peak_criterion: observed_host_rss_plus_dma_plus_gpu (from /proc, aligned with an external sampler)
-observed_peak(at_snapshot):     rss=291.75MB dma=935.12MB gpu=24.00MB total=1250.87MB
-observed_peak(max_of_sum):      rss=291.75MB dma=935.12MB gpu=24.00MB total=1250.87MB (...)
-observed_peak(independent_max): rss=369.54MB dma=935.12MB gpu=24.00MB
-observed_sampler: interval_ms=1 achieved_ms=1.58 dma_source=fd+maps gpu_source=smaps samples=9516 ...
-```
-
-`at_snapshot` 和 `max_of_sum` 相等就是目标状态：堆栈是在最大值那一刻抓的，而不是在
-爬升过程中的某一级。首次越线模式下两者按设计就不相等，差值由 `snapshot_lag` 给出：
-
-```text
-peak_retention: first_crossing floor=200.000000MB (single snapshot; step unused)
-snapshot_lag: observed=+117.800781MB (of 323.628906MB peak)
-```
-
-如果整个运行都没越过下限，就没有任何快照。此时报告不会输出一段空的堆栈——那看起来
-和"hook 什么都没抓到"一样——而是退回列出报告时刻的存活分配，并写明原因：
-
-```text
-peak_snapshot: none (criterion never passed the floor; the list above is live at report time)
-peak_criterion: none (nothing was snapshotted)
-```
-
-`achieved_ms` 大于请求的间隔说明读 `/proc` 的耗时超过了间隔，
-采样器自行降频以保证不超过半个核——它不会谎报一个没达到的节奏。当 host 和设备内存
-在不同时刻见顶时，`independent_max` 会高于 `max_of_sum` 中的任一项，而这正是这套机
-制存在的理由。
-
-`gpu` 指驱动没有走 dmabuf、而是直接 mmap 字符设备拿到的设备内存，并且是 PFN/IO 映射、
-背后没有 struct page。这类区间会同时躲开 `rss` 和 `dma`：它不是 dmabuf，而内核又因为
-没有 page 可计账而把 PFN/IO 页排除在 `VmRSS` 之外——所以在补上这一项之前，这里的和相
-对于同样上报这三项的外部采样器，正好少了这么多。它按每个区间的 `Size - Rss` 从
-`/proc/self/smaps` 读出，因此内核**确实**计入 `VmRSS` 的那部分只贡献 `rss` 还没算上的
-差额。
-
-三件它做不到的事：采样器读的是 `/proc`，只能看到采样时刻的进程状态，持续时间不足
-一个间隔的峰值它抓不到——被对齐的那个外部采样器同样抓不到。`dma_source=none` 表示
-这个内核没有可读取的 dmabuf 统计接口，不等于进程没有占用设备内存。而在没有这一遍
-所统计的设备节点的平台上 `gpu_source` 为 `not_applicable`，这同样不是"测得为零"，而
-是根本没去测——这个判断刻意放在打开 `/proc/self/smaps` 之前：内核要遍历进程里每个
-VMA 的每个 PTE 才能给出这一遍需要的按区间驻留量，实测 arm64 目标上一个约 460 MB 的
-进程要 ~25 ms，所以把区间放到读完之后再过滤，等于付满全部代价换一个零。
+完整命令行、输出和每个报告字段的读法见
+[`docs/get_hook_report.zh-CN.md`](docs/get_hook_report.zh-CN.md)。
 
 ## 支持的平台
 
-| 能力 | Android | OHOS（默认） | OHOS（`MALLOC_HOOK_OHOS_MMAP_HOOK=ON`） | glibc Linux |
+| 能力 | Android | OHOS（默认） | OHOS（`ENABLE_MMAP_HOOK_EXPORT=ON`） | glibc Linux |
 | --- | --- | --- | --- | --- |
 | `malloc`/`free`/`calloc`/`realloc` | 支持 | 支持 | 支持 | 支持 |
 | 对齐分配 API | 支持 | 支持 | 支持 | 支持 |
@@ -282,11 +127,10 @@ VMA 的每个 PTE 才能给出这一遍需要的按区间驻留量，实测 arm6
 | `ioctl`/`close` DMA 抓取 | 支持（默认） | 支持（默认） | 支持（默认） | 支持（默认） |
 | 检查点报告 | 支持 | 支持 | 支持 | 支持 |
 
-OHOS 默认关闭 `mmap` 拦截，以减少 loader 和厂商运行时受到的影响。只有在
-小型、可控的复现程序中才建议打开。
+`ENABLE_MMAP_HOOK_EXPORT` 在 OHOS 上默认关闭，以减少 loader 和厂商运行时受到的影响。
+只有在小型、可控的复现程序中才建议打开。
 
 ## 范围和安全
 
-本项目追踪原生 C/C++ 分配活动。采样会改变 host 分配归因，但不会改变资源
-记账。直接系统调用和未导出的厂商入口会绕过拦截。不要将生成的报告或私有
-设备标识写入源代码文档。
+本项目追踪原生 C/C++ 分配活动。直接系统调用和未导出的厂商入口会绕过拦截。不要将生成的
+报告或私有设备标识写入源代码文档。

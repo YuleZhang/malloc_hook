@@ -3,7 +3,19 @@ cmake_minimum_required(VERSION 3.23)
 project(malloc_hook LANGUAGES C CXX ASM)
 
 option(MALLOC_HOOK_BUILD_TESTS "Build malloc_hook test binaries" ON)
-option(MALLOC_HOOK_OHOS_MMAP_HOOK "Export mmap/munmap hooks in OHOS builds" OFF)
+# mmap/munmap/mremap interposition is a platform-neutral capability, but its
+# default differs: OHOS leaves it off to limit loader/vendor runtime
+# interference, while Android and glibc Linux export it by policy. The target
+# identity (ANDROID/OHOS) is set by the toolchain before options are declared,
+# so the default can be selected here without a separate per-OS switch.
+if(OHOS)
+  set(_malloc_hook_mmap_hook_default OFF)
+else()
+  set(_malloc_hook_mmap_hook_default ON)
+endif()
+option(ENABLE_MMAP_HOOK_EXPORT
+  "Export mmap/munmap/mremap hooks (default OFF on OHOS, ON elsewhere)"
+  ${_malloc_hook_mmap_hook_default})
 # DMA/ION/GPU buffer capture is part of what this tool measures, not an add-on:
 # on every supported target the majority of a camera/NN pipeline's memory is
 # DMA-BUF, so it is on by default. Turn it off only for host smoke builds that
@@ -140,15 +152,22 @@ target_compile_definitions(malloc_hook_platform_contract INTERFACE
   "MALLOC_HOOK_HAVE_DMA_HEAP_UAPI=${_malloc_hook_dma_heap_uapi}"
   "MALLOC_HOOK_HAVE_COMPILER_UNWIND=${_malloc_hook_compiler_unwind}")
 
+# mmap export is a single capability across every target now; only its default
+# differs by OS (selected above). The version script for each policy lists the
+# mmap family, and the strip pass below removes it when the capability is off.
+if(ENABLE_MMAP_HOOK_EXPORT)
+  set(MALLOC_HOOK_EXPORT_MMAP_HOOK 1)
+else()
+  set(MALLOC_HOOK_EXPORT_MMAP_HOOK 0)
+endif()
+
 if(MALLOC_HOOK_TARGET_OS STREQUAL "android")
   set(MALLOC_HOOK_EXPORT_POLICY android)
-  set(MALLOC_HOOK_EXPORT_MMAP_HOOK 1)
   set(MALLOC_HOOK_EXPORT_RESOURCE_HOOKS 1)
   set(MALLOC_HOOK_EXPORT_CPP_NEW_HOOK 0)
   set(VERSION_SCRIPT ${CMAKE_SOURCE_DIR}/version_script.ld)
 elseif(MALLOC_HOOK_TARGET_OS STREQUAL "linux")
   set(MALLOC_HOOK_EXPORT_POLICY linux)
-  set(MALLOC_HOOK_EXPORT_MMAP_HOOK 1)
   set(MALLOC_HOOK_EXPORT_RESOURCE_HOOKS 1)
   set(MALLOC_HOOK_EXPORT_CPP_NEW_HOOK 0)
   set(VERSION_SCRIPT ${CMAKE_SOURCE_DIR}/version_script.ld)
@@ -156,13 +175,7 @@ elseif(MALLOC_HOOK_TARGET_OS STREQUAL "ohos")
   set(MALLOC_HOOK_EXPORT_POLICY ohos)
   set(MALLOC_HOOK_EXPORT_RESOURCE_HOOKS 1)
   set(MALLOC_HOOK_EXPORT_CPP_NEW_HOOK 1)
-  if(MALLOC_HOOK_OHOS_MMAP_HOOK)
-    set(MALLOC_HOOK_EXPORT_MMAP_HOOK 1)
-    set(VERSION_SCRIPT ${CMAKE_SOURCE_DIR}/version_script_ohos_mmap.ld)
-  else()
-    set(MALLOC_HOOK_EXPORT_MMAP_HOOK 0)
-    set(VERSION_SCRIPT ${CMAKE_SOURCE_DIR}/version_script_ohos.ld)
-  endif()
+  set(VERSION_SCRIPT ${CMAKE_SOURCE_DIR}/version_script_ohos.ld)
 else()
   message(FATAL_ERROR
     "No hook export policy for target OS '${MALLOC_HOOK_TARGET_OS}'")
@@ -172,21 +185,31 @@ if(NOT MALLOC_HOOK_ENABLE_DMA_CAPTURE)
   set(MALLOC_HOOK_EXPORT_RESOURCE_HOOKS 0)
 endif()
 
-# A host smoke build may intentionally disable vendor resource interception.
-# Keep the ABI manifest valid in that mode instead of asking the linker to
-# export hooks that are not compiled into the library.
+# The selected version script lists every hook this project can export. Symbols
+# for a capability that is off in this build are stripped here so the linker is
+# never asked to export a hook that was not compiled in: ioctl/close when
+# resource tracking is off (host smoke builds), and the mmap family when mmap
+# export is off (OHOS default, or an explicit opt-out on any platform).
+set(_malloc_hook_strip_symbols "")
 if(NOT MALLOC_HOOK_EXPORT_RESOURCE_HOOKS)
+  list(APPEND _malloc_hook_strip_symbols "ioctl" "close")
+endif()
+if(NOT MALLOC_HOOK_EXPORT_MMAP_HOOK)
+  list(APPEND _malloc_hook_strip_symbols "mmap" "mmap64" "munmap" "mremap")
+endif()
+if(_malloc_hook_strip_symbols)
   file(READ "${VERSION_SCRIPT}" _malloc_hook_version_script)
+  string(REPLACE ";" "|" _malloc_hook_strip_alternation "${_malloc_hook_strip_symbols}")
   string(REGEX REPLACE
-    "[ \t]*(ioctl|close)[ \t]*;[ \t]*\n"
+    "[ \t]*(${_malloc_hook_strip_alternation})[ \t]*;[ \t]*\n"
     ""
     _malloc_hook_version_script
     "${_malloc_hook_version_script}")
-  set(_malloc_hook_no_resource_script
-      "${CMAKE_BINARY_DIR}/malloc_hook_version_script_no_resource.ld")
-  file(GENERATE OUTPUT "${_malloc_hook_no_resource_script}"
+  set(_malloc_hook_stripped_script
+      "${CMAKE_BINARY_DIR}/malloc_hook_version_script_stripped.ld")
+  file(GENERATE OUTPUT "${_malloc_hook_stripped_script}"
        CONTENT "${_malloc_hook_version_script}")
-  set(VERSION_SCRIPT "${_malloc_hook_no_resource_script}")
+  set(VERSION_SCRIPT "${_malloc_hook_stripped_script}")
 endif()
 
 # ARCH-01 capability contract. OS, libc, and CPU identity remain independent
@@ -274,7 +297,7 @@ add_custom_target(print_build_options
   COMMAND ${CMAKE_COMMAND} -E echo "  compiler=${CMAKE_CXX_COMPILER_ID}-${CMAKE_CXX_COMPILER_VERSION}"
   COMMAND ${CMAKE_COMMAND} -E echo "  target=${MALLOC_HOOK_TARGET_OS}/${MALLOC_HOOK_TARGET_LIBC}/${MALLOC_HOOK_TARGET_ARCH}"
   COMMAND ${CMAKE_COMMAND} -E echo "  MALLOC_HOOK_ENABLE_DMA_CAPTURE=${MALLOC_HOOK_ENABLE_DMA_CAPTURE}"
-  COMMAND ${CMAKE_COMMAND} -E echo "  MALLOC_HOOK_OHOS_MMAP_HOOK=${MALLOC_HOOK_OHOS_MMAP_HOOK}"
+  COMMAND ${CMAKE_COMMAND} -E echo "  ENABLE_MMAP_HOOK_EXPORT=${ENABLE_MMAP_HOOK_EXPORT}"
   COMMAND ${CMAKE_COMMAND} -E echo "  MALLOC_HOOK_BUILD_TESTS=${MALLOC_HOOK_BUILD_TESTS}"
   COMMAND ${CMAKE_COMMAND} -E echo "  MALLOC_HOOK_BUILD_GL_TESTS=${MALLOC_HOOK_BUILD_GL_TESTS}"
   COMMAND ${CMAKE_COMMAND} -E echo "  build_gl_tests_effective=${_malloc_hook_build_gl_tests_effective}"

@@ -153,10 +153,13 @@ function(verify_policy COMPILER POLICY SCRIPT EXPECT_CPP EXPECT_MMAP)
 endfunction()
 
 foreach(COMPILER IN LISTS COMPILERS)
+  # These are the base ABI manifests: each lists every hook its policy can
+  # export, mmap family included. The OHOS default of *not* exporting mmap is
+  # produced by the CMake strip pass (ENABLE_MMAP_HOOK_EXPORT=OFF), and is
+  # verified end to end against the built library by built_platform_export_policy.
   verify_policy("${COMPILER}" android version_script.ld FALSE TRUE)
   verify_policy("${COMPILER}" linux version_script.ld FALSE TRUE)
-  verify_policy("${COMPILER}" ohos version_script_ohos.ld TRUE FALSE)
-  verify_policy("${COMPILER}" ohos-mmap version_script_ohos_mmap.ld TRUE TRUE)
+  verify_policy("${COMPILER}" ohos version_script_ohos.ld TRUE TRUE)
 endforeach()
 
 message(STATUS "Verified platform export policies with: ${COMPILERS}")

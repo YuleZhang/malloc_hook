@@ -18,7 +18,6 @@
 
 #include "Config.h"
 #include "ObservedMemory.h"
-#include "Sampling.h"
 #include "UnwindBacktrace.h"
 
 // Live allocations left out of a report because they carry no stack (filtered
@@ -192,7 +191,6 @@ public:
     // state it had before the failed operation.
     void RestoreEntry(const void* ptr, const PointerInfoType& info);
     size_t AddBacktrace(size_t num_frames, size_t size_bytes);
-    bool ShouldCaptureBacktrace(size_t size_bytes);
     void Remove(const void* ptr);
     void RemoveBacktrace(size_t hash_index);
 

@@ -77,12 +77,6 @@ target_link_libraries(observed_memory_test PRIVATE
     ${CMAKE_DL_LIBS} Threads::Threads)
 add_test(NAME observed_memory COMMAND observed_memory_test)
 
-add_executable(sampling_test sampling_test.cpp)
-target_compile_features(sampling_test PRIVATE cxx_std_17)
-target_include_directories(sampling_test PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/../backtrace/include)
-add_test(NAME sampling COMMAND sampling_test)
-
 add_executable(async_report_contract_test
     async_report_contract_test.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/../backtrace/src/AsyncStackPipeline.cpp)

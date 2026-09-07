@@ -1,5 +1,7 @@
-/* OHOS default ABI: C allocation/resource hooks plus C++ allocation hooks.
- * mmap interposition is opt-in through version_script_ohos_mmap.ld. */
+/* OHOS ABI: C allocation/resource hooks plus C++ allocation hooks, and the
+ * mmap family. mmap/munmap/mremap are stripped from this manifest by CMake when
+ * ENABLE_MMAP_HOOK_EXPORT is off (the OHOS default), so this one script covers
+ * both the default and the opt-in build. */
 {
 global:
     malloc;
@@ -9,6 +11,10 @@ global:
     aligned_alloc;
     memalign;
     posix_memalign;
+    mmap;
+    mmap64;
+    munmap;
+    mremap;
     ioctl;
     close;
     checkpoint;
