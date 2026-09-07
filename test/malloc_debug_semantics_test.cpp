@@ -110,9 +110,8 @@ long ThreadsAtLeast(long target) {
 }  // namespace
 
 int main() {
-    // Force Fast-mode sampling to leave this small allocation unsampled.
+    // Fast mode tracks every allocation at its exact size (no sub-sampling).
     setenv("ALLOC_HOOK_CAPTURE_MODE", "fast", 1);
-    setenv("ALLOC_HOOK_SAMPLING_INTERVAL_BYTES", "1000000000", 1);
 
     m_sys_malloc = FakeMalloc;
     m_sys_free = FakeFree;

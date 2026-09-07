@@ -7,74 +7,80 @@ checkpoint or peak reports.
 
 [中文 README / Chinese README](README.zh-CN.md)
 
-## General hook lifecycle
+## Hook flow
+
+The interception path does three things, in three stages, and only the first
+runs on the allocating thread:
 
 ```mermaid
 flowchart LR
-    A[allocation or resource hook] --> B[filter and optional Fast sampling]
-    B --> C{capture mode}
-    C -->|Fast| D[_Unwind_Backtrace raw PCs]
-    C -->|Accurate| E[platform native backend]
-    D --> F[backend-neutral raw stack]
-    E --> F
-    F --> G[live accounting and bounded async queue]
-    G --> H[ModuleResolver]
-    H --> I[Symbolizer]
-    I --> J[checkpoint / peak report]
+    A[allocation / resource hook] --> B[Capture]
+    B --> C[Light parse]
+    C --> D[Generate report]
+    B -.-> B1[size filter + bounded raw stack]
+    C -.-> C1[async: module snapshot + symbolize]
+    D -.-> D1[checkpoint / peak report]
 ```
 
-The interception path performs filtering, accounting decisions, and bounded
-native capture only. Module lookup, worker-side `dladdr`, symbolization, and
-report formatting stay outside the allocation hook. Successful `malloc`/`new`,
-anonymous `mmap`, and selected resource-allocating `ioctl` events share one raw
-stack contract; release paths reuse the stored allocation identity.
+- **Capture** — on the allocating thread. Filter by size, then take a bounded
+  raw-PC stack (a frame-pointer walk in Fast mode, an OS backend in Accurate
+  mode). No module lookup, no symbolization, no dynamic allocation.
+- **Light parse** — on a worker thread. Deduplicate raw stacks, snapshot the
+  loaded ELF modules, and resolve dynamic symbol names, keeping raw and
+  module-relative PCs when symbols are unavailable.
+- **Generate report** — a checkpoint (on demand) or a peak report (on exit).
 
-## Current architecture
+Successful `malloc`/`new`, anonymous `mmap`, and selected resource-allocating
+`ioctl` events share one raw-stack contract; release paths reuse the stored
+allocation identity.
+
+## Architecture
 
 The implementation is split into platform-neutral contracts and platform
-backends:
+backends. The three flow stages map onto these pieces:
 
-- **Capture:** Fast uses bounded `_Unwind_Backtrace` capture when the compiler
-  runtime exposes it. Accurate selects an explicit Android, Linux, or OHOS
-  backend and preserves partial/error state.
-- **Async resolution:** `AsyncStackPipeline` deduplicates raw stacks, snapshots
-  loaded ELF modules, resolves dynamic names on a worker, and retains raw and
-  module-relative PCs when symbols are unavailable.
-- **Report addresses:** captured PCs are return addresses, so every
-  module-relative PC in a report is stepped back into the call instruction
-  before module lookup. The addresses on `#<n> <addr> <module>` lines are ELF
-  virtual addresses of call sites and can be fed straight to
+- **Capture.** `CaptureStack()` returns a project-owned `RawStackRecord` with
+  capture state, mode, backend, terminal error, skipped-frame count, module
+  generation, and bounded PCs. Fast uses a bounded frame-pointer walk on aarch64
+  (falling back to `_Unwind_Backtrace` where the frame-pointer walk is
+  unavailable); Accurate selects an explicit Android, Linux, or OHOS backend and
+  preserves partial/error state. The core contract is native C/C++ and
+  current-thread; managed-runtime stacks, other-thread contexts, and offline
+  DWARF expansion are optional future capabilities.
+- **Light parse.** `AsyncStackPipeline` deduplicates records by raw PCs and
+  module generation, snapshots loaded ELF load segments through `dl_iterate_phdr`
+  on a worker, and uses worker-side `dladdr` for dynamic symbol names. It always
+  retains raw and module-relative PCs, and does not promise complete DWARF or
+  offline symbolization. Queue capacity, duplicate suppression, dropped work, and
+  processed results are exposed through `AsyncStackStats`; hook boundaries use
+  `AsyncStackWorkerThread()` so the resolver's own allocations are not tracked.
+- **Report addresses.** Captured PCs are return addresses, so every
+  module-relative PC in a report is stepped back into the call instruction before
+  module lookup. The addresses on `#<n> <addr> <module>` lines are ELF virtual
+  addresses of call sites and can be fed straight to
   `llvm-symbolizer --obj=<unstripped-elf>`; each report states the convention on
   its `frame_pc:` line.
-- **Accounting:** `PointerData` owns live-allocation identity, sampled host
-  accounting, resource accounting, and peak counters.
-- **Platform boundaries:** CMake separates OS, libc, architecture, compiler
-  unwind capability, and export policy. OHOS `mmap` interposition is opt-in.
+- **Accounting.** `PointerData` owns the live-allocation table, resource
+  accounting, and peak counters. Every eligible allocation is tracked at its
+  exact size; the size filter (`BACKTRACE_MIN_SIZE`) is the only cost control.
+- **Platform boundaries.** CMake separates OS, libc, architecture, compiler
+  unwind capability, and export policy. mmap interposition is a single capability
+  gated by `ENABLE_MMAP_HOOK_EXPORT`, on by default on Android and glibc Linux
+  and off by default on OHOS to limit loader/vendor interference. Resource hooks
+  are exported only when DMA capture is built in.
 
-See the detailed architecture contract in
-[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md). The architecture is native
-C/C++ and current-thread oriented; managed-runtime stacks, remote-thread
-contexts, and complete offline DWARF expansion are optional future capabilities.
+## Documentation
 
-## Usage
+| Document | What it covers |
+| --- | --- |
+| [`docs/get_hook_report.md`](docs/get_hook_report.md) | The two kinds of hook behaviour — the observe-only probe and the two report modes — and how to read a report. |
+| [`docs/EXAMPLE.md`](docs/EXAMPLE.md) | Prerequisites, builds, preload deployment, checkpoints, troubleshooting, and known limitations, end to end. |
+| [`docs/GPU_MEMORY_ACCOUNTING.md`](docs/GPU_MEMORY_ACCOUNTING.md) | How GPU device memory is accounted, which driver paths land in which signal, and the vendor API pitfalls. |
 
-The same-language usage guide is the entry point for prerequisites, builds,
-preload deployment, configuration, checkpoints, troubleshooting, and known
-limitations:
-
-[`docs/USAGE.md`](docs/USAGE.md)
-
-How GPU device memory is accounted differs by OS, vendor, driver allocation path
-and kernel version, and the three signals the sampler sums do not partition it
-cleanly. Which paths land in which signal, with the vendor API pitfalls found
-while establishing it:
-
-[`docs/GPU_MEMORY_ACCOUNTING.md`](docs/GPU_MEMORY_ACCOUNTING.md)
-
-The Chinese entry points remain entirely in Chinese:
+Chinese entry points:
 [`README.zh-CN.md`](README.zh-CN.md),
-[`docs/ARCHITECTURE.zh-CN.md`](docs/ARCHITECTURE.zh-CN.md),
-[`docs/USAGE.zh-CN.md`](docs/USAGE.zh-CN.md), and
+[`docs/get_hook_report.zh-CN.md`](docs/get_hook_report.zh-CN.md),
+[`docs/EXAMPLE.zh-CN.md`](docs/EXAMPLE.zh-CN.md), and
 [`docs/GPU_MEMORY_ACCOUNTING.zh-CN.md`](docs/GPU_MEMORY_ACCOUNTING.zh-CN.md).
 
 ## Configuration
@@ -86,8 +92,8 @@ switches: if a behaviour is not listed here, it is not tunable.
 
 | Option | Default | Effect |
 | --- | --- | --- |
-| `MALLOC_HOOK_ENABLE_DMA_CAPTURE` | `ON` | Capture DMA-BUF/ION/GPU buffers (`ioctl`/`close` interposition) in addition to `malloc`/`mmap`. Turn off only for host smoke builds with no driver UAPI; on a real device most pipeline memory is DMA, so leaving it off makes the report look empty. |
-| `MALLOC_HOOK_OHOS_MMAP_HOOK` | `OFF` | Export `mmap`/`munmap` on OHOS. Off by default to limit loader/vendor interference. |
+| `MALLOC_HOOK_ENABLE_DMA_CAPTURE` | `ON` | Capture DMA-BUF/ION/GPU buffers (`ioctl`/`close` interposition) in addition to `malloc`/`mmap`. Turn off only for host smoke builds with no driver UAPI; on a real device most pipeline memory is DMA, so leaving it off makes the report look empty. This governs only the tracked interposition — the observed-memory sampler reads dmabuf from `/proc` regardless. |
+| `ENABLE_MMAP_HOOK_EXPORT` | `ON` (Android/Linux), `OFF` (OHOS) | Export `mmap`/`munmap`/`mremap` hooks. A single platform-neutral switch; OHOS defaults it off to limit loader/vendor interference. When off, the mmap family is stripped from the version script so the linker never exports an uncompiled hook. |
 | `MALLOC_HOOK_BUILD_TESTS` | `ON` | Build the test binaries and register them with CTest. |
 | `MALLOC_HOOK_BUILD_GL_TESTS` | `ON` on Android | Build the Android OpenGL integration fixture. |
 
@@ -103,226 +109,40 @@ build, run `cmake --build <build-dir> --target print_build_options`.
 
 | Variable | Default | Effect |
 | --- | --- | --- |
-| `DUMP_PEAK_VALUE_MB` | unset | A positive floor selects **first-crossing** mode: enables peak recording and dump on exit, and retains a single snapshot, taken the first time the peak criterion passes this many MB. One stack walk for the whole run, so nothing after the crossing stalls an allocating thread. `0` turns first-crossing off. |
-| `ALLOC_HOOK_DUMP_PREFIX` | `/data/local/tmp/trace/backtrace_heap` | Path prefix for reports. Files are named `<prefix>.exit.pid_<pid>.time_<t>.txt`, so a report can always be tied to the process that produced it. |
-| `DUMP_PEAK_STEP_MB` | `0` (off) | A positive step together with `ALLOC_HOOK_PEAK_SAMPLE_MS` selects **peak-chasing**; on its own it does nothing, and `0` turns chasing off. Upper bound on the growth required before the peak snapshot is rebuilt: a smaller step keeps the snapshot nearer the maximum and pays more stack walks, and for small peaks the code uses 25% growth with a 64 KB floor. Unused in first-crossing mode, which never rebuilds. |
-| `ALLOC_HOOK_PEAK_SAMPLE_MS` | the interval published by a host framework, else `50` when peak recording is on | Interval for sampling the process's *observed* footprint on a dedicated thread: current `VmRSS` from `/proc/self/status`, dmabuf bytes, and GPU device mappings covered by neither. Their same-sample sum is the peak criterion every mode compares against. **On its own it selects the observe-only probe**: the footprint is measured and logged, nothing is tracked. Add `DUMP_PEAK_STEP_MB` for peak-chasing, or `DUMP_PEAK_VALUE_MB` for first-crossing. `0` forces the sampler off, leaving the criterion on tracked allocation bytes. |
-| `BACKTRACE_MIN_SIZE` | OHOS: `40960`; elsewhere `1024` when peak recording is on, else `0` | Skip stack capture for allocations smaller than this. This is the main cost control: in a typical pipeline it filters >99% of allocations. |
+| `DUMP_PEAK_VALUE_MB` | unset | A positive floor selects **first-crossing** mode: enables peak recording and dump on exit, and retains a single snapshot, taken the first time the peak criterion passes this many MB. `0` turns first-crossing off. |
+| `DUMP_PEAK_STEP_MB` | `0` (off) | A positive step together with `ALLOC_HOOK_PEAK_SAMPLE_MS` selects **peak-chasing**; on its own it does nothing. Upper bound on the growth required before the peak snapshot is rebuilt; for small peaks the code uses 25% growth with a 64 KB floor. Unused in first-crossing mode. |
+| `ALLOC_HOOK_PEAK_SAMPLE_MS` | the interval published by a host framework, else `50` when peak recording is on | Interval for sampling the process's *observed* footprint (`VmRSS` + dmabuf + uncovered GPU mappings) on a dedicated thread. **On its own it selects the observe-only probe**: the footprint is measured and logged, nothing is tracked. `0` forces the sampler off. |
+| `ALLOC_HOOK_DUMP_PREFIX` | `/data/local/tmp/trace/backtrace_heap` | Path prefix for reports. Files are named `<prefix>.exit.pid_<pid>.time_<t>.txt`. |
+| `BACKTRACE_MIN_SIZE` | OHOS: `40960`; elsewhere `1024` when peak recording is on, else `0` | Skip stack capture for allocations smaller than this. The main cost control: in a typical pipeline it filters >99% of allocations. |
 | `ALLOC_HOOK_CAPTURE_MODE` | `fast` | `fast` = bounded raw-PC capture with no symbolization on the allocation thread; the worker may resolve dynamic symbols. `accurate` = OS-specific backend. |
-| `ALLOC_HOOK_SAMPLING_INTERVAL_BYTES` | `1` (off) | Poisson-sample host allocations at this byte interval. Scales reported host sizes; does not affect DMA accounting. |
-| `ALLOC_HOOK_FAST_CAPTURE_INTERVAL_BYTES` | `1` (off) | Capture a stack only once per this many bytes allocated. Suppresses stacks only; exact size accounting is unaffected. |
-| `ALLOC_HOOK_FAST_UNWINDER` | unset | `compiler` forces `_Unwind_Backtrace` instead of the aarch64 frame-pointer walk. The frame-pointer walk is the default because it is cheaper and does not fault on targets whose unwind tables drive libgcc's pointer-authentication path into a `SIGILL`. |
-| `BACKTRACE_DUMP_SIGNAL` | `SIGRTMIN+6` (Bionic: `BIONIC_SIGNAL_BACKTRACE`; OHOS: `46`) | Signal that triggers an on-demand report. |
-| `ALLOC_HOOK_DEBUG` | unset | Set to anything to emit hook diagnostics (signal, unwind, and ION/DMA paths) on stderr. |
+| `ENABLE_HOOK_DEBUG` | unset | Set to anything to emit hook diagnostics (signal, unwind, and ION/DMA paths) on stderr. |
 
-Naming note: the `DUMP_*` and `BACKTRACE_*` variables predate the
-`ALLOC_HOOK_*` prefix and are kept as-is because deployment scripts depend on
-them.
+The report-trigger signal is not tunable: each platform uses its conventional
+backtrace signal (Bionic's reserved backtrace signal on Android, `46` on OHOS,
+`SIGRTMIN+6` elsewhere).
 
-### Two kinds of hook behaviour
+Naming note: the `DUMP_*` and `BACKTRACE_*` variables predate the `ALLOC_HOOK_*`
+prefix and are kept as-is because deployment scripts depend on them.
 
-Every mode measures the same criterion -- the observed total, `VmRSS` + dmabuf +
-GPU mappings, sampled from `/proc` on a dedicated thread. What differs is whether
-the run also *tracks allocations* to attribute that total to call sites, because
-that is where the cost is. Which one runs is decided entirely by which variables
-are set:
+## Getting a report
 
-| Set this | Mode | Interposed calls | Output | Answers |
-| --- | --- | --- | --- | --- |
-| `ALLOC_HOOK_PEAK_SAMPLE_MS=k` | observe-only probe | forwarded to libc untouched | a log block on stderr at exit | how much did this process hold, split into rss / dma / gpu |
-| `DUMP_PEAK_VALUE_MB=N` | first crossing | tracked, one stack walk per run | a report file | what was holding memory when it first passed `N` MB |
-| `ALLOC_HOOK_PEAK_SAMPLE_MS=k` + `DUMP_PEAK_STEP_MB=s` | peak chasing | tracked, one stack walk per `s` of growth | a report file | what was holding memory at the run's maximum |
+Which mode a run is in is decided entirely by which variables above are set:
 
-The probe answers *how much*; the two report modes answer *which call sites*, and
-charge for it. Nothing else enables a report: an interval without a step, or a
-step without an interval, produces the probe or nothing at all.
+- Set only `ALLOC_HOOK_PEAK_SAMPLE_MS` for the **observe-only probe** — measures
+  how much the process holds (rss / dma / gpu), tracks nothing, and prints a log
+  block at exit.
+- Set `DUMP_PEAK_VALUE_MB` for **first crossing** — one report, one stack walk,
+  answering what held memory when it first passed the floor. This is the common
+  report mode.
+- Set `ALLOC_HOOK_PEAK_SAMPLE_MS` + `DUMP_PEAK_STEP_MB` for **peak chasing** —
+  one report describing the run's maximum, with a stack walk per step of growth.
 
-`0` is how each of these is turned off, uniformly: `DUMP_PEAK_VALUE_MB=0` asks for
-no first-crossing snapshot, `DUMP_PEAK_STEP_MB=0` asks for no chasing, and
-`ALLOC_HOOK_PEAK_SAMPLE_MS=0` asks for no sampler at all. A run that zeroes both
-report switches keeps the probe; a run that zeroes all three tracks allocations
-for the on-demand checkpoint and produces nothing on its own.
-
-First crossing is the cheaper and steadier of the two: after its single walk no
-allocating thread is stalled again, which matters when the pipeline being
-measured is timing-sensitive. In exchange the stacks describe the floor, not the
-maximum, so the floor has to be set near the peak to answer "what is holding
-memory at the peak" -- typically from an earlier run's report. Read
-`snapshot_lag` to tune it: it is exactly how much higher the floor could have
-been set.
-
-Peak chasing needs no such prior knowledge, so a first run gets a correct peak
-snapshot straight away, at the cost of a stack walk every time the peak grows
-past the step.
-
-Both report modes write to `ALLOC_HOOK_DUMP_PREFIX` on normal exit and create the
-directory if it does not exist. Setting both variables gives first crossing at
-the floor, with the interval you supplied.
-
-#### The observe-only probe
-
-Interposition cannot be switched off at runtime -- `LD_PRELOAD` has already bound
-these symbols -- but whether an interposed call *does* anything can be, and
-tracking only pays for itself if a report consumes it. So a run that asks only for
-a cadence never builds the tracker:
-
-```sh
-LD_PRELOAD=/path/liballoc_hook.so ALLOC_HOOK_PEAK_SAMPLE_MS=5 ./your_program
-```
-
-```text
-alloc_hook: ============================================================
-alloc_hook:                 Memory Usage Summary
-alloc_hook: ------------------------------------------------------------
-alloc_hook:   DMA Max (sampling):                              0.00 MB
-alloc_hook:   RSS Max (sampling):                             61.27 MB
-alloc_hook:   GPU mmap Max (sampling):                        12.05 MB
-alloc_hook:   RSS Max (getrusage):                            61.54 MB
-alloc_hook:   DMA+RSS+GPU mmap Max (sampling):                73.29 MB
-alloc_hook:   not measured, so not a zero: dma
-alloc_hook: ------------------------------------------------------------
-alloc_hook:   Sampling Period:                                    1 ms
-alloc_hook:   Achieved Period:                                22.28 ms
-alloc_hook: ============================================================
-```
-
-The block keeps the shape, the column widths and the yellow of the summary a host
-framework prints for the same three quantities, so the two can be read side by
-side in one log; the colour is emitted only when stderr is a terminal. The cost
-is one sampler thread reading `/proc` plus one relaxed load per interposed call --
-68 ns per `malloc`/`free` pair against 60 ns with nothing preloaded, where a
-tracking mode with no size filter costs 2762 ns.
-
-Four rows to read carefully. The first three are each part's own maximum, so they
-need not have peaked together and their sum is not the combined row -- that row is
-the largest *same-cycle* sum, which is what an external evaluator reports as the
-process peak. `RSS Max (getrusage)` is the kernel's own high-water mark: standing
-well above the sampled RSS row, it means a resident peak happened between two
-samples. `Achieved Period` above `Sampling Period` means the `/proc` reads cost
-more than the interval and the sampler throttled itself to stay under half a core.
-And a part with no reachable interface is named on the `not measured` line rather
-than left to read as a measured zero.
-
-Use the probe to find out whether a process has a memory problem, and how big it
-is, without perturbing it: it captures no stacks, so it cannot say which call site
-is responsible. It has no live allocation table either, so `checkpoint()` writes
-these same figures to the requested path instead of a heap report, and the
-checkpoint signal is ignored rather than left to kill a process that is only being
-measured. A `fork` child prints nothing, and a process that leaves through
-`_exit()` or a fatal signal prints nothing at all -- the same limitation the
-tracked report has. When the answer is "yes, and here is how much", add
-`DUMP_PEAK_STEP_MB` or `DUMP_PEAK_VALUE_MB` to find out where it goes.
-
-#### Cadence
-
-`ALLOC_HOOK_PEAK_SAMPLE_MS` needs no value in the common case. A host framework
-that samples this process's memory publishes the interval it uses in a variable
-whose name ends in `AUTO_SHOW_MEM_USE_DURATION_MS`; when the hook finds one set
-to a positive value it adopts that interval, so the snapshot lands at the instant
-such a framework calls the peak and the cadence does not need to be kept in sync
-by hand. Failing that, peak recording samples every 50 ms. Setting
-`ALLOC_HOOK_PEAK_SAMPLE_MS` explicitly overrides both, including to `0`, which
-runs no sampler at all and compares the floor against tracked allocation bytes
-instead -- a different quantity, which the report labels as such.
-
-A framework's variable only ever supplies the cadence. It never enables peak
-recording on its own: a process that set none of these variables must not gain a
-sampler thread and an exit report from its environment.
-
-This does not read the historical `VmPeak` or `VmHWM` fields. They cannot tell
-the hook when to copy live stacks. Each sampling cycle instead reads the current
-`VmRSS`, then DMA and GPU memory, and compares that same-cycle sum with the
-largest sum seen so far. When the sum also crosses the `DUMP_PEAK_VALUE_MB` and
-`DUMP_PEAK_STEP_MB` gates, the callback immediately re-reads
-`VmRSS`/`RssAnon`/`RssFile`/`RssShmem`, collects the top resident mappings from
-`/proc/self/smaps`, and copies the live stack table. These reads and the stack
-copy are sequential, not an atomic kernel snapshot; report labels such as
-`at_peak` mean the same peak callback window.
-
-For a snapshot that tracks the maximum closely, a practical explicit
-configuration is:
-
-```sh
-export ALLOC_HOOK_PEAK_SAMPLE_MS=5   # peak chasing; preferably match the external sampler
-export DUMP_PEAK_STEP_MB=1           # smallest useful step: closest to the maximum, most walks
-export BACKTRACE_MIN_SIZE=1024       # use 0 only when every small stack is required
-```
-
-For the single-snapshot mode, with the floor taken from a previous run's peak:
-
-```sh
-export DUMP_PEAK_VALUE_MB=300        # first crossing of 300MB; one stack walk
-export BACKTRACE_MIN_SIZE=1024
-```
-
-Leave `ALLOC_HOOK_SAMPLING_INTERVAL_BYTES` and
-`ALLOC_HOOK_FAST_CAPTURE_INTERVAL_BYTES` unset (their effective default is `1`)
-when exact host attribution and a stack for every eligible allocation are
-required. On a platform with a supported GPU device node the observed criterion
-is `rss + dma + gpu`; there is no runtime switch for `rss + dma` while excluding
-only that otherwise-unaccounted GPU term.
-
-The report says which watermark the snapshot describes and which criterion
-produced it, and — when it was the observed footprint — what that footprint read
-at the snapshot instant, what its maximum over the run was, and what the sampler
-cost:
-
-```text
-peak_retention: chase_max (snapshot refreshed per step)
-peak_criterion: observed_host_rss_plus_dma_plus_gpu (from /proc, aligned with an external sampler)
-observed_peak(at_snapshot):     rss=291.75MB dma=935.12MB gpu=24.00MB total=1250.87MB
-observed_peak(max_of_sum):      rss=291.75MB dma=935.12MB gpu=24.00MB total=1250.87MB (...)
-observed_peak(independent_max): rss=369.54MB dma=935.12MB gpu=24.00MB
-observed_sampler: interval_ms=1 achieved_ms=1.58 dma_source=fd+maps gpu_source=smaps samples=9516 ...
-```
-
-`at_snapshot` equal to `max_of_sum` is the goal state: the stacks were captured
-at the maximum, not at some earlier step of it. In first-crossing mode they are
-not equal by design, and `snapshot_lag` names the difference:
-
-```text
-peak_retention: first_crossing floor=200.000000MB (single snapshot; step unused)
-snapshot_lag: observed=+117.800781MB (of 323.628906MB peak)
-```
-
-A run whose floor was never reached has no snapshot at all. Rather than emit an
-empty stack section, which reads as a hook that captured nothing, the report
-falls back to the live allocations at report time and says so:
-
-```text
-peak_snapshot: none (criterion never passed the floor; the list above is live at report time)
-peak_criterion: none (nothing was snapshotted)
-``` `achieved_ms` above the
-requested interval means the `/proc` reads cost more than the interval and the
-sampler throttled itself to stay under half a core — it never silently claims a
-cadence it did not reach. `independent_max` is higher than any single part of
-`max_of_sum` whenever host and device memory peak at different moments, which is
-the situation this whole mechanism exists for.
-
-`gpu` is device memory a driver mmap'd from a character device instead of handing
-out a dmabuf, and mapped PFN/IO rather than with struct pages behind it. Such a
-region escapes `rss` and `dma` simultaneously — it is not a dmabuf, and the
-kernel excludes PFN/IO pages from `VmRSS` because there is no page to account —
-so before it was added the sum here was short by exactly that amount against an
-external sampler reporting the same three parts. It is read from
-`/proc/self/smaps` as per-region `Size - Rss`, so a region the kernel *does*
-count in `VmRSS` contributes only the part `rss` does not already hold.
-
-Three things this cannot do. The sampler reads `/proc`, so it sees the process at
-sample instants only; a peak that exists for less than one interval is missed by
-it exactly as it is missed by the external sampler being aligned with.
-`dma_source=none` means this kernel exposes no reachable dmabuf accounting, which
-is not the same as the process holding no device memory. And `gpu_source` is
-`not_applicable` on any platform without the device node this pass counts, which
-is likewise not a measurement of zero: it is the reason no measurement was
-attempted. That check happens before `/proc/self/smaps` is opened, deliberately —
-the kernel walks every PTE of every VMA to produce the per-region residency this
-pass reads, ~25 ms for a ~460 MB process on a measured arm64 target, so filtering
-regions out *after* the read would pay the whole cost to return zero.
+Full command lines, output, and how to read every report field are in
+[`docs/get_hook_report.md`](docs/get_hook_report.md).
 
 ## Supported platforms
 
-| Capability | Android | OHOS (default) | OHOS (`MALLOC_HOOK_OHOS_MMAP_HOOK=ON`) | glibc Linux |
+| Capability | Android | OHOS (default) | OHOS (`ENABLE_MMAP_HOOK_EXPORT=ON`) | glibc Linux |
 | --- | --- | --- | --- | --- |
 | `malloc`/`free`/`calloc`/`realloc` | Yes | Yes | Yes | Yes |
 | aligned allocation APIs | Yes | Yes | Yes | Yes |
@@ -330,12 +150,11 @@ regions out *after* the read would pay the whole cost to return zero.
 | `ioctl`/`close` DMA capture | Yes (default) | Yes (default) | Yes (default) | Yes (default) |
 | checkpoint reports | Yes | Yes | Yes | Yes |
 
-OHOS leaves `mmap` interposition disabled by default to reduce loader and vendor
+`ENABLE_MMAP_HOOK_EXPORT` defaults off on OHOS to reduce loader and vendor
 runtime interference. Enable it only for a small, controlled reproduction.
 
 ## Scope and safety
 
-This project traces native C/C++ allocation activity. Sampling changes host
-allocation attribution, not resource accounting. Direct system calls and
+This project traces native C/C++ allocation activity. Direct system calls and
 unexported vendor entry points bypass interposition. Do not use generated
 reports or private device identifiers as source documentation.

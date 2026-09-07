@@ -90,7 +90,6 @@ size_t CountOccurrences(const std::string& haystack, const std::string& needle) 
 
 int main() {
     setenv("ALLOC_HOOK_CAPTURE_MODE", "fast", 1);
-    unsetenv("ALLOC_HOOK_FAST_CAPTURE_INTERVAL_BYTES");
     m_sys_malloc = std::malloc;
     m_sys_free = std::free;
     m_sys_calloc = std::calloc;

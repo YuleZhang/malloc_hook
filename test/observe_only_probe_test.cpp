@@ -118,8 +118,11 @@ void TestSignalSelection() {
     ClearEnv();
     const int default_signal = Config::DumpSignal();
     assert(default_signal > 0);
+    // The report-trigger signal is fixed to the platform default and is no
+    // longer tunable through the environment: the old BACKTRACE_DUMP_SIGNAL
+    // override was removed, so setting it must have no effect.
     setenv("BACKTRACE_DUMP_SIGNAL", "44", 1);
-    assert(Config::DumpSignal() == 44);
+    assert(Config::DumpSignal() == default_signal);
     unsetenv("BACKTRACE_DUMP_SIGNAL");
     assert(Config::DumpSignal() == default_signal);
 

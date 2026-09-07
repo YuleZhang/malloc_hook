@@ -64,7 +64,7 @@ fi
 
 echo "Using OHOS NDK: ${OHOS_NDK_NATIVE}"
 echo "Building liballoc_hook.so for ${BUILD_ARCH}"
-echo "OHOS mmap hooks: ${OHOS_ENABLE_MMAP_HOOK:-OFF}"
+echo "mmap hook export: ${ENABLE_MMAP_HOOK_EXPORT:-OFF}"
 
 rm -rf "${BUILD_DIR}"
 cmake -S "${SRC_DIR}" -B "${BUILD_DIR}" -G Ninja \
@@ -73,7 +73,7 @@ cmake -S "${SRC_DIR}" -B "${BUILD_DIR}" -G Ninja \
     -DOHOS_STL=c++_static \
     -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_INSTALL_PREFIX="${SRC_DIR}" \
-    -DMALLOC_HOOK_OHOS_MMAP_HOOK="${OHOS_ENABLE_MMAP_HOOK:-OFF}" \
+    -DENABLE_MMAP_HOOK_EXPORT="${ENABLE_MMAP_HOOK_EXPORT:-OFF}" \
     -DMALLOC_HOOK_BUILD_TESTS=OFF
 cmake --build "${BUILD_DIR}" --target install -v
 cmake --build "${BUILD_DIR}" --target print_build_options

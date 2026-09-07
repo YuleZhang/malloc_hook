@@ -59,11 +59,6 @@ public:
     // the peak criterion on tracked allocation bytes, which is either an
     // explicit opt-out or the fallback for a sampler that could not start.
     unsigned observed_peak_sample_ms() const { return observed_peak_sample_ms_; }
-    size_t sampling_interval_bytes() const { return sampling_interval_bytes_; }
-    size_t fast_capture_interval_bytes() const { return fast_capture_interval_bytes_; }
-    bool sampling_enabled() const {
-        return capture_mode_ == StackCaptureMode::Fast && sampling_interval_bytes_ > 1;
-    }
     StackCaptureMode capture_mode() const { return capture_mode_; }
 
     static StackCaptureMode ParseCaptureMode(const char* value);
@@ -98,8 +93,6 @@ private:
     size_t peak_record_step_bytes_ = 0;
     PeakRetention peak_retention_ = PeakRetention::ChaseMax;
     unsigned observed_peak_sample_ms_ = 0;
-    size_t sampling_interval_bytes_ = 1;
-    size_t fast_capture_interval_bytes_ = 1;
     StackCaptureMode capture_mode_ = StackCaptureMode::Fast;
 
     uint64_t options_ = 0;

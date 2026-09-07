@@ -223,7 +223,7 @@ static void* signal_dump_thread(void*) {
 // non-blocking, so a dump requested before the thread exists simply waits in the
 // pipe until it does.
 static bool PrepareSignalDumpChannel() {
-    g_signal_debug_enabled = getenv("ALLOC_HOOK_DEBUG") != nullptr;
+    g_signal_debug_enabled = getenv("ENABLE_HOOK_DEBUG") != nullptr;
     if (g_signal_pipe[0] != -1) {
         return true;
     }
@@ -481,11 +481,6 @@ static void* SystemMallocNoHook(size_t size) {
     return m_sys_malloc(size);
 }
 
-static void SystemFreeNoHook(void* pointer) {
-    ScopedDisableDebugCalls disable;
-    m_sys_free(pointer);
-}
-
 static void* SystemCallocNoHook(size_t nmemb, size_t size) {
     ScopedDisableDebugCalls disable;
     return m_sys_calloc(nmemb, size);
@@ -546,10 +541,6 @@ void debug_free(void* pointer) {
         return m_sys_free(pointer);
     }
 
-    if (g_debug->config().sampling_enabled() &&
-        !g_debug->pointer->MightContain(pointer)) {
-        return SystemFreeNoHook(pointer);
-    }
     ScopedConcurrentLock lock;
     ScopedDisableDebugCalls disable;
 
@@ -909,7 +900,7 @@ static bool is_dma_buf(int fd, size_t* size) {
 }
 
 static void IonPathLog(const char* tag, unsigned long request, size_t sz) {
-    static bool enabled = getenv("ALLOC_HOOK_DEBUG") != nullptr;
+    static bool enabled = getenv("ENABLE_HOOK_DEBUG") != nullptr;
     if (!enabled) {
         return;
     }

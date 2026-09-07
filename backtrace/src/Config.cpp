@@ -23,15 +23,10 @@ static constexpr size_t DEFAULT_OHOS_BACKTRACE_MIN_SIZE_BYTES = 40960;
 // default of its own. Peak recording walks the live stack table, so an unfiltered
 // run pays for stacks that no report line can attribute.
 static constexpr size_t kPeakRecordingMinSizeBytes = 1024;
-static constexpr char kSamplingIntervalBytesEnv[] =
-        "ALLOC_HOOK_SAMPLING_INTERVAL_BYTES";
-static constexpr char kFastCaptureIntervalEnv[] =
-        "ALLOC_HOOK_FAST_CAPTURE_INTERVAL_BYTES";
 static constexpr char kDumpPrefixEnv[] = "ALLOC_HOOK_DUMP_PREFIX";
 static constexpr char kPeakSampleIntervalEnv[] = "ALLOC_HOOK_PEAK_SAMPLE_MS";
 static constexpr char kDumpPeakValueEnv[] = "DUMP_PEAK_VALUE_MB";
 static constexpr char kPeakStepEnv[] = "DUMP_PEAK_STEP_MB";
-static constexpr char kDumpSignalEnv[] = "BACKTRACE_DUMP_SIGNAL";
 // Cadence used when peak recording is on but nothing published an interval. The
 // criterion is a watermark of the observed total, which only the sampler can
 // evaluate, so there is no "no sampler" fallback to take.
@@ -176,12 +171,11 @@ bool Config::ObserveOnlyRequested(unsigned* interval_ms) {
 }
 
 int Config::DumpSignal() {
-    int signal_number = DefaultBacktraceSignal();
-    size_t dump_signal = 0;
-    if (ParseValue(getenv(kDumpSignalEnv), &dump_signal)) {
-        signal_number = static_cast<int>(dump_signal);
-    }
-    return signal_number;
+    // The report-trigger signal is not tunable: each platform uses its
+    // conventional backtrace signal (Bionic's reserved backtrace signal on
+    // Android, 46 on OHOS, SIGRTMIN+6 elsewhere) so a deployment script never
+    // has to keep an env var in sync with the platform.
+    return DefaultBacktraceSignal();
 }
 
 bool Config::Init() {
@@ -195,19 +189,6 @@ bool Config::Init() {
         backtrace_dump_prefix_ = dump_prefix;
     }
     capture_mode_ = ParseCaptureMode(getenv("ALLOC_HOOK_CAPTURE_MODE"));
-    sampling_interval_bytes_ = 1;
-    fast_capture_interval_bytes_ = 1;
-    size_t fast_capture_interval = 0;
-    if (ParseValue(getenv(kFastCaptureIntervalEnv), &fast_capture_interval) &&
-        fast_capture_interval > 1) {
-        fast_capture_interval_bytes_ = fast_capture_interval;
-    }
-    const char* sampling_interval_env = getenv(kSamplingIntervalBytesEnv);
-    size_t sampling_interval = 0;
-    if (ParseValue(sampling_interval_env, &sampling_interval) &&
-        sampling_interval > 1) {
-        sampling_interval_bytes_ = sampling_interval;
-    }
 
     // 如果开启 BACKTRACE_SPECIFIC_SIZES, 请指定内存申请的最大和最小 size
     options_ |= BACKTRACE_SPECIFIC_SIZES;

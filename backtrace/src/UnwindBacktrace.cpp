@@ -113,7 +113,7 @@ unwindstack::AndroidLocalUnwinder& LocalUnwinder() {
 }
 
 bool UnwindDebugEnabled() {
-    static bool enabled = getenv("ALLOC_HOOK_DEBUG") != nullptr;
+    static bool enabled = getenv("ENABLE_HOOK_DEBUG") != nullptr;
     return enabled;
 }
 

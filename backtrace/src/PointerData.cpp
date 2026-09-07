@@ -73,13 +73,6 @@ bool RaisePeak(std::atomic<size_t>* peak, size_t candidate) {
     return false;
 }
 
-struct SamplerTlsState {
-    uint64_t configured_interval = 0;
-    PoissonSampler sampler;
-    uint64_t capture_interval = 0;
-    uint64_t capture_accumulated = 0;
-};
-
 struct ModuleRange {
     uintptr_t start = 0;
     uintptr_t end = 0;
@@ -374,48 +367,6 @@ void CollectMappingRss(
     }
 }
 
-// Released through the system allocator: the state is owned by the thread, not
-// by the tracker, so it must not outlive the thread. Without this the sampler
-// leaks one SamplerTlsState per thread exit for the life of the process.
-void DestroySamplerState(void* raw_state) {
-    if (raw_state == nullptr) {
-        return;
-    }
-    static_cast<SamplerTlsState*>(raw_state)->~SamplerTlsState();
-    // A thread can exit before the real free has been resolved (alloc_hook.cpp
-    // guards the same way). Leaking this one state beats calling through null.
-    if (m_sys_free != nullptr) {
-        m_sys_free(raw_state);
-    }
-}
-
-pthread_key_t& SamplerKey() {
-    static pthread_key_t key;
-    static pthread_once_t once = PTHREAD_ONCE_INIT;
-    pthread_once(&once, [] { pthread_key_create(&key, DestroySamplerState); });
-    return key;
-}
-
-SamplerTlsState* GetSamplerState() {
-    SamplerTlsState* state =
-            static_cast<SamplerTlsState*>(pthread_getspecific(SamplerKey()));
-    if (state != nullptr) {
-        return state;
-    }
-    void* storage = m_sys_malloc(sizeof(SamplerTlsState));
-    if (storage == nullptr) {
-        return nullptr;
-    }
-    state = new (storage) SamplerTlsState();
-    // A failed setspecific would otherwise allocate and leak a fresh state on
-    // every subsequent allocation, so drop it and fall back to not sampling.
-    if (pthread_setspecific(SamplerKey(), state) != 0) {
-        DestroySamplerState(state);
-        return nullptr;
-    }
-    return state;
-}
-
 }  // namespace
 
 PointerData::~PointerData() = default;
@@ -479,30 +430,12 @@ void PointerData::UnlockAllShards() {
 }
 
 bool PointerData::ShouldTrackAllocation(
-        size_t pointer_size, MemType type, size_t* tracked_size) {
+        size_t pointer_size, MemType /*type*/, size_t* tracked_size) {
+    // Every eligible allocation is tracked at its exact size. The size filter
+    // (BACKTRACE_MIN_SIZE) is the only cost control; there is no probabilistic
+    // sub-sampling of host allocations.
     *tracked_size = pointer_size;
-    if (type != HOST || !g_debug->config().sampling_enabled()) {
-        return true;
-    }
-    SamplerTlsState* state = GetSamplerState();
-    if (state == nullptr) {
-        return true;
-    }
-    const size_t interval = g_debug->config().sampling_interval_bytes();
-    if (state->configured_interval != interval) {
-        state->sampler.SetSamplingInterval(interval);
-        state->configured_interval = interval;
-    }
-    *tracked_size = state->sampler.SampleSize(pointer_size);
-    // SampleSize() scales the request up to interval * samples, which is
-    // unrelated to the MaxSize() bound debug_malloc checks against the
-    // *requested* size. Left unclamped, a scaled size above the bound has its
-    // bit 31 masked off by RealSize() while current_used was incremented by the
-    // full value, so per-entry sizes and the totals stop agreeing.
-    if (*tracked_size > PointerInfoType::MaxSize()) {
-        *tracked_size = PointerInfoType::MaxSize();
-    }
-    return *tracked_size != 0;
+    return true;
 }
 
 void PointerData::LockForFork() {
@@ -525,33 +458,6 @@ bool PointerData::MightContain(const void* ptr) const {
     const size_t index1 = (hash >> 6) & (kPointerFilterWords - 1);
     const uint64_t bit1 = 1ULL << ((hash >> 22) & 63);
     return (pointer_filter_[index1].load(std::memory_order_relaxed) & bit1) != 0;
-}
-
-bool PointerData::ShouldCaptureBacktrace(size_t size_bytes) {
-    if (g_debug == nullptr ||
-        g_debug->config().capture_mode() != StackCaptureMode::Fast) {
-        return true;
-    }
-    const uint64_t interval = g_debug->config().fast_capture_interval_bytes();
-    // Check the interval before touching thread-local state: with sampling off
-    // (the default) this must not cost a pthread_getspecific per allocation.
-    if (interval <= 1) {
-        return true;
-    }
-    SamplerTlsState* state = GetSamplerState();
-    if (state == nullptr) {
-        return true;
-    }
-    if (state->capture_interval != interval) {
-        state->capture_interval = interval;
-        state->capture_accumulated = 0;
-    }
-    state->capture_accumulated += size_bytes;
-    if (state->capture_accumulated < interval) {
-        return false;
-    }
-    state->capture_accumulated %= interval;
-    return true;
 }
 
 void PointerData::MarkPointerFilter(const void* ptr) {
@@ -902,8 +808,7 @@ void PointerData::Remap(const void* old_ptr, const void* new_ptr, size_t new_siz
 }
 
 size_t PointerData::AddBacktrace(size_t num_frames, size_t size_bytes) {
-    if (!ShouldBacktraceAllocSize(size_bytes) ||
-        !ShouldCaptureBacktrace(size_bytes)) {
+    if (!ShouldBacktraceAllocSize(size_bytes)) {
         return kBacktraceEmptyIndex;
     }
 
