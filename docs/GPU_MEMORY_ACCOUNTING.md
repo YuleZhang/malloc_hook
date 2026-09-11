@@ -215,6 +215,42 @@ figure is carried between those events, so a run whose GPU buffers are allocated
 once pays for one read. A process with the device node but no device mapping pays
 none. `gpu_reads` in `observed_sampler` reports how many were paid.
 
+## The KGSL per-process node: cheaper and more accurate on Adreno, and the MTK/Mali conclusion
+
+The smaps divergence above only sees GPU pages *after* the CPU faults them. A
+buffer written by the GPU and never CPU-mapped, or mapped but only partly read --
+the common case in a GPU compute pipeline -- is therefore **undercounted**. Reading
+the KGSL per-process node `/sys/class/kgsl/kgsl/proc/<pid>/kernel`
+(`gpumem_mapped + gpumem_unmapped`) instead fixes this:
+
+* It reports the driver's **committed allocation in full at `clCreateBuffer`/
+  `clSVMAlloc` time**, independent of CPU faulting, uniformly across five Adreno
+  generations, in a single integer read (no maps/smaps scan). Measured on the
+  imx896 pipeline, the old method reported 1.9 MB on an Adreno662 where the node --
+  and the driver -- report 37.8 MB; per-sample cost drops ~5-8x and the sampler no
+  longer throttles.
+* It is paired with `RssAnon` rather than `VmRSS`: the driver's CPU mapping, once
+  faulted, is counted in `VmRSS` (as `RssFile` or `RssShmem` depending on the part),
+  so pairing with `RssAnon` avoids double counting and keeps
+  `RssAnon + kernel + dma` disjoint.
+* An imported dma-buf goes only to the driver's `imported_mem`, **not** `kernel`,
+  and is already counted by `dma_bytes` by inode, so the GPU bucket does not add
+  `imported_mem` and does not double count dma.
+* When the node is unreadable (host CI, non-Adreno, or an SELinux domain denied it)
+  the sampler falls back to the smaps method above.
+
+**MTK/Mali does not need this.** Mali's equivalent node is
+`/proc/mtk_mali/gpu_memory` (format `kctx-<hash>  <pages>  <tgid>`, keyed by tgid),
+but Mali faults `/dev/mali0` allocations into `RssFile` **at create**, regardless of
+map or touch -- measured, the node and the `RssFile` delta track to within ~1 MB at
+every step. So the GPU memory is **already contained in `/proc/<pid>/status`** (the
+`RssFile` part of `VmRSS`); there is no allocated-but-CPU-cold gap like Adreno, and
+the smaps/VmRSS fallback is already correct. `clImportMemoryARM` of a 64 MB dma-buf
+adds only ~128 kB of metadata to the node, not the imported size, so it would not
+double count with `dma_bytes` either. The node's only value on MTK would be
+attribution (a separate GPU bucket instead of GPU folded into rss) -- optional, not
+required for a correct total.
+
 ## Vendor API notes
 
 These cost real time to rediscover, so they are recorded here.
