@@ -74,6 +74,14 @@ enum class GpuMmapSource : uint8_t {
     NotApplicable,
     // Region sizes from /proc/self/maps, every sample. Nothing else is read.
     Maps,
+    // The KGSL driver's per-process byte counter
+    // /sys/class/kgsl/kgsl/proc/<pid>/kernel (= gpumem_mapped + gpumem_unmapped).
+    // Preferred over Maps where the node is readable: it reports the driver's
+    // committed allocation directly, at allocation time and independent of CPU
+    // faulting, so it does not miss GPU-resident-but-CPU-cold memory the way the
+    // smaps divergence does. Measured across five Adreno generations; see
+    // docs/GPU_MEMORY_ACCOUNTING.md.
+    Kgsl,
 };
 
 const char* GpuMmapSourceName(GpuMmapSource source);
@@ -191,6 +199,42 @@ bool ReadGpuSmapsReading(const char* path, GpuSmapsReading* into);
 // one vendor's parts -- `VmRSS` counting pages the per-VMA walk does not -- reports
 // nothing rather than underflowing.
 size_t GpuBytesFromReading(const GpuSmapsReading& reading, size_t vmrss_bytes);
+
+// ---------------------------------------------------------------------------
+// KGSL per-process byte counters, the accurate replacement for the smaps
+// divergence on Qualcomm/Adreno.
+//
+// /sys/class/kgsl/kgsl/proc/<pid>/kernel reports the process's committed GPU
+// allocation (gpumem_mapped + gpumem_unmapped) as one integer of bytes. Unlike
+// the smaps signals it does not depend on the pages having been CPU-faulted:
+// measured on five Adreno parts, `kernel` reports a buffer's full size at
+// clCreateBuffer/clSVMAlloc time, before any map or touch, while VmRSS and
+// per-VMA Rss register only after a fault -- and on the newer parts an
+// allocated-but-CPU-cold buffer is invisible to both smaps signals but not to
+// this node. Imports (dma-buf host-pointer) are NOT counted here; they land in
+// the driver's separate imported_mem counter and are already attributed to
+// dma_bytes by inode, so this node must not be combined with imported_mem.
+//
+// The figure pairs with RssAnon rather than VmRSS: the driver CPU-maps every
+// buffer, and a faulted GPU mapping is counted in VmRSS (as RssFile on some
+// parts, RssShmem on others), so VmRSS + kernel would double count. RssAnon
+// excludes GPU device mappings and dma-buf mappings on every measured part, so
+// RssAnon + kernel + dma_bytes is disjoint. See docs/GPU_MEMORY_ACCOUNTING.md.
+
+// Reads a single decimal byte count out of a KGSL proc node file (e.g. the
+// `kernel` node). Returns false only when the path could not be opened or held
+// no number, so "readable and reported N" stays distinct from "not readable".
+// Exposed with an explicit path so the node's exact text can be covered by a
+// test on a host with no kgsl device.
+bool ReadKgslKernelBytesFrom(const char* path, size_t* bytes);
+
+// Reads this process's KGSL `kernel` byte count into `into->gpu_bytes` and sets
+// `into->gpu_source = Kgsl`. Returns the bytes, or 0 with source left unchanged
+// when the KGSL model is not in use (no driver, node not yet created, or the
+// SELinux domain is denied the read). Latches its decision the first time the
+// node is actually read; see ObservedMemory.cpp. Declared beside
+// ReadSelfGpuMmapBytes, after ObservedMemSample is defined.
+
 
 // Carried state for the GPU pass.
 //
@@ -348,6 +392,10 @@ size_t GpuBytesForMapped(const GpuMmapCache& cache, size_t mapped);
 size_t ReadSelfGpuMmapBytes(ObservedMemSample* into);
 size_t ReadSelfGpuMmapBytesGated(
         ObservedMemSample* into, GpuMmapCache* cache, size_t peak_total_bytes);
+
+// See the KGSL section above. Reads /sys/class/kgsl/kgsl/proc/<pid>/kernel for
+// this process and folds it into `into` as the GPU figure when readable.
+size_t ReadSelfKgslGpuBytes(ObservedMemSample* into);
 
 // Carried state that lets the mapping pass be skipped on samples that cannot
 // move the peak.
