@@ -1,5 +1,6 @@
 .vscode/
 .cache/
+__pycache__
 build/
 out/
 compile_commands.json
@@ -13,3 +14,9 @@ compile_commands.json
 # reads it from here through .bench.local. Ignored so it cannot be committed by
 # accident.
 test/bench_workload/
+
+# Vendored camera-pipeline benchmark payloads: stripped siq_test plus the anc
+# HDR libs, model/resource set and a real input raw. Tens to hundreds of MB of
+# device binaries, kept out of the repo; the harnesses extract them locally.
+test/ppl_imx896.tar.xz
+test/avr-rear-main.tar.gz

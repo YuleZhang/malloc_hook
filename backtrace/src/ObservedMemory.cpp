@@ -378,6 +378,8 @@ const char* GpuMmapSourceName(GpuMmapSource source) {
             return "not_applicable";
         case GpuMmapSource::Maps:
             return "maps";
+        case GpuMmapSource::Kgsl:
+            return "kgsl";
         case GpuMmapSource::Unprobed:
             break;
     }
@@ -622,6 +624,135 @@ size_t GpuBytesFromReading(const GpuSmapsReading& reading, size_t vmrss_bytes) {
     // cannot be attributed here.
     return divergence < reading.device_rss_bytes ? divergence
                                                  : reading.device_rss_bytes;
+}
+
+// The KGSL `kernel` node holds one decimal byte count and nothing else. Read
+// with a small stack buffer and parsed by hand: no sscanf over a whole file, so
+// this stays a few microseconds on the sampling path.
+bool ReadKgslKernelBytesFrom(const char* path, size_t* bytes) {
+    const int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        return false;
+    }
+    char buffer[32];
+    const ssize_t n = read(fd, buffer, sizeof(buffer) - 1);
+    close(fd);
+    if (n <= 0) {
+        return false;
+    }
+    buffer[n] = '\0';
+    const char* p = buffer;
+    while (*p == ' ' || *p == '\t' || *p == '\n') {
+        ++p;
+    }
+    if (*p < '0' || *p > '9') {
+        // The node exists but held no number. Reporting failure keeps a garbled
+        // read from being taken as a measured zero.
+        return false;
+    }
+    size_t value = 0;
+    while (*p >= '0' && *p <= '9') {
+        value = value * 10 + static_cast<size_t>(*p - '0');
+        ++p;
+    }
+    *bytes = value;
+    return true;
+}
+
+// The self path is /sys/class/kgsl/kgsl/proc/<pid>/kernel: there is no `self`
+// symlink under this directory, so the pid is formatted in. Built once here
+// rather than per call because getpid() does not change across a run.
+const char* KgslSelfKernelPath() {
+    static char path[64];
+    static std::atomic<bool> built{false};
+    if (!built.load(std::memory_order_relaxed)) {
+        snprintf(path, sizeof(path), "/sys/class/kgsl/kgsl/proc/%d/kernel",
+                 static_cast<int>(getpid()));
+        built.store(true, std::memory_order_relaxed);
+    }
+    return path;
+}
+
+// Whether the KGSL model should be used this sample, reading the `kernel` node
+// as the test. Latched by an actual read rather than access(), for two reasons
+// the sampler's lifetime forces:
+//
+//   * The per-pid node does not exist until the process first opens /dev/kgsl,
+//     which is long after the sampler thread starts (it starts before main).
+//     A one-shot probe at startup would cache "absent" before any GPU is used
+//     and never look again. So while the driver is present but the node has not
+//     appeared yet (ENOENT), the state stays unknown and the next sample retries.
+//   * access(R_OK) does not consult SELinux; open() does. A domain denied
+//     vendor_sysfs_kgsl_proc passes access() but fails open() with EACCES. Such
+//     a domain must fall back to smaps, not latch the KGSL model and then read
+//     zero. EACCES latches "unavailable" so the denial is hit once, not every
+//     sample -- one avc audit record rather than a stream of them.
+//
+// State: 0 unknown (keep probing), 1 active (latched), 2 unavailable (latched).
+enum { kKgslUnknown = 0, kKgslActive = 1, kKgslUnavailable = 2 };
+
+bool ReadSelfKgslKernel(size_t* bytes) {
+    static std::atomic<int> state{kKgslUnknown};
+    const int known = state.load(std::memory_order_relaxed);
+    if (known == kKgslUnavailable) {
+        return false;
+    }
+    const int fd = open(KgslSelfKernelPath(), O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        if (known == kKgslUnknown) {
+            if (errno == EACCES || errno == EPERM) {
+                // Denied by SELinux/DAC: fall back for good.
+                state.store(kKgslUnavailable, std::memory_order_relaxed);
+            } else if (errno != ENOENT ||
+                       access("/sys/class/kgsl/kgsl", F_OK) != 0) {
+                // ENOENT with the driver dir present means "GPU not used yet":
+                // keep probing. Anything else -- including no driver at all --
+                // means this platform will not serve the node; stop probing.
+                state.store(kKgslUnavailable, std::memory_order_relaxed);
+            }
+        }
+        return false;
+    }
+    char buffer[32];
+    const ssize_t n = read(fd, buffer, sizeof(buffer) - 1);
+    close(fd);
+    size_t value = 0;
+    bool parsed = false;
+    if (n > 0) {
+        buffer[n] = '\0';
+        const char* p = buffer;
+        while (*p == ' ' || *p == '\t' || *p == '\n') {
+            ++p;
+        }
+        if (*p >= '0' && *p <= '9') {
+            parsed = true;
+            while (*p >= '0' && *p <= '9') {
+                value = value * 10 + static_cast<size_t>(*p - '0');
+                ++p;
+            }
+        }
+    }
+    if (!parsed) {
+        return false;
+    }
+    if (known == kKgslUnknown) {
+        state.store(kKgslActive, std::memory_order_relaxed);
+    }
+    *bytes = value;
+    return true;
+}
+
+size_t ReadSelfKgslGpuBytes(ObservedMemSample* into) {
+    if (into == nullptr) {
+        return 0;
+    }
+    size_t bytes = 0;
+    if (!ReadSelfKgslKernel(&bytes)) {
+        return 0;
+    }
+    into->gpu_bytes = bytes;
+    into->gpu_source = GpuMmapSource::Kgsl;
+    return bytes;
 }
 
 bool GpuSampleNeedsRead(const GpuMmapCache& cache, size_t mapped_bytes) {
@@ -919,13 +1050,43 @@ ObservedMemSample ReadObservedMemoryGated(
     if (!rss.valid) {
         return sample;
     }
-    sample.rss_bytes = rss.vm_rss_kb * 1024;
+
+    // Two accounting models, chosen by whether this process's KGSL `kernel`
+    // node can actually be read. They differ in what rss_bytes means, and the
+    // difference is what keeps each disjoint:
+    //
+    //   Kgsl model (Adreno, node read succeeds): gpu_bytes is the driver's
+    //     committed allocation (the `kernel` node), which is exact and
+    //     fault-independent. A CPU-mapped GPU buffer is also counted in VmRSS
+    //     once faulted, so rss_bytes must exclude it -- RssAnon does, on every
+    //     measured part, while also excluding dma-buf mappings. total =
+    //     RssAnon + kernel + dma.
+    //
+    //   Fallback (no node -- host CI, non-Adreno, node not yet created, or a
+    //     denied SELinux domain): the smaps divergence, which is only the GPU
+    //     pages VmRSS does not already hold, added on top of the full VmRSS.
+    //     total = VmRSS + divergence + dma. This is the original model, left
+    //     unchanged.
+    //
+    // The dma pass is identical in both: buffers deduped by inode across the fd
+    // and mapping passes (see ReadSelfDmaBytesGated), so a buffer reachable
+    // through several descriptors or a surviving mapping is counted once. The
+    // KGSL model does not add imported_mem: an imported dma-buf is the same
+    // physical memory dma_bytes already counts by inode.
+    //
+    // The KGSL read is attempted first so the model -- and therefore which RSS
+    // figure feeds the dma pass's gate -- is known before the dma pass runs.
+    const bool kgsl = ReadSelfKgslGpuBytes(&sample) != 0 ||
+                      sample.gpu_source == GpuMmapSource::Kgsl;
+    sample.rss_bytes = (kgsl ? rss.anon_kb : rss.vm_rss_kb) * 1024;
     ResetDmaInodeSet(set);
     sample.dma_bytes =
             ReadSelfDmaBytesGated(set, &sample, map_cache, peak_total_bytes);
-    // Last, so its own gate can weigh rss and dma as they were actually measured
-    // this sample rather than against a carried guess.
-    ReadSelfGpuMmapBytesGated(&sample, gpu_cache, peak_total_bytes);
+    if (!kgsl) {
+        // Last, so its own gate can weigh rss and dma as they were actually
+        // measured this sample rather than against a carried guess.
+        ReadSelfGpuMmapBytesGated(&sample, gpu_cache, peak_total_bytes);
+    }
     sample.valid = true;
     return sample;
 }

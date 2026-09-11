@@ -247,6 +247,19 @@ if(MALLOC_HOOK_HAVE_GTEST)
         install(TARGETS alloc_hook_test DESTINATION ${CMAKE_INSTALL_PREFIX}/out/bin)
     endif()
 
+    # On-device regression tool for the KGSL GPU-memory accounting. Drives
+    # clCreateBuffer / clCreateBufferWithProperties / clEnqueueMapBuffer / SVM /
+    # the QCOM dma-buf imports through their lifecycle and prints, per step, the
+    # /proc/self smaps+status figures alongside the /sys/class/kgsl proc nodes,
+    # so the numbers ObservedMemory.cpp relies on can be re-verified on a new
+    # Adreno part. Android + opencl-stub only: it needs a real OpenCL driver and
+    # the kgsl node, neither of which exists on a host CI runner.
+    if(ANDROID AND TARGET opencl-stub)
+        add_executable(gpu_kgsl_probe gpu_kgsl_probe.cpp)
+        target_link_libraries(gpu_kgsl_probe PRIVATE opencl-stub log)
+        install(TARGETS gpu_kgsl_probe DESTINATION ${CMAKE_INSTALL_PREFIX}/out/bin)
+    endif()
+
     add_executable(async_stack_pipeline_test
         async_stack_pipeline_test.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/../backtrace/src/AsyncStackPipeline.cpp)

@@ -733,6 +733,51 @@ void TestGpuReadFailurePath() {
     unlink(gpu_path.c_str());
 }
 
+// The KGSL `kernel` node is a single decimal byte count. Parsing is covered here
+// because the sampling-path reader is hand-rolled (no sscanf over the file), and
+// the device it reads on is not the host a test runs on.
+void TestKgslKernelNode() {
+    size_t bytes = 999;
+    // A plain integer, as the node presents it.
+    const std::string ok = WriteTempFile("kgsl_kernel_ok", "278000000\n");
+    assert(ReadKgslKernelBytesFrom(ok.c_str(), &bytes));
+    assert(bytes == 278000000u);
+
+    // Leading whitespace and no trailing newline both parse.
+    bytes = 0;
+    const std::string ws = WriteTempFile("kgsl_kernel_ws", "   65536");
+    assert(ReadKgslKernelBytesFrom(ws.c_str(), &bytes));
+    assert(bytes == 65536u);
+
+    // A zero is a real measurement (context up, nothing allocated yet), not a
+    // failure: the node is readable and says zero.
+    bytes = 123;
+    const std::string zero = WriteTempFile("kgsl_kernel_zero", "0\n");
+    assert(ReadKgslKernelBytesFrom(zero.c_str(), &bytes));
+    assert(bytes == 0u);
+
+    // An empty file and a non-numeric one are read failures, not measured zeros,
+    // so a garbled read can never be taken as "this process holds no GPU memory".
+    bytes = 777;
+    const std::string empty = WriteTempFile("kgsl_kernel_empty", "");
+    assert(!ReadKgslKernelBytesFrom(empty.c_str(), &bytes));
+    assert(bytes == 777u);
+    const std::string junk = WriteTempFile("kgsl_kernel_junk", "not-a-number\n");
+    assert(!ReadKgslKernelBytesFrom(junk.c_str(), &bytes));
+    assert(bytes == 777u);
+
+    // A path that cannot be opened is the host-CI / non-Adreno / not-yet-created
+    // case, and must report failure so the caller falls back to the smaps model.
+    assert(!ReadKgslKernelBytesFrom("/nonexistent/kgsl/kernel", &bytes));
+
+    unlink(ok.c_str());
+    unlink(ws.c_str());
+    unlink(zero.c_str());
+    unlink(empty.c_str());
+    unlink(junk.c_str());
+}
+
+
 void TestGpuMmapAccounting() {
     // Verbatim region shape from a Qualcomm/Adreno device: the OpenCL driver
     // mmaps device memory from the kgsl node, and the kernel reports Rss 0 for it
@@ -1197,6 +1242,7 @@ int main() {
     TestGpuMmapAccounting();
     TestGpuNodePathMatching();
     TestGpuReadFailurePath();
+    TestKgslKernelNode();
     TestGpuSmapsReadingSeesDriverRegions();
     TestGpuBytesFromReading();
     TestGpuReadPolicy();
