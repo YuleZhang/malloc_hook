@@ -213,9 +213,7 @@ bool Config::Init() {
     }
     backtrace_max_size_bytes_ = SIZE_MAX;
 
-    // 开启 unwind
-    options_ |= BACKTRACE;
-    // 记录 trace
+    // 记录 trace（指针表和 host/dma 峰值计数器，独立于抓栈）
     options_ |= TRACK_ALLOCS;
 
     // Peak criterion cadence, resolved before the peak options below because the
@@ -264,6 +262,13 @@ bool Config::Init() {
                                      : PeakRetention::ChaseMax;
     if (record_peak) {
         options_ |= RECORD_MEMORY_PEAK;
+        // Stack capture only earns its keep when a report consumes it. A run that
+        // configures no report is a lightweight tracked probe: it keeps the
+        // pointer table and the host/dma/total peak counters (TRACK_ALLOCS) but
+        // never unwinds, and prints the tracked peaks at exit. So BACKTRACE is
+        // enabled here, with the report, rather than unconditionally -- a bare
+        // LD_PRELOAD must not pay ~2762ns/alloc to capture stacks nothing reads.
+        options_ |= BACKTRACE;
         // Fills in a filter where the platform sets none. It must not relax one
         // that a platform did set: that default exists for that platform's own
         // cost reasons, and enabling peak recording is not a reason to capture

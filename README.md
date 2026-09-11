@@ -128,10 +128,15 @@ prefix and are kept as-is because deployment scripts depend on them.
 
 Which mode a run is in is decided entirely by which variables above are set:
 
+- Set nothing (bare `LD_PRELOAD`) for the **lightweight tracked probe** — tracks
+  allocations but captures no stacks, and prints the tracked host / dma / total
+  peak at exit. Cheap enough for a quick "how much does the hook see" pass, and
+  the natural way to pick a `DUMP_PEAK_VALUE_MB` floor.
 - Set only `ALLOC_HOOK_PEAK_SAMPLE_MS` for the **observe-only probe** — measures
-  how much the process holds (rss / dma / gpu), tracks nothing, and prints a log
-  block at exit.
-- Set `DUMP_PEAK_VALUE_MB` for **first crossing** — one report, one stack walk,
+  how much the process holds (rss / dma / gpu from `/proc`), tracks nothing, and
+  prints a log block at exit.
+- Set `DUMP_PEAK_VALUE_MB` (with `ALLOC_HOOK_PEAK_SAMPLE_MS=0` to judge against
+  the tracked total) for **first crossing** — one report, one stack walk,
   answering what held memory when it first passed the floor. This is the common
   report mode.
 - Set `ALLOC_HOOK_PEAK_SAMPLE_MS` + `DUMP_PEAK_STEP_MB` for **peak chasing** —

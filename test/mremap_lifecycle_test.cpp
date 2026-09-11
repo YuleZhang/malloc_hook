@@ -90,6 +90,12 @@ size_t CountOccurrences(const std::string& haystack, const std::string& needle) 
 
 int main() {
     setenv("ALLOC_HOOK_CAPTURE_MODE", "fast", 1);
+    // Per-allocation report blocks (alloc_size + stack) require stack capture,
+    // which now belongs to a report mode: a bare run is a lightweight tracked
+    // probe that keeps counters but no stacks. Ask for a report so BACKTRACE is
+    // on. The 1MB floor is never crossed by these 8KB mappings, so it only
+    // enables capture; it does not snapshot or change the live listing.
+    setenv("DUMP_PEAK_VALUE_MB", "1", 1);
     m_sys_malloc = std::malloc;
     m_sys_free = std::free;
     m_sys_calloc = std::calloc;

@@ -107,10 +107,13 @@ backtrace 信号，OHOS 为 `46`，其他平台为 `SIGRTMIN+6`）。
 
 设置了上面哪些变量，就完全决定了这次运行是哪一种：
 
+- 什么都不设（裸 `LD_PRELOAD`）——**轻量 tracked 探测**：跟踪分配但不抓栈，退出时打印
+  tracked 的 host / dma / total 峰值。足够轻，可顺手跑一遍看"hook 看到多少"，也是给
+  `DUMP_PEAK_VALUE_MB` 定下限的自然方式。
 - 只设 `ALLOC_HOOK_PEAK_SAMPLE_MS`——**只观测探测模式**：测量进程占了多少
-  （rss / dma / gpu），不跟踪任何东西，退出时打印一段日志。
-- 设 `DUMP_PEAK_VALUE_MB`——**首次越线**：一份报告、一次栈遍历，回答首次越过下限时是谁
-  占着内存。这是常用的报告模式。
+  （`/proc` 的 rss / dma / gpu），不跟踪任何东西，退出时打印一段日志。
+- 设 `DUMP_PEAK_VALUE_MB`（配 `ALLOC_HOOK_PEAK_SAMPLE_MS=0` 以 tracked 合计为判据）——
+  **首次越线**：一份报告、一次栈遍历，回答首次越过下限时是谁占着内存。这是常用的报告模式。
 - 设 `ALLOC_HOOK_PEAK_SAMPLE_MS` + `DUMP_PEAK_STEP_MB`——**峰值追踪**：一份描述运行期
   最大值的报告，每涨一个步长做一次栈遍历。
 

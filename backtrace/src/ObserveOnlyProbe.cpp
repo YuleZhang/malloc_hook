@@ -45,6 +45,7 @@ constexpr int kRuleWidth = 60;
 constexpr int kLabelWidth = 33;
 constexpr int kValueWidth = 20;
 constexpr char kTitle[] = "                Memory Usage Summary";
+constexpr char kTrackedTitle[] = "              Tracked Allocation Peak";
 
 // Yellow marks the block the way that framework's own summary is marked, which
 // is the point of matching it: one colour to look for in a long log.
@@ -209,6 +210,29 @@ void WriteObservedBlock(int fd, const char* reason) {
 }
 
 }  // namespace
+
+void WriteTrackedSummary(
+        int fd, size_t host_peak_bytes, size_t dma_peak_bytes,
+        size_t total_peak_bytes) {
+    const LineStyle style = StyleFor(fd);
+    WriteRule(fd, style, '=');
+    WriteText(fd, style, kTrackedTitle);
+    WriteRule(fd, style, '-');
+    // Accounting bytes, not /proc RSS: these are the sizes requested through the
+    // interposed alloc/mmap/ioctl paths, which is exactly the quantity the
+    // DUMP_PEAK_VALUE_MB first-crossing criterion compares against when the
+    // sampler is off (ALLOC_HOOK_PEAK_SAMPLE_MS=0). Labelled so, never as RSS.
+    WriteMegabyteRow(fd, style, "Tracked host peak (malloc/mmap):", host_peak_bytes);
+    WriteMegabyteRow(fd, style, "Tracked DMA peak (ioctl):", dma_peak_bytes);
+    WriteMegabyteRow(fd, style, "Tracked total peak:", total_peak_bytes);
+    // The kernel's real resident high-water mark, for reference: how much of the
+    // process's actual footprint the tracked bytes above account for.
+    const size_t max_rss_bytes = ReadMaxRssBytes();
+    if (max_rss_bytes != 0) {
+        WriteMegabyteRow(fd, style, "RSS Max (getrusage):", max_rss_bytes);
+    }
+    WriteRule(fd, style, '=');
+}
 
 int ResolveMode() {
     // The loader publishes `environ` before it runs any constructor, but an

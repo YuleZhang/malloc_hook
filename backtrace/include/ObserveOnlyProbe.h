@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <cstddef>
 
 // ---------------------------------------------------------------------------
 // Observe-only probe: measure the footprint, take over nothing.
@@ -83,5 +84,15 @@ void ReportAtExit();
 // observe-only mode, where there is no live allocation table to report.
 // Does not stop the sampler.
 bool WriteReport(const char* file_name);
+
+// Writes a boxed summary of the tracked-allocation peaks (host, DMA, total) to
+// `fd`, in the same shape as the observe-only block. Used by the tracker's exit
+// path: it is the whole output of the lightweight tracked probe (bare
+// LD_PRELOAD, no stacks) and also accompanies a report. The figures are
+// accounting bytes -- sizes requested through the interposed paths -- not /proc
+// RSS, which is why the rows say "Tracked ..." rather than "RSS".
+void WriteTrackedSummary(
+        int fd, size_t host_peak_bytes, size_t dma_peak_bytes,
+        size_t total_peak_bytes);
 
 }  // namespace observe_only
