@@ -184,6 +184,30 @@ gpu_bytes  = min(divergence, 设备区间的 per-VMA Rss 之和)
 有设备节点但没有设备映射的进程一次都不付。`observed_sampler` 里的 `gpu_reads` 报告实际
 付了多少次。
 
+## KGSL 每进程节点：Adreno 上更准也更省，以及 MTK/Mali 的结论
+
+上面的 smaps divergence 只在 GPU 页被 CPU **缺页之后**才看得到。GPU 侧写、CPU 从不映射/
+只读一部分的 buffer（GPU 计算流水线的常态）因此被**低估**。改用 KGSL 每进程节点
+`/sys/class/kgsl/kgsl/proc/<pid>/kernel`（= `gpumem_mapped + gpumem_unmapped`）后可修正：
+
+* 它在 `clCreateBuffer`/`clSVMAlloc` 时就报出**已提交的全额**，与 CPU 缺页无关，五代 Adreno
+  一致，一次整数读即可（无需扫 maps/smaps）。实测在 imx896 流水线上，旧法在 Adreno662 报
+  1.9 MB，节点报 37.8 MB（与驱动一致）；采样单次成本降约 5–8×，不再限流。
+* 与 `RssAnon` 配对而非 `VmRSS`：驱动对 buffer 的 CPU 映射一旦缺页会计入 `VmRSS`
+  （视机型落在 `RssFile` 或 `RssShmem`），配 `RssAnon` 才不会重复计，保证
+  `RssAnon + kernel + dma` 三者不相交。
+* 导入的 dma-buf 只进驱动的 `imported_mem`、**不进** `kernel`，且已被 `dma_bytes` 按 inode
+  统计，所以 GPU 桶不加 `imported_mem`，不会与 dma 重复。
+* 节点不可读时（host CI、非 Adreno、SELinux 域被拒）回退到上面的 smaps 方案。
+
+**MTK/Mali 不需要这一步。** Mali 的等价节点是 `/proc/mtk_mali/gpu_memory`（格式
+`kctx-<hash>  <pages>  <tgid>`，按 tgid 聚合），但 Mali 在 **create 时就把 `/dev/mali0`
+分配缺页进 `RssFile`**（无论是否 map/touch，实测节点与 `RssFile` 增量逐步吻合到 ~1 MB），
+所以 GPU 内存**已经完整体现在 `/proc/<pid>/status`（VmRSS 的 RssFile 分量）里** —— 没有
+Adreno 那种"已分配但 CPU 冷页"的漏计，现有 smaps/VmRSS 回退已给出正确总量。`clImportMemoryARM`
+导入 64 MB 只给该节点加 ~128 kB（元数据），不计入那 64 MB，因此也不会与 `dma_bytes` 重复。
+该节点在 MTK 上的唯一价值是把 GPU 从 rss 桶拆成独立 gpu 桶（纯归类，非必需）。
+
 ## 厂商 API 注意事项
 
 这些重新踩一遍要花真金白银的时间，所以记在这里。
