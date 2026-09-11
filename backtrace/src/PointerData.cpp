@@ -19,6 +19,7 @@
 
 #include "Config.h"
 #include "DebugData.h"
+#include "ObserveOnlyProbe.h"
 #include "PointerData.h"
 #include "UnwindBacktrace.h"
 #include "memory_hook.h"
@@ -1444,24 +1445,32 @@ void PointerData::DumpLiveToFile(int fd, bool dump_peak) {
 void PointerData::DumpPeakInfo() {
     // No tracker lock: every value printed here is an atomic counter. Taking
     // all 64 shards to read six words would stall every allocating thread for
-    // the duration of a printf.
-    printf("\n+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++"
-           "++++++++++++++++\n");
-    printf("host peak used: %fMB, dma peak used %fMB, total peak used: %fMB\n\n",
-           peak_host.load(std::memory_order_relaxed) / 1024.0 / 1024.0,
-           peak_dma.load(std::memory_order_relaxed) / 1024.0 / 1024.0,
-           peak_tot.load(std::memory_order_relaxed) / 1024.0 / 1024.0);
+    // the duration of a print.
+    const size_t host_peak = peak_host.load(std::memory_order_relaxed);
+    const size_t dma_peak = peak_dma.load(std::memory_order_relaxed);
+    const size_t total_peak = peak_tot.load(std::memory_order_relaxed);
+    observe_only::WriteTrackedSummary(
+            STDERR_FILENO, host_peak, dma_peak, total_peak);
+
     const ObservedSamplerStats sampler = ObservedPeakSamplerInstance().stats();
     if (sampler.samples != 0) {
         // Printed next to the tracked totals because they are different
-        // quantities: the line above is bytes this process asked for, this one
+        // quantities: the box above is bytes this process asked for, this one
         // is what the kernel says it holds.
-        printf("observed peak (host rss + dma + gpu, from /proc every %ums): "
-               "rss %fMB + dma %fMB + gpu %fMB = %fMB\n\n",
-               sampler.interval_ms,
-               sampler.peak_total_rss_bytes / 1024.0 / 1024.0,
-               sampler.peak_total_dma_bytes / 1024.0 / 1024.0,
-               sampler.peak_total_gpu_bytes / 1024.0 / 1024.0,
-               sampler.peak_total_bytes / 1024.0 / 1024.0);
+        dprintf(STDERR_FILENO,
+                "alloc_hook: observed peak (host rss + dma + gpu, from /proc "
+                "every %ums): rss %.2fMB + dma %.2fMB + gpu %.2fMB = %.2fMB\n",
+                sampler.interval_ms,
+                sampler.peak_total_rss_bytes / 1024.0 / 1024.0,
+                sampler.peak_total_dma_bytes / 1024.0 / 1024.0,
+                sampler.peak_total_gpu_bytes / 1024.0 / 1024.0,
+                sampler.peak_total_bytes / 1024.0 / 1024.0);
+    } else if (!(g_debug->config().options() & BACKTRACE)) {
+        // The lightweight tracked probe: it never unwound, so it can report how
+        // much but not which call site. Point at the report modes that can.
+        dprintf(STDERR_FILENO,
+                "alloc_hook: tracked probe: no stacks captured; add "
+                "DUMP_PEAK_VALUE_MB (with ALLOC_HOOK_PEAK_SAMPLE_MS=0) to "
+                "attribute the peak to call sites\n");
     }
 }

@@ -200,8 +200,12 @@ static void* signal_dump_thread(void*) {
             }
             break;
         }
+        // Dump whenever this process is tracking, whether or not it captured
+        // stacks. The lightweight tracked probe (bare LD_PRELOAD) keeps a live
+        // table but no BACKTRACE, so it still has a stackless live report worth
+        // writing; gating on BACKTRACE would drop the signal silently there.
         if (command != 'd' || g_debug == nullptr ||
-            !(g_debug->config().options() & BACKTRACE)) {
+            !g_debug->TrackPointers()) {
             continue;
         }
 

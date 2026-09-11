@@ -2,31 +2,88 @@
 
 [中文版 / Chinese](get_hook_report.zh-CN.md) · [README](../README.md)
 
-Every mode this library runs measures the same criterion — the **observed
-total**, `VmRSS` + dmabuf + GPU mappings, sampled from `/proc` on a dedicated
-thread. What differs is whether the run also *tracks allocations* to attribute
-that total to call sites, because that is where the cost is. Which one runs is
-decided entirely by which environment variables are set:
+This library runs in one of four modes, decided entirely by which environment
+variables are set. Two are *probes* that only measure a peak and print it at
+exit; two are *reports* that also capture stacks to attribute that peak to call
+sites, which is where the cost is. The probes differ in **which quantity** they
+watch:
+
+- **tracked** — the bytes requested through the interposed `malloc`/`mmap`/`ioctl`
+  paths (accounting bytes), summed as host / dma / total.
+- **observed** — the process's real footprint from `/proc`: `VmRSS` + dmabuf +
+  GPU mappings, sampled on a dedicated thread.
 
 | Set this | Mode | Interposed calls | Output | Answers |
 | --- | --- | --- | --- | --- |
-| `ALLOC_HOOK_PEAK_SAMPLE_MS=k` | observe-only probe | forwarded to libc untouched | a log block on stderr at exit | how much did this process hold, split into rss / dma / gpu |
-| `DUMP_PEAK_VALUE_MB=N` | first crossing | tracked, one stack walk per run | a report file | what was holding memory when it first passed `N` MB |
+| *(nothing)* — bare `LD_PRELOAD` | tracked probe (lightweight) | tracked, no stacks | a tracked-peak box on stderr at exit | how much the hook tracked: host / dma / total accounting bytes |
+| `ALLOC_HOOK_PEAK_SAMPLE_MS=k` | observe-only probe | forwarded to libc untouched | an observed-peak box on stderr at exit | how much the process held: rss / dma / gpu from `/proc` |
+| `DUMP_PEAK_VALUE_MB=N` | first crossing | tracked, one stack walk per run | a report file | what was holding memory when the criterion first passed `N` MB |
 | `ALLOC_HOOK_PEAK_SAMPLE_MS=k` + `DUMP_PEAK_STEP_MB=s` | peak chasing | tracked, one stack walk per `s` of growth | a report file | what was holding memory at the run's maximum |
 
-The probe answers *how much*; the two report modes answer *which call sites*,
+The two probes answer *how much*; the two report modes answer *which call sites*,
 and charge for it. Nothing else enables a report: an interval without a step, or
-a step without an interval, produces the probe or nothing at all.
+a step without an interval, produces a probe or nothing at all.
 
-`0` is how each of these is turned off, uniformly: `DUMP_PEAK_VALUE_MB=0` asks
-for no first-crossing snapshot, `DUMP_PEAK_STEP_MB=0` asks for no chasing, and
-`ALLOC_HOOK_PEAK_SAMPLE_MS=0` asks for no sampler at all. A run that zeroes both
-report switches keeps the probe; a run that zeroes all three tracks allocations
-for the on-demand checkpoint and produces nothing on its own.
+**Which criterion the report uses is the crux.** With a sampler running
+(`ALLOC_HOOK_PEAK_SAMPLE_MS>0`), `DUMP_PEAK_VALUE_MB` compares against the
+*observed* total. With the sampler off (`ALLOC_HOOK_PEAK_SAMPLE_MS=0`), it
+compares against the *tracked* total — the very same `peak_tot` the bare tracked
+probe prints. So the two tracked modes pair up: run bare once to read the tracked
+total, then set `DUMP_PEAK_VALUE_MB` to just under it with
+`ALLOC_HOOK_PEAK_SAMPLE_MS=0`, and the criterion that triggers the snapshot is the
+same quantity you measured — the report cannot cross yet come back empty.
+
+`0` is how each switch is turned off, uniformly: `DUMP_PEAK_VALUE_MB=0` asks for
+no first-crossing snapshot, `DUMP_PEAK_STEP_MB=0` asks for no chasing, and
+`ALLOC_HOOK_PEAK_SAMPLE_MS=0` asks for no sampler at all (criterion falls back to
+tracked bytes).
 
 Both report modes write to `ALLOC_HOOK_DUMP_PREFIX` on normal exit and create the
 directory if it does not exist. Setting both variables gives first crossing at
 the floor, with the interval you supplied.
+
+## 0. The lightweight tracked probe (bare `LD_PRELOAD`)
+
+The default when no peak variable is set. It keeps the live-allocation table and
+the host/dma/total peak counters, but **captures no stacks** — so it is cheap
+enough to leave on for a quick "how much does the hook see" pass:
+
+```sh
+LD_PRELOAD=/path/liballoc_hook.so ./your_program
+```
+
+```text
+alloc_hook: ============================================================
+alloc_hook:               Tracked Allocation Peak
+alloc_hook: ------------------------------------------------------------
+alloc_hook:   Tracked host peak (malloc/mmap):               363.55 MB
+alloc_hook:   Tracked DMA peak (ioctl):                      144.79 MB
+alloc_hook:   Tracked total peak:                            507.83 MB
+alloc_hook:   RSS Max (getrusage):                           474.39 MB
+alloc_hook: ============================================================
+alloc_hook: tracked probe: no stacks captured; add DUMP_PEAK_VALUE_MB (with ALLOC_HOOK_PEAK_SAMPLE_MS=0) to attribute the peak to call sites
+```
+
+These are **accounting bytes**, not `/proc` RSS: `Tracked host` is what was
+requested through `malloc`/`mmap`, `Tracked DMA` what was requested through the
+interposed `ioctl` paths. They can exceed `RSS Max (getrusage)` (DMA buffers and
+non-resident allocations count here but not in RSS); the getrusage row is the
+kernel's real resident high-water mark, printed for reference so you can see how
+much of the footprint the tracked bytes account for.
+
+Use `Tracked total peak` as the floor for a first-crossing report: set
+`DUMP_PEAK_VALUE_MB` to just under it with `ALLOC_HOOK_PEAK_SAMPLE_MS=0` (section
+2a). Because the probe and that report use the same `peak_tot`, one probe run is
+enough to land a tight snapshot — `snapshot_lag` in the report tells you exactly
+how much closer the floor could be.
+
+Since it captures no stacks, `checkpoint()` (the exported call or the signal)
+writes a **stackless** live report — the live table and tracked peaks, without
+call sites. Ask for a report mode when you need stacks. A `fork` child runs its
+own empty tracker and prints a zeroed box; a process that leaves through
+`_exit()` or a fatal signal prints nothing.
+
+
 
 ## 1. The observe-only probe
 
@@ -94,20 +151,25 @@ covered in [`GPU_MEMORY_ACCOUNTING.md`](GPU_MEMORY_ACCOUNTING.md).
 ### 2a. `DUMP_PEAK_VALUE_MB` — first crossing (common)
 
 ```sh
-export DUMP_PEAK_VALUE_MB=300        # first crossing of 300MB; one stack walk
+# criterion = tracked total; pairs with the bare tracked probe's number
+export DUMP_PEAK_VALUE_MB=480        # first crossing of 480MB; one stack walk
+export ALLOC_HOOK_PEAK_SAMPLE_MS=0   # sampler off -> criterion is tracked bytes
 export BACKTRACE_MIN_SIZE=1024
 ```
 
 A positive floor selects first-crossing: peak recording is enabled, and a single
-snapshot is retained -- taken the first time the observed total passes this many
-MB. One stack walk for the whole run, so after the crossing no allocating thread
-is stalled again, which matters when the pipeline being measured is
-timing-sensitive.
+snapshot is retained -- taken the first time the criterion passes this many MB.
+The criterion is the *tracked* total when the sampler is off
+(`ALLOC_HOOK_PEAK_SAMPLE_MS=0`, recommended when the goal is to attribute the
+tracked bytes to call sites) and the *observed* `/proc` total when a sampler runs.
+One stack walk for the whole run, so after the crossing no allocating thread is
+stalled again, which matters when the pipeline being measured is timing-sensitive.
 
-In exchange the stacks describe the floor, not the maximum, so the floor has to be
-set near the peak to answer "what is holding memory at the peak" -- typically from
-an earlier run's report. Read `snapshot_lag` to tune it: it is exactly how much
-higher the floor could have been set.
+Take the floor from the bare tracked probe's `Tracked total peak` (set it just
+under). In exchange the stacks describe the floor, not the maximum, so a floor
+near the peak is what answers "what is holding memory at the peak". Read
+`snapshot_lag` to tune it: it is exactly how much higher the floor could have
+been set.
 
 ```text
 peak_retention: first_crossing floor=200.000000MB (single snapshot; step unused)
