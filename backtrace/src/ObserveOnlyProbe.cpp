@@ -5,6 +5,7 @@
 #include <unistd.h>
 #include <cerrno>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 #include "Config.h"
@@ -18,6 +19,27 @@ namespace observe_only {
 std::atomic<int> g_mode{kUndecided};
 
 namespace {
+
+// Primary election state for this copy of the library: -1 undecided, 1 primary,
+// 0 secondary. Latched the first time IsPrimary() is asked. Per-copy by design
+// (the version script hides it), which is exactly why the decision below is
+// coordinated through environ rather than through this word.
+std::atomic<int> g_primary{-1};
+
+constexpr char kPrimaryPidEnv[] = "ALLOC_HOOK_PRIMARY_PID";
+
+// The pid stamped in ALLOC_HOOK_PRIMARY_PID, or -1 when unset or unparseable.
+long ReadStampedPrimaryPid() {
+    const char* stamped = getenv(kPrimaryPidEnv);
+    if (stamped == nullptr || *stamped < '0' || *stamped > '9') {
+        return -1;
+    }
+    long value = 0;
+    for (const char* p = stamped; *p >= '0' && *p <= '9'; ++p) {
+        value = value * 10 + (*p - '0');
+    }
+    return value;
+}
 
 // The process the sampler thread belongs to. fork() clones neither that thread
 // nor the figures it produced, but the child *does* inherit this library's exit
@@ -254,9 +276,50 @@ int ResolveMode() {
     return mode;
 }
 
+bool IsPrimary() {
+    const int known = g_primary.load(std::memory_order_acquire);
+    if (known >= 0) {
+        return known == 1;
+    }
+    // First decision for this copy. environ carries the election across copies;
+    // guard errno the same way ResolveMode does, since the setenv/getenv below
+    // can be the first environ touch a caller makes on an allocation path.
+    const int saved_errno = errno;
+    const pid_t pid = getpid();
+    bool primary;
+    if (ReadStampedPrimaryPid() == static_cast<long>(pid)) {
+        // Another copy in this same process already claimed the report.
+        primary = false;
+    } else {
+        char buf[16];
+        snprintf(buf, sizeof(buf), "%d", static_cast<int>(pid));
+        setenv(kPrimaryPidEnv, buf, 1);
+        primary = true;
+    }
+    errno = saved_errno;
+    // Latch, tolerating a race between two threads of this same copy: whoever
+    // wins the CAS fixes the decision, the loser adopts it. Both threads belong
+    // to the same copy, so they must agree, and the stamp above is idempotent.
+    int expected = -1;
+    const int desired = primary ? 1 : 0;
+    if (g_primary.compare_exchange_strong(
+                expected, desired, std::memory_order_acq_rel)) {
+        return desired == 1;
+    }
+    return g_primary.load(std::memory_order_acquire) == 1;
+}
+
 bool StartProbe() {
     unsigned interval_ms = 0;
     if (!Bypassed() || !Config::ObserveOnlyRequested(&interval_ms)) {
+        return false;
+    }
+    // Only the primary copy of this library runs the sampler and registers the
+    // exit report. A secondary copy -- this same file re-instantiated in a
+    // linker namespace an app dlopen created -- would otherwise sample its own
+    // near-empty namespace and print a second, misleading summary. See
+    // IsPrimary().
+    if (!IsPrimary()) {
         return false;
     }
     g_probe_pid = getpid();

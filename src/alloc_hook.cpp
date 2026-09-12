@@ -434,6 +434,15 @@ AllocHook& AllocHook::inst() {
 
 __attribute__((constructor(201))) void mark_init_done() {
     in_preinit_phase = false;
+    // Elect the process's primary copy here, at load, rather than at exit. A
+    // preloaded library's constructors run at process startup, before the app
+    // can dlopen this same file into a linker namespace, so the whole-life
+    // LD_PRELOAD copy stamps its pid first and every later namespace copy stays
+    // secondary. Deciding it at report time would be backwards: the namespace
+    // copy reports first (via its dlclose destructor) yet holds the near-empty
+    // numbers. See observe_only::IsPrimary(). Both the tracker's exit summary
+    // and the observe-only summary are gated on this.
+    (void)observe_only::IsPrimary();
     // The loader is done with us, so pthread_create works from here on. If a
     // preinit allocation already built the tracker, this is where its threads
     // start; if not, AllocHook's constructor starts them itself.

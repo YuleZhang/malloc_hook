@@ -24,6 +24,7 @@
 #include "Config.h"
 #include "DebugData.h"
 #include "HookSourcePolicy.h"
+#include "ObserveOnlyProbe.h"
 #include "ObservedMemory.h"
 #include "PointerData.h"
 #include "debug_disable.h"
@@ -277,6 +278,14 @@ static bool OnObservedMemoryPeak(const ObservedMemSample& sample) {
 // Off only when peak recording was not requested at all, or when an explicit
 // interval of 0 opted out of the extra thread (see Config::Init).
 static void StartObservedPeakSampler() {
+    // Only the primary copy samples. A secondary copy -- this same file
+    // re-instantiated in a linker namespace an app dlopen created -- would
+    // otherwise run a second /proc sampler and, at its own teardown, print a
+    // second summary describing only its near-empty namespace. See
+    // observe_only::IsPrimary().
+    if (!observe_only::IsPrimary()) {
+        return;
+    }
     if (!(g_debug->config().options() & RECORD_MEMORY_PEAK)) {
         return;
     }
