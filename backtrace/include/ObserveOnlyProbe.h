@@ -95,4 +95,39 @@ void WriteTrackedSummary(
         int fd, size_t host_peak_bytes, size_t dma_peak_bytes,
         size_t total_peak_bytes);
 
+// The cross-instance primary election: true only in the one copy of this
+// library that is responsible for the process's exit report.
+//
+// The version script marks every symbol except the hook functions `local`, so
+// each mapped copy of this library has its own g_debug, its own AllocHook
+// singleton, its own sampler and its own exit path. That is invisible when the
+// library is loaded once, but an LD_PRELOAD interposer is not: the loader
+// replicates a preloaded library into every additional linker namespace the
+// process creates (a camera/model framework dlopen'ing vendor plugins is the
+// case that bit us), so the SAME file ends up with two independent instances.
+// Each would otherwise emit its own exit summary -- and the extra, namespace
+// copy is the misleading one: its malloc symbols serve only that namespace, so
+// its tracker/sampler see almost nothing, and it happens to report FIRST,
+// through its dlclose destructor, before the real preload copy reports through
+// atexit. A "first writer wins" guard would therefore keep exactly the wrong,
+// near-zero numbers.
+//
+// So the election is decided at LOAD time, not at report time. environ is the
+// one piece of state every copy shares; the first copy to initialise stamps its
+// pid into ALLOC_HOOK_PRIMARY_PID and becomes primary. Because a preloaded
+// library's constructors run at process startup, strictly before the app can
+// dlopen anything into a new namespace, the whole-life LD_PRELOAD copy always
+// wins and every later namespace copy sees its own pid already stamped and
+// stays secondary. Pid-stamped rather than a bare flag so a fork child, which
+// inherits the parent's environ, re-elects a primary under its own pid.
+//
+// Idempotent and thread-safe within a copy: the decision is latched the first
+// time it is asked for. Both exit summaries -- the observe-only "Memory Usage
+// Summary" and the tracker's "Tracked Allocation Peak" -- and both samplers are
+// gated on this, so exactly one copy does the work and prints. The on-demand
+// checkpoint report is deliberately not gated: it is a caller-requested dump,
+// not the automatic exit report, and must always answer from whichever copy the
+// call reached.
+bool IsPrimary();
+
 }  // namespace observe_only

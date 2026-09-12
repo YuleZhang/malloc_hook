@@ -1443,6 +1443,15 @@ void PointerData::DumpLiveToFile(int fd, bool dump_peak) {
 }
 
 void PointerData::DumpPeakInfo() {
+    // Only the primary copy of this library reports. A secondary copy -- this
+    // same file re-instantiated in a linker namespace an app dlopen created --
+    // tracks only that namespace's allocations, so its peak is not the
+    // process's, and it reaches its exit (a dlclose) before the primary does. It
+    // must stay silent rather than print a second, near-empty summary. See
+    // observe_only::IsPrimary().
+    if (!observe_only::IsPrimary()) {
+        return;
+    }
     // No tracker lock: every value printed here is an atomic counter. Taking
     // all 64 shards to read six words would stall every allocating thread for
     // the duration of a print.
