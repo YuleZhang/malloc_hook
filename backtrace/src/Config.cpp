@@ -47,6 +47,56 @@ static constexpr size_t kDefaultPeakSampleMs = 50;
 static constexpr char kExternalSampleIntervalSuffix[] =
         "AUTO_SHOW_MEM_USE_DURATION_MS";
 
+// The tunable environment surface, emitted verbatim into a dedicated ELF
+// section so it can be read straight off the .so file -- no process, no run,
+// host and on-device .so alike:
+//
+//     readelf -p .alloc_hook_help liballoc_hook.so
+//     strings   liballoc_hook.so | grep -A40 'alloc_hook env'
+//
+// This is the single documentation source for the knobs; the reads themselves
+// live in Config::Init(), ObserveOnlyProbe, UnwindBacktrace and malloc_debug.
+// Keep this block in sync when a knob is added, renamed or removed -- it is the
+// interface contract, and a reader who trusts it must not have to grep getenv.
+// `used` keeps the compiler from eliding it; `retain` (SHF_GNU_RETAIN) keeps the
+// linker from dropping it under --gc-sections, which the Android/NDK build turns
+// on -- without it the section survives the host gcc build but not that one.
+#if defined(__has_attribute)
+#if __has_attribute(retain)
+#define ALLOC_HOOK_RETAIN __attribute__((retain))
+#endif
+#endif
+#ifndef ALLOC_HOOK_RETAIN
+#define ALLOC_HOOK_RETAIN
+#endif
+__attribute__((used, section(".alloc_hook_help"))) ALLOC_HOOK_RETAIN
+static const char kAllocHookEnvManifest[] =
+        "alloc_hook env manifest (read with: readelf -p .alloc_hook_help <so>)\n"
+        "  ALLOC_HOOK_PEAK_SAMPLE_MS   /proc footprint sampling period, ms. >0 "
+        "starts the observe-only probe (rss+dma+gpu peak); 0/unset = tracked "
+        "allocation peak only. default: 0\n"
+        "  DUMP_PEAK_VALUE_MB          first-crossing peak: snapshot stacks once "
+        "when the observed total first passes this many MB. selects tracking + "
+        "first-crossing. default: 0 (off)\n"
+        "  DUMP_PEAK_STEP_MB           chase-max peak: re-snapshot each time the "
+        "peak grows this many MB. with PEAK_SAMPLE_MS>0 = chasing. default: 0 "
+        "(off)\n"
+        "  ALLOC_HOOK_DUMP_PREFIX      output path prefix for heap/backtrace "
+        "dumps. default: built-in\n"
+        "  ALLOC_HOOK_CAPTURE_MODE     stack capture mode: fast | accurate. "
+        "default: fast\n"
+        "  BACKTRACE_MIN_SIZE          minimum allocation size, bytes, to record. "
+        "default: 0 (OHOS: 40960)\n"
+        "  ALLOC_HOOK_FAST_UNWINDER    force the fast frame-pointer unwinder when "
+        "set. default: unset\n"
+        "  ENABLE_HOOK_DEBUG           verbose hook debug logging when set. "
+        "default: unset\n"
+        "  *AUTO_SHOW_MEM_USE_DURATION_MS  adopted as the sampling period (suffix "
+        "match) when ALLOC_HOOK_PEAK_SAMPLE_MS is unset; a host framework's own "
+        "knob.\n"
+        "  (internal) ALLOC_HOOK_PRIMARY_PID  cross-copy report election, set by "
+        "the library itself -- not a user knob.\n";
+
 static int DefaultBacktraceSignal() {
 #if defined(__BIONIC__)
     return BIONIC_SIGNAL_BACKTRACE;
