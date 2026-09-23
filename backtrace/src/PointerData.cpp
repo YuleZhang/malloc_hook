@@ -1,4 +1,5 @@
 #include <cxxabi.h>
+#include <fcntl.h>
 #include <inttypes.h>
 #include <sys/syscall.h>
 #include <sys/time.h>
@@ -25,8 +26,71 @@ constexpr size_t kBacktraceEmptyIndex = 1;
 constexpr size_t kDefaultPeakRecordStepBytes = 12 * 1024 * 1024;
 const char* mtype[3] = {"host", "mmap", "dma"};
 
+// Platforms whose kernel exposes an ftrace trace_marker we can write atrace-style
+// events into (bionic/Android and musl/OHOS). On anything else the marker helpers
+// compile to no-ops.
+#if defined(__MUSL__) || defined(__ANDROID__)
+#define MALLOC_HOOK_HAS_TRACE_MARKER 1
+#else
+#define MALLOC_HOOK_HAS_TRACE_MARKER 0
+#endif
+
+#if MALLOC_HOOK_HAS_TRACE_MARKER
+// One cached, write-only fd to the kernel trace_marker, opened lazily and reused for
+// every event so the alloc/free hot path does not pay an open()/close() per marker.
+// A negative fd (tracefs absent or not writable by this process) makes every write a
+// graceful no-op.
+static int TraceMarkerFd() {
+    static int fd = static_cast<int>(
+            syscall(SYS_openat, AT_FDCWD, "/sys/kernel/tracing/trace_marker",
+                    O_WRONLY | O_CLOEXEC, 0));
+    return fd;
+}
+
+static inline void WriteTraceMarker(const char* buf, size_t len) {
+    int fd = TraceMarkerFd();
+    if (fd >= 0) {
+        syscall(SYS_write, fd, buf, len);
+    }
+}
+
+static bool AllocTraceMarkerEnabled() {
+    static bool enabled = [] {
+        const char* value = getenv("MALLOC_HOOK_TRACE_ALLOC");
+        return value != nullptr && value[0] != '\0' && strcmp(value, "0") != 0;
+    }();
+    return enabled;
+}
+
+// Emit an atrace async begin ('S') / end ('F') for a single tracked allocation, so a
+// Perfetto trace can render each mat's alloc->free lifetime. The event name embeds the
+// pointer (unique among live allocations, so S and F pair) and the backtrace hash as
+// ".h<idx>" — build_perfetto_alloc_track.py keys off that hash to attach the symbolized
+// variable / call site. Only allocations that carry a backtrace (i.e. large enough to be
+// tracked) are marked; the cookie is the pointer so overlapping lifetimes stay distinct.
+static void WriteAllocTraceMarker(
+        char phase, const void* ptr, size_t hash_index, MemType type) {
+    if (!AllocTraceMarkerEnabled()) {
+        return;
+    }
+    const int pid = static_cast<int>(syscall(SYS_getpid));
+    const unsigned long long cookie =
+            static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(ptr));
+    char marker[160];
+    int length = snprintf(
+            marker, sizeof(marker), "%c|%d|memory_%s@%p.h%zu|%llu", phase, pid,
+            mtype[type], ptr, hash_index, cookie);
+    if (length > 0 && static_cast<size_t>(length) < sizeof(marker)) {
+        WriteTraceMarker(marker, static_cast<size_t>(length));
+    }
+}
+#else
+static inline bool AllocTraceMarkerEnabled() { return false; }
+static inline void WriteAllocTraceMarker(char, const void*, size_t, MemType) {}
+#endif
+
 static bool PeakTraceMarkerEnabled() {
-#if defined(__MUSL__)
+#if MALLOC_HOOK_HAS_TRACE_MARKER
     static bool enabled = [] {
         const char* value = getenv("MALLOC_HOOK_TRACE_PEAK");
         return value != nullptr && value[0] != '\0' && strcmp(value, "0") != 0;
@@ -38,7 +102,7 @@ static bool PeakTraceMarkerEnabled() {
 }
 
 static void WritePeakTraceMarker(size_t host_bytes, size_t dma_bytes, size_t total_bytes) {
-#if defined(__MUSL__)
+#if MALLOC_HOOK_HAS_TRACE_MARKER
     if (!PeakTraceMarkerEnabled()) {
         return;
     }
@@ -51,12 +115,17 @@ static void WritePeakTraceMarker(size_t host_bytes, size_t dma_bytes, size_t tot
     }
 
     const int pid = static_cast<int>(syscall(SYS_getpid));
+    // Report the peak in MiB — the natural unit for a memory budget and what the
+    // Perfetto post-processor surfaces on the "Memory Top Allocations" track.
+    const double total_mb = static_cast<double>(total_bytes) / (1024.0 * 1024.0);
+    const double host_mb = static_cast<double>(host_bytes) / (1024.0 * 1024.0);
+    const double dma_mb = static_cast<double>(dma_bytes) / (1024.0 * 1024.0);
     char marker[256];
     int length = snprintf(
             marker, sizeof(marker),
-            "B|%d|malloc_hook_peak_snapshot total_bytes=%zu host_bytes=%zu "
-            "dma_bytes=%zu",
-            pid, total_bytes, host_bytes, dma_bytes);
+            "B|%d|malloc_hook_peak_snapshot total_mb=%.1f host_mb=%.1f "
+            "dma_mb=%.1f",
+            pid, total_mb, host_mb, dma_mb);
     if (length > 0 && static_cast<size_t>(length) < sizeof(marker)) {
         syscall(SYS_write, fd, marker, static_cast<size_t>(length));
         static constexpr char kTraceEnd[] = "E";
@@ -64,20 +133,20 @@ static void WritePeakTraceMarker(size_t host_bytes, size_t dma_bytes, size_t tot
     }
 
     length = snprintf(
-            marker, sizeof(marker), "C|%d|malloc_hook_peak_total_bytes|%zu", pid,
-            total_bytes);
+            marker, sizeof(marker), "C|%d|malloc_hook_peak_total_mb|%zu", pid,
+            total_bytes >> 20);
     if (length > 0 && static_cast<size_t>(length) < sizeof(marker)) {
         syscall(SYS_write, fd, marker, static_cast<size_t>(length));
     }
     length = snprintf(
-            marker, sizeof(marker), "C|%d|malloc_hook_peak_host_bytes|%zu", pid,
-            host_bytes);
+            marker, sizeof(marker), "C|%d|malloc_hook_peak_host_mb|%zu", pid,
+            host_bytes >> 20);
     if (length > 0 && static_cast<size_t>(length) < sizeof(marker)) {
         syscall(SYS_write, fd, marker, static_cast<size_t>(length));
     }
     length = snprintf(
-            marker, sizeof(marker), "C|%d|malloc_hook_peak_dma_bytes|%zu", pid,
-            dma_bytes);
+            marker, sizeof(marker), "C|%d|malloc_hook_peak_dma_mb|%zu", pid,
+            dma_bytes >> 20);
     if (length > 0 && static_cast<size_t>(length) < sizeof(marker)) {
         syscall(SYS_write, fd, marker, static_cast<size_t>(length));
     }
@@ -132,6 +201,7 @@ void PointerData::Add(const void* ptr, size_t pointer_size, MemType type) {
     size_t hash_index =
             AddBacktrace(g_debug->config().backtrace_frames(), pointer_size);
     size_t replaced_hash_index = kBacktraceEmptyIndex;
+    MemType replaced_type = HOST;
 
     {
         std::lock_guard<std::mutex> pointer_guard(pointer_mutex_);
@@ -145,6 +215,7 @@ void PointerData::Add(const void* ptr, size_t pointer_size, MemType type) {
                     (existing->second.mem_type == DMA) ? &current_dma : &current_host;
             *replaced_current -= existing->second.size;
             replaced_hash_index = existing->second.hash_index;
+            replaced_type = existing->second.mem_type;
         }
 
         pointers_[mangled_ptr] = PointerInfoType{pointer_size, hash_index, type, tv};
@@ -174,6 +245,16 @@ void PointerData::Add(const void* ptr, size_t pointer_size, MemType type) {
                 }
             }
         }
+    }
+
+    // A replaced pointer means the old allocation is gone: close its lifetime slice
+    // first, then open one for the new allocation. Both are gated on carrying a
+    // backtrace (tracked large allocations only).
+    if (replaced_hash_index > kBacktraceEmptyIndex) {
+        WriteAllocTraceMarker('F', ptr, replaced_hash_index, replaced_type);
+    }
+    if (hash_index > kBacktraceEmptyIndex) {
+        WriteAllocTraceMarker('S', ptr, hash_index, type);
     }
 
     RemoveBacktrace(replaced_hash_index);
@@ -231,6 +312,7 @@ size_t PointerData::AddBacktrace(size_t num_frames, size_t size_bytes) {
 
 void PointerData::Remove(const void* ptr) {
     size_t hash_index;
+    MemType removed_type = HOST;
     {
         std::lock_guard<std::mutex> pointer_guard(pointer_mutex_);
         uintptr_t mangled_ptr = ManglePointer(reinterpret_cast<uintptr_t>(ptr));
@@ -243,7 +325,14 @@ void PointerData::Remove(const void* ptr) {
         size_t* target = (entry->second.mem_type == DMA) ? &current_dma : &current_host;
         *target -= entry->second.size;
         hash_index = entry->second.hash_index;
+        removed_type = entry->second.mem_type;
         pointers_.erase(mangled_ptr);
+    }
+
+    // Close this allocation's lifetime slice (tracked large allocations only). This is
+    // where a mat's release time lands on the Perfetto timeline.
+    if (hash_index > kBacktraceEmptyIndex) {
+        WriteAllocTraceMarker('F', ptr, hash_index, removed_type);
     }
 
     RemoveBacktrace(hash_index);
@@ -299,7 +388,8 @@ void PointerData::GetList(
 
         list->emplace_back(ListInfoType{
                 pointer, 1, entry.second.RealSize(), entry.second.mem_type, frame_info,
-                std::move(backtrace_info), entry.second.alloc_time});
+                std::move(backtrace_info), entry.second.alloc_time,
+                entry.second.hash_index});
     }
 
     std::sort(list->begin(), list->end(), pred);
@@ -387,9 +477,9 @@ void PointerData::DumpLiveToFile(int fd, bool dump_peak) {
 
         dprintf(fd,
                 "alloc_size:%fKB \t alloc_type:%s \t alloc_num:%zu \t "
-                "alloc_time:%s.%zu\n",
+                "hash_index:%zu \t alloc_time:%s.%zu\n",
                 info.size / 1024.0, mtype[info.mem_type], info.num_allocations,
-                formatted_time, info.alloc_time.tv_usec / 1000);
+                info.hash_index, formatted_time, info.alloc_time.tv_usec / 1000);
         if (info.backtrace_info == nullptr || info.backtrace_info->empty()) {
             dprintf(fd, "#00 <backtrace unavailable>\n\n");
             continue;
