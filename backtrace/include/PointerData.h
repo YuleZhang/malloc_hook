@@ -80,6 +80,10 @@ struct ListInfoType {
     FrameInfoType* frame_info;
     std::shared_ptr<std::vector<unwindstack::FrameData>> backtrace_info;
     timeval alloc_time;
+    // Backtrace hash: matches the ".h<hash_index>" embedded in the per-allocation
+    // trace_marker events, so a Perfetto trace's alloc slices can be joined back to
+    // this dump's symbolized call site.
+    size_t hash_index;
 };
 using Pred = std::function<bool(const ListInfoType&, const ListInfoType&)>;
 
