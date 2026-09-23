@@ -148,6 +148,45 @@ use to get malloc and free backtrace, include dmabuffer by hook `ioctl` and `clo
   - DUMP_PEAK_VALUE_MB 的单位默认为 MB
   - `DUMP_PEAK_STEP_MB` 控制峰值快照的最小增长间隔，默认 64MB；设置 `DUMP_PEAK_VALUE_MB` 后，工具会在首次超过阈值时保存峰值快照，之后只有峰值再次增长超过该间隔才重建快照，避免在运行时反复抓取和聚合堆栈导致卡住。
 
+* Perfetto 时间线：峰值 + 每分配生命周期 / Perfetto timeline: peak & per-allocation lifetimes
+
+  在抓取 Perfetto trace 的同时让 hook 通过 atrace(`trace_marker`)输出两类标记，再用
+  `scripts/build_perfetto_alloc_track.py` 把它们汇成一条干净的 "Memory Top Allocations"
+  轨道：峰值时刻 + 每个被跟踪分配的 alloc→free 生命周期。两个开关都是可选的，都不设置时
+  分配/释放热路径只多一次缓存标志判断。
+
+  环境变量 / env:
+  - `MALLOC_HOOK_TRACE_ALLOC=1` — 为每个被跟踪(带 backtrace，即达到 min-size)的分配写
+    async begin(alloc)/ end(free)标记，事件名 `memory_<host|dma|mmap>@<ptr>.h<hash>`；
+    `F`(end)即该缓冲的**释放时刻**，于是每块内存是一条 begin→free 的 slice。
+  - `MALLOC_HOOK_TRACE_PEAK=1` — 在峰值时刻写 `malloc_hook_peak_snapshot total_mb/host_mb/dma_mb`
+    以及同名计数器(单位 MiB)；需同时设置 `DUMP_PEAK_VALUE_MB` 以开启峰值记录。
+  - 设备前提：进程可写 `/sys/kernel/tracing/trace_marker`(root 或 SELinux permissive)，
+    且 Perfetto 配置里抓取了 `ftrace/print`。不可写时标记自动降级为 no-op。
+
+  离线合成 / offline steps:
+  ```
+  # 1) 开启标记跑一次，同时抓 Perfetto trace(含 ftrace/print)。程序退出得到
+  #    /data/local/tmp/trace/backtrace_heap.exit.*.txt —— 每条分配都带 hash_index。
+  # 2) 把该 dump 符号化成 “hash_index -> 信息” 的 JSON(schema 见下；符号化器依赖你的
+  #    源码布局，不随本仓库提供)。
+  # 3) 生成轨道：
+  python3 scripts/build_perfetto_alloc_track.py \
+      --trace <trace.perfetto> --map <hash_index_map.json> --output <out.perfetto>
+  ```
+
+  `--map` 的 JSON schema（键为字符串 hash_index，对应事件名里的 `.h<hash>` 与 dump 里的
+  `hash_index:<N>`）：
+  ```json
+  {
+    "1712": {"memory": "48.00 MB", "variable": "run_img_vec[i]",
+             "code_func": "...", "call_site": "file.cpp:1944", "top_index": 2}
+  }
+  ```
+  只有 `memory`(用于排序)和 `top_index`(用于轨道顺序)是必需的，其余字段仅用于 slice
+  标签。产出在 Perfetto UI 里是一条 "Memory Top Allocations" 轨道(每个分配一条 begin→free
+  slice)加子轨道 `[memory hook] Peak`(例如 `Peak: 455.2 MB (host 434.5 / dma 20.7)`)。
+
 * 内存泄露分析步骤
   - 利用 cheakpoint 机制执行两次程序，并对两次的内存调用堆栈输出进行对比，分析内存调用的增量，此时的内存调用是以时间排序，可以从后向前对比
   ``` c++
