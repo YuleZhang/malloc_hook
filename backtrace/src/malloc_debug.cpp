@@ -299,6 +299,11 @@ void debug_finalize() {
                                        .c_str(), true);
     }
 
+    // Climb mode: emit one report per accumulated step snapshot (…step.<MB>MB.txt).
+    if (g_debug->TrackPointers()) {
+        g_debug->pointer->DumpStepReports(g_debug->config().backtrace_dump_prefix());
+    }
+
     if (g_debug->TrackPointers()) {
         g_debug->pointer->DumpPeakInfo();
     }

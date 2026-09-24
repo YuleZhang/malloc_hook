@@ -80,6 +80,7 @@ install(FILES
     ${CMAKE_SOURCE_DIR}/scripts/process_memory_stack.py
     ${CMAKE_SOURCE_DIR}/scripts/build_perfetto_alloc_track.py
     ${CMAKE_SOURCE_DIR}/scripts/perfetto_proto.py
+    ${CMAKE_SOURCE_DIR}/scripts/merge_csv_to_perfetto.py
     ${CMAKE_SOURCE_DIR}/scripts/maps.example.json
     DESTINATION scripts COMPONENT dist EXCLUDE_FROM_ALL)
 install(FILES ${CMAKE_SOURCE_DIR}/README.md ${CMAKE_SOURCE_DIR}/VERSION

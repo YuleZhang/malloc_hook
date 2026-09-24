@@ -240,6 +240,11 @@ void PointerData::Add(const void* ptr, size_t pointer_size, MemType type) {
                 if (!next_peak_list.empty()) {
                     peak_list = std::move(next_peak_list);
                     WritePeakTraceMarker(current_host, current_dma, current_used);
+                    // Climb mode: keep this rung's snapshot so teardown can write a
+                    // report per step. Capped so a pathological run can't grow forever.
+                    if (peak_record_step_bytes_ != 0 && peak_snapshots_.size() < 256) {
+                        peak_snapshots_.emplace_back(current_used, peak_list);
+                    }
                     if (peak_record_step_bytes_ == 0) {
                         next_peak_record_threshold_ = peak_tot;
                     } else {
@@ -442,20 +447,10 @@ void PointerData::GetUniqueList(
     }
 }
 
-void PointerData::DumpLiveToFile(int fd, bool dump_peak) {
-    std::lock_guard<std::mutex> pointer_guard(pointer_mutex_);
-    std::lock_guard<std::mutex> frame_guard(frame_mutex_);
-
-    std::vector<ListInfoType> list;
-    if ((g_debug->config().options() & RECORD_MEMORY_PEAK) && dump_peak) {
-        list = peak_list;
-    } else {
-        // Sort by the time of the allocation.
-        GetList(&list, false, [](const ListInfoType& a, const ListInfoType& b) {
-            return a.alloc_time < b.alloc_time;
-        });
-    }
-
+// Lock-free: format an already-built allocation list to a fd. The caller owns any
+// locking (DumpLiveToFile holds the mutexes; DumpStepReports runs at teardown). Safe
+// against re-entrancy because debug calls are disabled on every path that reaches it.
+static void WriteListToFd(int fd, const std::vector<ListInfoType>& list) {
     size_t host_use = 0, dma_use = 0;
     for (const auto& it : list) {
         size_t bt_size = it.size * it.num_allocations;
@@ -521,6 +516,49 @@ void PointerData::DumpLiveToFile(int fd, bool dump_peak) {
             dprintf(fd, "%s\n", line.c_str());
         }
         dprintf(fd, "\n");
+    }
+}
+
+
+void PointerData::DumpLiveToFile(int fd, bool dump_peak) {
+    std::lock_guard<std::mutex> pointer_guard(pointer_mutex_);
+    std::lock_guard<std::mutex> frame_guard(frame_mutex_);
+
+    std::vector<ListInfoType> list;
+    if ((g_debug->config().options() & RECORD_MEMORY_PEAK) && dump_peak) {
+        list = peak_list;
+    } else {
+        // Sort by the time of the allocation.
+        GetList(&list, false, [](const ListInfoType& a, const ListInfoType& b) {
+            return a.alloc_time < b.alloc_time;
+        });
+    }
+
+    WriteListToFd(fd, list);
+}
+
+
+// Write one report per accumulated climb-mode snapshot. Runs at teardown where the
+// tracker is already quiesced, so no locking and no hot-path cost. Each file is named
+// by that rung's peak size so the set reads as a climb (…_412MB, …_436MB, …).
+void PointerData::DumpStepReports(const char* prefix) {
+    if (peak_snapshots_.empty() || prefix == nullptr) {
+        return;
+    }
+    for (const auto& snap : peak_snapshots_) {
+        size_t total_mb = snap.first >> 20;
+        char path[512];
+        int n = snprintf(path, sizeof(path), "%s.step.%zuMB.txt", prefix, total_mb);
+        if (n <= 0 || static_cast<size_t>(n) >= sizeof(path)) {
+            continue;
+        }
+        int fd = static_cast<int>(syscall(
+                SYS_openat, AT_FDCWD, path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644));
+        if (fd < 0) {
+            continue;
+        }
+        WriteListToFd(fd, snap.second);
+        syscall(SYS_close, fd);
     }
 }
 

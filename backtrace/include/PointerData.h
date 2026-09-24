@@ -101,6 +101,9 @@ public:
 
     void DumpLiveToFile(int fd, bool dump_peak = true);
     void DumpPeakInfo();
+    // Climb mode: write one report per accumulated step snapshot, named by its peak
+    // size (<prefix>.step.<MB>.txt). Called once at teardown (safe, single-threaded).
+    void DumpStepReports(const char* prefix);
     void GetCurrentUsage(size_t* host_bytes, size_t* dma_bytes);
 
 private:
@@ -127,6 +130,9 @@ private:
     size_t next_peak_record_threshold_;
     size_t peak_record_step_bytes_;
     std::vector<ListInfoType> peak_list;
+    // Climb mode (DUMP_PEAK_STEP_MB): (total_bytes, snapshot) captured at each step
+    // rung above the threshold; written out as per-step reports at teardown.
+    std::vector<std::pair<size_t, std::vector<ListInfoType>>> peak_snapshots_;
 
     BIONIC_DISALLOW_COPY_AND_ASSIGN(PointerData);
 };
