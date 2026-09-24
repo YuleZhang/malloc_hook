@@ -96,6 +96,7 @@ flowchart LR
 | `BACKTRACE_MIN_SIZE` | OHOS 为 `40960`；其他平台开启峰值记录时为 `1024`，否则为 `0` | 小于该尺寸的分配不抓堆栈。最主要的开销控制项：典型流水线里它会过滤掉 99% 以上的分配。 |
 | `ALLOC_HOOK_CAPTURE_MODE` | `fast` | `fast` = 在分配线程中只抓有界原始 PC，不做符号化；worker 后续可解析动态符号。`accurate` = 使用操作系统特定后端。 |
 | `ENABLE_HOOK_DEBUG` | 未设置 | 设为任意值即在 stderr 输出 hook 诊断信息（信号、unwind、ION/DMA 路径）。 |
+| `MALLOC_HOOK_TRACE_ALLOC` | 未设置 | 输出 Perfetto atrace 标记（一个开关统管两类）：每个被跟踪分配一条 begin/end 异步 slice（`memory_<type>@<ptr>.h<hash>`，end 即释放时刻），以及每次峰值快照一条 `malloc_hook_peak_snapshot` slice + MiB 计数器。需 `/sys/kernel/tracing/trace_marker` 可写（root / SELinux permissive）且 Perfetto 配置抓 `ftrace/print`，否则自动 no-op。离线用 `scripts/build_perfetto_alloc_track.py` 消费。 |
 
 触发报告的信号不可调：各平台使用其约定的 backtrace 信号（Android 为 Bionic 保留的
 backtrace 信号，OHOS 为 `46`，其他平台为 `SIGRTMIN+6`）。
@@ -119,6 +120,37 @@ backtrace 信号，OHOS 为 `46`，其他平台为 `SIGRTMIN+6`）。
 
 完整命令行、输出和每个报告字段的读法见
 [`docs/get_hook_report.zh-CN.md`](docs/get_hook_report.zh-CN.md)。
+
+## Perfetto 时间线与离线工具
+
+设 `MALLOC_HOOK_TRACE_ALLOC=1`，若该次运行同时被 Perfetto 抓取（含 `ftrace/print`），
+就能得到一条干净的 **"Memory Top Allocations"** 轨道：每个被跟踪分配一条 begin→free
+slice（free 即释放时刻），外加一条 **`[memory hook] Peak`** 子轨道按 MiB 标出每次峰值。
+`scripts/` 负责离线合成：
+
+```
+# 1) 符号化 dump -> 报告 + hash 映射（自动读 maps.json；-m 限制 top-N）
+python3 scripts/process_memory_stack.py -f <backtrace_heap*.txt> -m 30 -r report.md --export-hash-map
+# 2) 内存用量计数器（先把 CSV 裁到 trace 时间窗）
+python3 scripts/merge_csv_to_perfetto.py --trace <trace.perfetto> --csv <mem_use.csv> --output overlay.perfetto
+# 3) 分配生命周期 + 峰值（默认读 <hook_root>/hash_index_map.json）
+python3 scripts/build_perfetto_alloc_track.py --trace overlay.perfetto --output final.perfetto
+```
+
+`process_memory_stack.py` 从 gitignore 的 `<hook_root>/maps.json` 读取工程符号化配置
+（源码根、需排除的转发帧、pipeline 命名；schema 见 `scripts/maps.example.json`，可用
+`$MALLOC_HOOK_MAPS` 指向别处）。文件缺失则退回通用行为。
+
+**爬升模式**（`ALLOC_HOOK_PEAK_SAMPLE_MS` + `DUMP_PEAK_STEP_MB`，peak-chasing）每爬升一个
+step 写一份 `<prefix>.step.<MB>MB.txt`，文件名即该段峰值大小——逐个喂给第 1 步即得每段
+一份报告。**峰值模式**（`DUMP_PEAK_VALUE_MB`，首次越线）只产一份峰值报告。
+
+## 打包分发（cpack）
+
+版本号以仓库根 `VERSION` 为准（打 tag `v<VERSION>`）。平台构建后 `(cd <build> && cpack)`
+产出 `malloc_hook-<版本>-<abi>.tar.gz`，布局为 `lib/liballoc_hook.so` + `scripts/*.py` +
+`scripts/maps.example.json` + `README.md` + `VERSION`。`dist` 组件为 `EXCLUDE_FROM_ALL`，
+不影响各平台 `build_*.sh` 自身的 `ninja install`。
 
 ## 支持的平台
 

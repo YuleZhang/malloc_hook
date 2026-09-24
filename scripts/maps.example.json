@@ -1,0 +1,13 @@
+{
+  "_comment": "Copy to <hook_root>/maps.json (gitignored) and adapt to your source tree. process_memory_stack.py auto-loads it so `python <hook>/scripts/process_memory_stack.py ...` resolves your traces without extra flags. All fields optional; omit to keep the generic default.",
+  "workspace_root": "/path/to/your/source/root",
+  "workspace_subdirs": ["src", "modules"],
+  "dev_toolkit_subdir": "third_party",
+  "excluded_frame_relpaths": [
+    "third_party/allocator",
+    "third_party/some/op/kernels/include"
+  ],
+  "pipeline_namespace": "myproj::",
+  "pipeline_prefix": "myproj::Pipeline",
+  "pipeline_backup_prefixes": ["myproj::helper", "some_ns"]
+}

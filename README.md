@@ -116,6 +116,7 @@ build, run `cmake --build <build-dir> --target print_build_options`.
 | `BACKTRACE_MIN_SIZE` | OHOS: `40960`; elsewhere `1024` when peak recording is on, else `0` | Skip stack capture for allocations smaller than this. The main cost control: in a typical pipeline it filters >99% of allocations. |
 | `ALLOC_HOOK_CAPTURE_MODE` | `fast` | `fast` = bounded raw-PC capture with no symbolization on the allocation thread; the worker may resolve dynamic symbols. `accurate` = OS-specific backend. |
 | `ENABLE_HOOK_DEBUG` | unset | Set to anything to emit hook diagnostics (signal, unwind, and ION/DMA paths) on stderr. |
+| `MALLOC_HOOK_TRACE_ALLOC` | unset | Emit Perfetto atrace markers (one switch, both streams): a begin/end async slice per tracked allocation (`memory_<type>@<ptr>.h<hash>`, the end = its release time) and a `malloc_hook_peak_snapshot` slice + MiB counters at each peak snapshot. Needs a writable `/sys/kernel/tracing/trace_marker` (root / SELinux permissive) and a Perfetto config recording `ftrace/print`; no-op otherwise. Consumed offline by `scripts/build_perfetto_alloc_track.py`. |
 
 The report-trigger signal is not tunable: each platform uses its conventional
 backtrace signal (Bionic's reserved backtrace signal on Android, `46` on OHOS,
@@ -144,6 +145,40 @@ Which mode a run is in is decided entirely by which variables above are set:
 
 Full command lines, output, and how to read every report field are in
 [`docs/get_hook_report.md`](docs/get_hook_report.md).
+
+## Perfetto timeline & offline tooling
+
+With `MALLOC_HOOK_TRACE_ALLOC=1`, a run that is also captured by Perfetto (with
+`ftrace/print`) gets a clean **"Memory Top Allocations"** track: one begin→free slice
+per tracked allocation (the free is its release time) plus a **`[memory hook] Peak`**
+sub-track marking each peak snapshot in MiB. The `scripts/` build it offline:
+
+```
+# 1) symbolize the dump -> report + hash map (auto-loads maps.json; -m limits the top-N)
+python3 scripts/process_memory_stack.py -f <backtrace_heap*.txt> -m 30 -r report.md --export-hash-map
+# 2) memory-use counters (clip the CSV to the trace's time window first)
+python3 scripts/merge_csv_to_perfetto.py --trace <trace.perfetto> --csv <mem_use.csv> --output overlay.perfetto
+# 3) allocation lifetimes + peak (reads <hook_root>/hash_index_map.json by default)
+python3 scripts/build_perfetto_alloc_track.py --trace overlay.perfetto --output final.perfetto
+```
+
+`process_memory_stack.py` reads project-specific symbolization config (source roots,
+excluded/forwarding frames, pipeline naming) from a gitignored `<hook_root>/maps.json`
+(schema: `scripts/maps.example.json`; `$MALLOC_HOOK_MAPS` overrides). Missing file →
+generic defaults.
+
+**Climb mode** (`ALLOC_HOOK_PEAK_SAMPLE_MS` + `DUMP_PEAK_STEP_MB`, peak-chasing) writes
+one report per step of growth as `<prefix>.step.<MB>MB.txt`, named by that rung's peak
+size — feed each to step 1 for a report per rung. **Peak mode** (`DUMP_PEAK_VALUE_MB`,
+first-crossing) produces a single peak report.
+
+## Packaging (cpack)
+
+The `VERSION` file is the source of truth (tag as `v<VERSION>`). After a platform build,
+`(cd <build> && cpack)` produces `malloc_hook-<version>-<abi>.tar.gz` laid out as
+`lib/liballoc_hook.so` + `scripts/*.py` + `scripts/maps.example.json` + `README.md` +
+`VERSION`. The `dist` component is `EXCLUDE_FROM_ALL`, so the platform `build_*.sh`
+scripts' own `ninja install` is unaffected.
 
 ## Supported platforms
 
