@@ -194,6 +194,9 @@ public:
     // captured and no peak is recorded: the record is restored to the exact
     // state it had before the failed operation.
     void RestoreEntry(const void* ptr, const PointerInfoType& info);
+    // Close the trace lifetime of an entry detached with TakeEntry(). Call only
+    // after the underlying realloc/munmap has succeeded.
+    void TraceEntryReleased(const void* ptr, const PointerInfoType& info);
     size_t AddBacktrace(size_t num_frames, size_t size_bytes);
     void Remove(const void* ptr);
     void RemoveBacktrace(size_t hash_index);
@@ -336,12 +339,14 @@ private:
     size_t peak_list_dma = 0;
     size_t peak_list_tot = 0;
     // Climb mode: each step rung's snapshot (list + exact totals), captured as it
-    // is crossed and written as a per-step report at teardown. Capped.
+    // is crossed and written as a per-step report at teardown. Retention is
+    // bounded by an explicit byte budget so instrumentation cannot dominate RSS.
     struct StepSnapshot {
         std::vector<ListInfoType> list;
         size_t host = 0, dma = 0, tot = 0;
     };
     std::vector<StepSnapshot> step_snaps_;
+    size_t step_snaps_bytes_ = 0;
     // Which criterion produced the retained snapshot, and -- when it was the
     // observed footprint -- what that footprint read at that instant. Reported
     // so the snapshot can be lined up against an external sampler's series

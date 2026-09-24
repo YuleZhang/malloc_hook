@@ -76,7 +76,9 @@ static inline void WriteTraceMarker(const char* buf, size_t len) {
 // Async begin ('S') on alloc / end ('F') on free for a single tracked allocation.
 // The name embeds the pointer (unique among live allocations, so S/F pair) and the
 // backtrace hash as ".h<idx>" (the offline tool's key to the symbolized call site).
-static void WriteAllocTraceMarker(char phase, const void* ptr, size_t hash_index, MemType type) {
+static void WriteAllocTraceMarker(
+        char phase, const void* ptr, size_t hash_index, MemType type,
+        size_t size_bytes) {
     if (!TraceMarkersEnabled()) {
         return;
     }
@@ -84,8 +86,8 @@ static void WriteAllocTraceMarker(char phase, const void* ptr, size_t hash_index
     const unsigned long long cookie =
             static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(ptr));
     char marker[160];
-    int n = snprintf(marker, sizeof(marker), "%c|%d|memory_%s@%p.h%zu|%llu",
-                     phase, pid, mtype[type], ptr, hash_index, cookie);
+    int n = snprintf(marker, sizeof(marker), "%c|%d|memory_%s@%p.h%zu.s%zu|%llu",
+                     phase, pid, mtype[type], ptr, hash_index, size_bytes, cookie);
     if (n > 0 && static_cast<size_t>(n) < sizeof(marker)) {
         WriteTraceMarker(marker, static_cast<size_t>(n));
     }
@@ -115,7 +117,7 @@ static void WritePeakTraceMarker(size_t host_bytes, size_t dma_bytes, size_t tot
     if (n > 0 && static_cast<size_t>(n) < sizeof(m)) WriteTraceMarker(m, static_cast<size_t>(n));
 }
 #else
-static inline void WriteAllocTraceMarker(char, const void*, size_t, MemType) {}
+static inline void WriteAllocTraceMarker(char, const void*, size_t, MemType, size_t) {}
 static inline void WritePeakTraceMarker(size_t, size_t, size_t) {}
 #endif
 
@@ -659,11 +661,16 @@ bool PointerData::TakePeakSnapshotLocked(
     WritePeakTraceMarker(peak_list_host, peak_list_dma, peak_list_tot);
     // Climb mode (chase-max): keep every rung's snapshot so teardown can write a
     // per-step report named by its peak size. First-crossing keeps only one
-    // snapshot, so it is not accumulated here. Capped against a pathological run.
+    // snapshot, so it is not accumulated here. The byte budget prevents the
+    // retained reports from materially feeding back into observed RSS.
+    constexpr size_t kMaxStepSnapshotBytes = 8 * 1024 * 1024;
+    const size_t snapshot_bytes = peak_list.size() * sizeof(ListInfoType);
     if (g_debug->config().peak_retention() == PeakRetention::ChaseMax &&
-        step_snaps_.size() < 256) {
+        step_snaps_bytes_ <= kMaxStepSnapshotBytes &&
+        snapshot_bytes <= kMaxStepSnapshotBytes - step_snaps_bytes_) {
         step_snaps_.push_back(
                 StepSnapshot{peak_list, peak_list_host, peak_list_dma, peak_list_tot});
+        step_snaps_bytes_ += snapshot_bytes;
     }
     peak_snapshot_source_ = source;
     if (observed != nullptr) {
@@ -756,6 +763,7 @@ void PointerData::Add(
     // dropped, matching Remove()/Remap()'s ordering.
     size_t displaced_hash_index = 0;
     MemType displaced_type = HOST;
+    size_t displaced_size_bytes = 0;
     size_t tracked_total = 0;
     bool raised_peak = false;
     {
@@ -781,11 +789,11 @@ void PointerData::Add(
         // the same address.
         auto displaced = shard.pointers.find(mangled_ptr);
         if (displaced != shard.pointers.end()) {
-            const size_t displaced_size = displaced->second.size;
-            current_used.fetch_sub(displaced_size, std::memory_order_relaxed);
+            displaced_size_bytes = displaced->second.size;
+            current_used.fetch_sub(displaced_size_bytes, std::memory_order_relaxed);
             std::atomic<size_t>* displaced_current =
                     (displaced->second.mem_type == DMA) ? &current_dma : &current_host;
-            displaced_current->fetch_sub(displaced_size, std::memory_order_relaxed);
+            displaced_current->fetch_sub(displaced_size_bytes, std::memory_order_relaxed);
             displaced_hash_index = displaced->second.hash_index;
             displaced_type = displaced->second.mem_type;
             shard.pointers.erase(displaced);
@@ -824,10 +832,12 @@ void PointerData::Add(
     // Perfetto lifetime markers (tracked allocations only): close the displaced
     // allocation's slice, open this one's. Both no-op unless MALLOC_HOOK_TRACE_ALLOC.
     if (displaced_hash_index > kBacktraceEmptyIndex) {
-        WriteAllocTraceMarker('F', ptr, displaced_hash_index, displaced_type);
+        WriteAllocTraceMarker(
+                'F', ptr, displaced_hash_index, displaced_type,
+                displaced_size_bytes);
     }
     if (hash_index > kBacktraceEmptyIndex) {
-        WriteAllocTraceMarker('S', ptr, hash_index, type);
+        WriteAllocTraceMarker('S', ptr, hash_index, type, tracked_size);
     }
     if (displaced_hash_index > kBacktraceEmptyIndex) {
         RemoveBacktrace(displaced_hash_index);
@@ -841,6 +851,9 @@ void PointerData::Remap(const void* old_ptr, const void* new_ptr, size_t new_siz
     // A displaced destination entry's stack reference is released after the
     // pointer lock is dropped, matching Remove()'s ordering.
     size_t displaced_hash_index = 0;
+    MemType displaced_type = HOST;
+    size_t displaced_size_bytes = 0;
+    PointerInfoType moved_info{};
     size_t tracked_total = 0;
     bool raised_peak = false;
     {
@@ -868,6 +881,7 @@ void PointerData::Remap(const void* old_ptr, const void* new_ptr, size_t new_siz
             return;
         }
         PointerInfoType info = entry->second;
+        moved_info = info;
         const size_t old_size = info.size;
         info.size = new_size;
         old_shard.pointers.erase(entry);
@@ -879,14 +893,15 @@ void PointerData::Remap(const void* old_ptr, const void* new_ptr, size_t new_siz
         // entry is never released.
         auto displaced = new_shard.pointers.find(new_key);
         if (displaced != new_shard.pointers.end()) {
-            const size_t displaced_size = displaced->second.size;
-            current_used.fetch_sub(displaced_size, std::memory_order_relaxed);
+            displaced_size_bytes = displaced->second.size;
+            current_used.fetch_sub(displaced_size_bytes, std::memory_order_relaxed);
             if (displaced->second.mem_type == DMA) {
-                current_dma.fetch_sub(displaced_size, std::memory_order_relaxed);
+                current_dma.fetch_sub(displaced_size_bytes, std::memory_order_relaxed);
             } else {
-                current_host.fetch_sub(displaced_size, std::memory_order_relaxed);
+                current_host.fetch_sub(displaced_size_bytes, std::memory_order_relaxed);
             }
             displaced_hash_index = displaced->second.hash_index;
+            displaced_type = displaced->second.mem_type;
             new_shard.pointers.erase(displaced);
         }
 
@@ -915,6 +930,18 @@ void PointerData::Remap(const void* old_ptr, const void* new_ptr, size_t new_siz
         // reached this way must be snapshotted too; otherwise the report keeps
         // the pre-mremap mapping and understates the peak.
         MaybeRecordPeakSnapshot(tracked_total);
+    }
+    if (displaced_hash_index > kBacktraceEmptyIndex) {
+        WriteAllocTraceMarker(
+                'F', new_ptr, displaced_hash_index, displaced_type,
+                displaced_size_bytes);
+    }
+    if (old_ptr != new_ptr && moved_info.hash_index > kBacktraceEmptyIndex) {
+        WriteAllocTraceMarker(
+                'F', old_ptr, moved_info.hash_index, moved_info.mem_type,
+                moved_info.size);
+        WriteAllocTraceMarker(
+                'S', new_ptr, moved_info.hash_index, moved_info.mem_type, new_size);
     }
     if (displaced_hash_index > kBacktraceEmptyIndex) {
         RemoveBacktrace(displaced_hash_index);
@@ -1011,6 +1038,14 @@ void PointerData::RestoreEntry(const void* ptr, const PointerInfoType& info) {
     // already accounted for, so it can never establish a new peak.
 }
 
+void PointerData::TraceEntryReleased(
+        const void* ptr, const PointerInfoType& info) {
+    if (info.hash_index > kBacktraceEmptyIndex) {
+        WriteAllocTraceMarker(
+                'F', ptr, info.hash_index, info.mem_type, info.size);
+    }
+}
+
 void PointerData::Remove(const void* ptr) {
     PointerInfoType info{};
     if (!TakeEntry(ptr, &info)) {
@@ -1020,7 +1055,8 @@ void PointerData::Remove(const void* ptr) {
     // Perfetto lifetime marker: this is where a tracked allocation's release
     // time lands on the timeline. No-op unless MALLOC_HOOK_TRACE_ALLOC.
     if (info.hash_index > kBacktraceEmptyIndex) {
-        WriteAllocTraceMarker('F', ptr, info.hash_index, info.mem_type);
+        WriteAllocTraceMarker(
+                'F', ptr, info.hash_index, info.mem_type, info.size);
     }
 
     RemoveBacktrace(info.hash_index);
@@ -1454,14 +1490,17 @@ void PointerData::DumpLiveToFile(int fd, bool dump_peak) {
                 1024.0 / 1024.0;
         const double peak_list_mb =
                 peak_list.capacity() * sizeof(ListInfoType) / 1024.0 / 1024.0;
+        const double step_snaps_mb =
+                step_snaps_bytes_ / 1024.0 / 1024.0;
         const double filter_mb = sizeof(pointer_filter_) / 1024.0 / 1024.0;
         dprintf(fd,
                 "hook_overhead(%s): live_pointers=%zu unique_stacks=%zu "
                 "peak_list_entries=%zu pointers_est=%fMB stacks_est=%fMB "
-                "peak_list_est=%fMB filter=%fMB total_est=%fMB\n",
+                "peak_list_est=%fMB step_snapshots_est=%fMB filter=%fMB "
+                "total_est=%fMB\n",
                 map_when, live, stacks, peak_list.size(), pointers_mb, stacks_mb,
-                peak_list_mb, filter_mb,
-                pointers_mb + stacks_mb + peak_list_mb + filter_mb);
+                peak_list_mb, step_snaps_mb, filter_mb,
+                pointers_mb + stacks_mb + peak_list_mb + step_snaps_mb + filter_mb);
     }
     dprintf(fd,
             "++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++"
@@ -1581,14 +1620,25 @@ void PointerData::DumpStepReports(const char* prefix) {
         if (fd < 0) {
             continue;
         }
-        peak_list = std::move(snap.list);
+        // Restore the retained final peak after each step report. DumpPeakInfo()
+        // runs next and must not be left pointing at the last retained rung when
+        // the byte budget stopped retaining newer steps.
+        peak_list.swap(snap.list);
+        const size_t final_host = peak_list_host;
+        const size_t final_dma = peak_list_dma;
+        const size_t final_tot = peak_list_tot;
         peak_list_host = snap.host;
         peak_list_dma = snap.dma;
         peak_list_tot = snap.tot;
         DumpLiveToFile(fd, /*dump_peak=*/true);
         syscall(SYS_close, fd);
+        peak_list.swap(snap.list);
+        peak_list_host = final_host;
+        peak_list_dma = final_dma;
+        peak_list_tot = final_tot;
     }
     step_snaps_.clear();
+    step_snaps_bytes_ = 0;
 }
 
 

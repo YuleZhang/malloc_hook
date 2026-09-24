@@ -620,6 +620,12 @@ void* debug_realloc(void* pointer, size_t bytes) {
         return new_pointer;
     }
 
+    if (had_entry) {
+        // The allocator succeeded, so the old lifetime ends even if the new
+        // allocation is below the tracking threshold. Emit this before Add so
+        // an in-place realloc cannot open the replacement before closing it.
+        g_debug->pointer->TraceEntryReleased(pointer, previous);
+    }
     if (track_new_allocation && g_debug->TrackPointers()) {
         g_debug->pointer->Add(new_pointer, bytes, tracked_size);
     }
@@ -1249,6 +1255,7 @@ int debug_munmap(void* addr, size_t size) {
     int ret = CallMunmap(addr, size);
     if (hook_source::SyscallSucceeded(ret)) {
         if (had_entry) {
+            g_debug->pointer->TraceEntryReleased(addr, previous);
             g_debug->pointer->RemoveBacktrace(previous.hash_index);
         }
     } else if (had_entry) {

@@ -51,7 +51,8 @@ CHILD_ORDERING_EXPLICIT = 3  # ChildTracksOrdering.EXPLICIT:按 sibling_order_ra
 
 # 事件名里的 hash:".h<digits>",后接 "[caller]"(旧格式)或直接 "|cookie"(新格式,
 # 已去掉 caller)。用 lookahead 锚定字段边界,兼容两种格式。
-HASH_RE = re.compile(rb"\.h(\d+)(?=[\[|])")
+HASH_RE = re.compile(rb"\.h(\d+)(?=\.s|\[|\||$)")
+SIZE_RE = re.compile(rb"\.s(\d+)(?=\[|\||$)")
 
 # Peak-snapshot marker written by liballoc_hook to trace_marker:
 #   "B|<pid>|malloc_hook_peak_snapshot total_mb=<f> host_mb=<f> dma_mb=<f>"
@@ -67,15 +68,15 @@ PEAK_RE = re.compile(
 # --------------------------------------------------------------------------- #
 # 纯 protobuf 解析:取每个 hash 的 (begin_ts, dur)
 # --------------------------------------------------------------------------- #
-def extract_hash_timings(trace_bytes: bytes) -> dict:
-    """Return {hash_index: (begin_ts_ns, dur_ns)} parsed from ftrace print events.
+def extract_allocation_timings(trace_bytes: bytes) -> list[dict]:
+    """Return every paired allocation lifetime parsed from ftrace print events.
 
-    按完整事件名(name)配对 S/F,而非仅按 hash_index——因为同一个 hash 可能对应多个
-    不同指针(@ptr)的分配。name 就是 S/F 之后、cookie 之前的部分。
+    New markers carry both stack hash and allocation size. Pair by the complete
+    async identity so multiple pointers sharing one stack remain independent;
+    repeated reuse of the same address is retained as multiple lifetimes too.
     """
-    # 配对键:去掉首字符 S/F 和末尾 |cookie\n 后的完整名字
-    begins = {}  # name -> (hash, ts)
-    ends = {}    # name -> ts
+    begins = {}  # name -> FIFO list[(hash, size_bytes, ts)]
+    lifetimes = []
     view = memoryview(trace_bytes)
     off = 0
     n = len(view)
@@ -107,23 +108,27 @@ def extract_hash_timings(trace_bytes: bytes) -> dict:
                 if not m:
                     continue
                 hi = int(m.group(1))
+                size_match = SIZE_RE.search(buf)
+                size_bytes = int(size_match.group(1)) if size_match else None
                 marker = buf[0:1]
                 # 完整名字 = 去掉首字符 S/F 和末尾 |digits\n 后的部分
                 name = buf[1:].rsplit(b"|", 1)[0]
                 if marker == b"S":
-                    begins[name] = (hi, ts)
-                elif marker == b"F" and name in begins:
-                    ends[name] = ts
-    # 按 hash 聚合:同一个 hash 取所有配对成功的 (ts, dur),保留最长的
-    hash_durs = {}  # hash -> (ts, dur)
-    for name, ets in ends.items():
-        if name not in begins:
-            continue
-        hi, bts = begins[name]
-        dur = ets - bts if ets >= bts else 0
-        if hi not in hash_durs or dur > hash_durs[hi][1]:
-            hash_durs[hi] = (bts, dur)
-    return hash_durs
+                    begins.setdefault(name, []).append((hi, size_bytes, ts))
+                elif marker == b"F" and begins.get(name):
+                    begin_hi, begin_size, bts = begins[name].pop(0)
+                    lifetimes.append({
+                        "hash_index": begin_hi,
+                        "size_bytes": begin_size,
+                        "ts": bts,
+                        "dur": ts - bts if ts >= bts else 0,
+                    })
+    return lifetimes
+
+
+# Compatibility alias for callers that imported the old helper name. The return
+# shape is intentionally the new per-allocation list rather than a lossy hash map.
+extract_hash_timings = extract_allocation_timings
 
 
 def extract_peak_snapshots(trace_bytes: bytes) -> list:
@@ -219,14 +224,15 @@ def _make_slice_packet(seq, track_uuid, ts, clock_id, etype, name=None):
     return P.make_packet(fields, seq, P.SEQ_NEEDS_INCREMENTAL_STATE)
 
 
-def _slice_name(info: dict, hi: int) -> str:
+def _slice_name(info: dict, hi: int, size_bytes: int | None = None) -> str:
     """Build a readable, info-first slice label.
 
     以 "Top N: " 前缀开头(N 为该分配在所有分配里按大小的排名),便于在 UI 上
     直接看出这是第几大的内存分配。
     """
     top = info.get("top_index")
-    mem = info.get("memory") or ""
+    mem = (f"{size_bytes / (1024.0 * 1024.0):.2f} MB"
+           if size_bytes is not None else info.get("memory") or "")
     var = info.get("variable") or ""
     fn = info.get("code_func") or ""
     site = info.get("call_site") or ""
@@ -244,15 +250,14 @@ def _slice_name(info: dict, hi: int) -> str:
     label = " ".join(parts).strip()
     return label or f"h{hi}"
 
-def _sub_track_name(info: dict, hi: int) -> str:
+def _sub_track_name(info: dict, hi: int, allocation_rank: int | None = None) -> str:
     """Build the sub-track display label (shown on the left of the timeline row).
 
     以 "[memory hook] Top N" 形式命名,便于在 UI 左侧轨道栏一眼识别是内存 hook
     的第几大分配。N 为该分配在所有分配里按大小的排名。
     """
-    top = info.get("top_index")
-    if top is not None:
-        return f"[memory hook] Top {top}"
+    if allocation_rank is not None:
+        return f"[memory hook] Allocation {allocation_rank}"
     return f"[memory hook] h{hi}"
 
 def build_tracks(
@@ -268,7 +273,7 @@ def build_tracks(
     时间戳解析与时钟对齐对整份 trace 只做一次,所有轨道共用;uuid / 排序序号在
     多个轨道间连续分配,避免碰撞。
     """
-    timings = extract_hash_timings(trace_bytes)
+    timings = extract_allocation_timings(trace_bytes)
     peak_snaps = extract_peak_snapshots(trace_bytes)
     meta = P.analyze_trace(trace_bytes)
     seq = meta.overlay_sequence_id
@@ -279,21 +284,23 @@ def build_tracks(
     stats = []
     order = 0
     for group_index, (track_name, hash_map) in enumerate(groups):
-        # 只保留既有参数、又能在原 trace 找到时间戳的 hash;按内存大小降序。
-        def _mb(hi, _hash_map=hash_map):
-            m = re.search(r"([\d.]+)\s*MB", _hash_map[hi].get("memory", "") or "")
-            return float(m.group(1)) if m else 0.0
-
-        usable = [hi for hi in hash_map if hi in timings]
-        usable.sort(key=_mb, reverse=True)
-        stats.append((track_name, len(usable), len(hash_map) - len(usable)))
+        # One output slice per concrete allocation. Stack metadata still comes
+        # from the dump's hash map, but size/lifetime come from that pointer's
+        # marker; never label one representative lifetime with an aggregate size.
+        usable = [t for t in timings if t["hash_index"] in hash_map]
+        usable.sort(
+            key=lambda t: (t["size_bytes"] if t["size_bytes"] is not None else 0),
+            reverse=True,
+        )
+        matched_hashes = {t["hash_index"] for t in usable}
+        stats.append((track_name, len(usable), len(hash_map) - len(matched_hashes)))
 
         # 分配 UUID:parent + 每个子 track 一个
         parent_uuid = next_uuid
         next_uuid += 1
-        child_uuids = {}
-        for hi in usable:
-            child_uuids[hi] = next_uuid
+        child_uuids = []
+        for _ in usable:
+            child_uuids.append(next_uuid)
             next_uuid += 1
 
         # 只有整份 trace 的第一个追加 packet 能带 INCREMENTAL_STATE_CLEARED,
@@ -346,15 +353,14 @@ def build_tracks(
                     )
                 )
                 order += 1
-        for hi in usable:
-            child_uuid = child_uuids[hi]
-            child_name = _slice_name(hash_map[hi], hi)
-            sub_track_name = _sub_track_name(hash_map[hi], hi)
+        for allocation_rank, timing in enumerate(usable, 1):
+            hi = timing["hash_index"]
+            child_uuid = child_uuids[allocation_rank - 1]
+            child_name = _slice_name(hash_map[hi], hi, timing["size_bytes"])
+            sub_track_name = _sub_track_name(hash_map[hi], hi, allocation_rank)
             # 子 track 按 top_index 作为排序权重(越小=内存越大=越靠前),
             # 缺失 top_index 时排到最后(用一个大值兜底)。
-            rank = hash_map[hi].get("top_index")
-            if rank is None:
-                rank = 1 << 30
+            rank = allocation_rank
             # 子 track descriptor:uuid=child_uuid(整数),name=sub_track_name(轨道显示名)
             packets.append(
                 P.OverlayPacketEntry(
@@ -367,7 +373,7 @@ def build_tracks(
             )
             order += 1
 
-            bts, dur = timings[hi]
+            bts, dur = timing["ts"], timing["dur"]
             end_ts = bts + (dur if dur > 0 else 1_000_000)
             packets.append(
                 P.OverlayPacketEntry(
