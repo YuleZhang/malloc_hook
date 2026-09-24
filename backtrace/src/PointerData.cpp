@@ -1,8 +1,10 @@
 #include <cxxabi.h>
 #include <elf.h>
+#include <fcntl.h>
 #include <link.h>
 #include <inttypes.h>
 #include <pthread.h>
+#include <sys/syscall.h>
 #include <sys/time.h>
 #include <unistd.h>
 #include <algorithm>
@@ -31,6 +33,92 @@ constexpr size_t kBacktraceEmptyIndex = 1;
 // Fast and Accurate backends retain the same neutral contract.
 constexpr size_t kHookCaptureSkipFrames = 3;
 const char* mtype[3] = {"host", "mmap", "dma"};
+
+// --------------------------------------------------------------------------- #
+// Perfetto atrace markers (opt-in via MALLOC_HOOK_TRACE_ALLOC). One switch drives
+// both streams: per-allocation alloc->free lifetimes and the peak snapshot. They
+// are written to the kernel trace_marker so a Perfetto trace that records
+// ftrace/print can show where memory goes over time; build_perfetto_alloc_track.py
+// turns them into a "Memory Top Allocations" track. No-op where tracefs is absent
+// or not writable.
+// --------------------------------------------------------------------------- #
+#if defined(__MUSL__) || defined(__ANDROID__)
+#define MALLOC_HOOK_HAS_TRACE_MARKER 1
+#else
+#define MALLOC_HOOK_HAS_TRACE_MARKER 0
+#endif
+
+#if MALLOC_HOOK_HAS_TRACE_MARKER
+static bool TraceMarkersEnabled() {
+    static bool enabled = [] {
+        const char* v = getenv("MALLOC_HOOK_TRACE_ALLOC");
+        return v != nullptr && v[0] != '\0' && strcmp(v, "0") != 0;
+    }();
+    return enabled;
+}
+
+static int TraceMarkerFd() {
+    // Opened once and reused; a negative fd (no tracefs / not writable) makes
+    // every write a graceful no-op.
+    static int fd = static_cast<int>(
+            syscall(SYS_openat, AT_FDCWD, "/sys/kernel/tracing/trace_marker",
+                    O_WRONLY | O_CLOEXEC, 0));
+    return fd;
+}
+
+static inline void WriteTraceMarker(const char* buf, size_t len) {
+    int fd = TraceMarkerFd();
+    if (fd >= 0) {
+        syscall(SYS_write, fd, buf, len);
+    }
+}
+
+// Async begin ('S') on alloc / end ('F') on free for a single tracked allocation.
+// The name embeds the pointer (unique among live allocations, so S/F pair) and the
+// backtrace hash as ".h<idx>" (the offline tool's key to the symbolized call site).
+static void WriteAllocTraceMarker(char phase, const void* ptr, size_t hash_index, MemType type) {
+    if (!TraceMarkersEnabled()) {
+        return;
+    }
+    const int pid = static_cast<int>(syscall(SYS_getpid));
+    const unsigned long long cookie =
+            static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(ptr));
+    char marker[160];
+    int n = snprintf(marker, sizeof(marker), "%c|%d|memory_%s@%p.h%zu|%llu",
+                     phase, pid, mtype[type], ptr, hash_index, cookie);
+    if (n > 0 && static_cast<size_t>(n) < sizeof(marker)) {
+        WriteTraceMarker(marker, static_cast<size_t>(n));
+    }
+}
+
+// The peak moment as a labeled slice + MiB counter tracks, at the instant the
+// snapshot is taken. Values in MiB (the natural unit for a memory budget).
+static void WritePeakTraceMarker(size_t host_bytes, size_t dma_bytes, size_t total_bytes) {
+    if (!TraceMarkersEnabled()) {
+        return;
+    }
+    const int pid = static_cast<int>(syscall(SYS_getpid));
+    char m[256];
+    int n = snprintf(m, sizeof(m),
+                     "B|%d|malloc_hook_peak_snapshot total_mb=%.1f host_mb=%.1f dma_mb=%.1f",
+                     pid, total_bytes / (1024.0 * 1024.0), host_bytes / (1024.0 * 1024.0),
+                     dma_bytes / (1024.0 * 1024.0));
+    if (n > 0 && static_cast<size_t>(n) < sizeof(m)) {
+        WriteTraceMarker(m, static_cast<size_t>(n));
+        WriteTraceMarker("E", 1);
+    }
+    n = snprintf(m, sizeof(m), "C|%d|malloc_hook_peak_total_mb|%zu", pid, total_bytes >> 20);
+    if (n > 0 && static_cast<size_t>(n) < sizeof(m)) WriteTraceMarker(m, static_cast<size_t>(n));
+    n = snprintf(m, sizeof(m), "C|%d|malloc_hook_peak_host_mb|%zu", pid, host_bytes >> 20);
+    if (n > 0 && static_cast<size_t>(n) < sizeof(m)) WriteTraceMarker(m, static_cast<size_t>(n));
+    n = snprintf(m, sizeof(m), "C|%d|malloc_hook_peak_dma_mb|%zu", pid, dma_bytes >> 20);
+    if (n > 0 && static_cast<size_t>(n) < sizeof(m)) WriteTraceMarker(m, static_cast<size_t>(n));
+}
+#else
+static inline void WriteAllocTraceMarker(char, const void*, size_t, MemType) {}
+static inline void WritePeakTraceMarker(size_t, size_t, size_t) {}
+#endif
+
 
 static inline bool ShouldBacktraceAllocSize(size_t size_bytes) {
     static bool only_backtrace_specific_sizes =
@@ -531,6 +619,10 @@ void PointerData::MaybeRecordPeakSnapshot(size_t tracked_total) {
         }
         return;
     }
+    // Climb mode: keep this rung's snapshot (list + exact totals) so teardown can
+    // write a report per DUMP_PEAK_STEP_MB step, named by the rung's peak size.
+    // Accumulated in TakePeakSnapshotLocked so it catches the snapshot regardless
+    // of which path (tracked or observed sampler) took it.
     next_peak_record_threshold_.store(
             peak_record_step_bytes_ == 0
                     ? peak_now
@@ -562,6 +654,17 @@ bool PointerData::TakePeakSnapshotLocked(
     peak_list_host = current_host.load(std::memory_order_relaxed);
     peak_list_dma = current_dma.load(std::memory_order_relaxed);
     peak_list_tot = current_used.load(std::memory_order_relaxed);
+    // Mark this peak moment on the Perfetto timeline (MiB). No-op unless
+    // MALLOC_HOOK_TRACE_ALLOC; infrequent (once per retained snapshot).
+    WritePeakTraceMarker(peak_list_host, peak_list_dma, peak_list_tot);
+    // Climb mode (chase-max): keep every rung's snapshot so teardown can write a
+    // per-step report named by its peak size. First-crossing keeps only one
+    // snapshot, so it is not accumulated here. Capped against a pathological run.
+    if (g_debug->config().peak_retention() == PeakRetention::ChaseMax &&
+        step_snaps_.size() < 256) {
+        step_snaps_.push_back(
+                StepSnapshot{peak_list, peak_list_host, peak_list_dma, peak_list_tot});
+    }
     peak_snapshot_source_ = source;
     if (observed != nullptr) {
         peak_observed_rss_ = observed->rss_bytes;
@@ -652,6 +755,7 @@ void PointerData::Add(
     // A displaced entry's stack reference is released after the pointer lock is
     // dropped, matching Remove()/Remap()'s ordering.
     size_t displaced_hash_index = 0;
+    MemType displaced_type = HOST;
     size_t tracked_total = 0;
     bool raised_peak = false;
     {
@@ -683,6 +787,7 @@ void PointerData::Add(
                     (displaced->second.mem_type == DMA) ? &current_dma : &current_host;
             displaced_current->fetch_sub(displaced_size, std::memory_order_relaxed);
             displaced_hash_index = displaced->second.hash_index;
+            displaced_type = displaced->second.mem_type;
             shard.pointers.erase(displaced);
         }
 
@@ -715,6 +820,14 @@ void PointerData::Add(
     // moment.
     if (raised_peak) {
         MaybeRecordPeakSnapshot(tracked_total);
+    }
+    // Perfetto lifetime markers (tracked allocations only): close the displaced
+    // allocation's slice, open this one's. Both no-op unless MALLOC_HOOK_TRACE_ALLOC.
+    if (displaced_hash_index > kBacktraceEmptyIndex) {
+        WriteAllocTraceMarker('F', ptr, displaced_hash_index, displaced_type);
+    }
+    if (hash_index > kBacktraceEmptyIndex) {
+        WriteAllocTraceMarker('S', ptr, hash_index, type);
     }
     if (displaced_hash_index > kBacktraceEmptyIndex) {
         RemoveBacktrace(displaced_hash_index);
@@ -904,6 +1017,12 @@ void PointerData::Remove(const void* ptr) {
         return;
     }
 
+    // Perfetto lifetime marker: this is where a tracked allocation's release
+    // time lands on the timeline. No-op unless MALLOC_HOOK_TRACE_ALLOC.
+    if (info.hash_index > kBacktraceEmptyIndex) {
+        WriteAllocTraceMarker('F', ptr, info.hash_index, info.mem_type);
+    }
+
     RemoveBacktrace(info.hash_index);
 }
 
@@ -972,7 +1091,8 @@ void PointerData::GetList(
                                           : frame_info->capture_state,
                     static_cast<uint8_t>(
                             frame_info == nullptr ? 0 : frame_info->terminal_error),
-                    entry.second.alloc_time});
+                    entry.second.alloc_time,
+                    entry.second.hash_index});
         }
     }
 
@@ -1356,9 +1476,9 @@ void PointerData::DumpLiveToFile(int fd, bool dump_peak) {
 
         dprintf(fd,
                 "alloc_size:%fKB \t alloc_type:%s \t alloc_num:%zu \t "
-                "alloc_time:%s.%zu\n",
+                "hash_index:%zu \t alloc_time:%s.%zu\n",
                 info.size / 1024.0, mtype[info.mem_type], info.num_allocations,
-                formatted_time, info.alloc_time.tv_usec / 1000);
+                info.hash_index, formatted_time, info.alloc_time.tv_usec / 1000);
         if (info.raw_frames != nullptr && !info.raw_frames->empty()) {
             // Raw PCs plus report-time module identity are what the offline
             // symbolizer consumes, so this is the path on every platform. It is
@@ -1441,6 +1561,36 @@ void PointerData::DumpLiveToFile(int fd, bool dump_peak) {
         dprintf(fd, "\n");
     }
 }
+
+void PointerData::DumpStepReports(const char* prefix) {
+    // Climb mode: write one report per accumulated rung, named by its peak size.
+    // Runs at teardown (single-threaded), so it can reuse DumpLiveToFile's full
+    // formatter by pointing the peak snapshot at each rung in turn. Uses raw
+    // syscalls for open/close so the hooked close() is never re-entered.
+    if (prefix == nullptr) {
+        return;
+    }
+    for (auto& snap : step_snaps_) {
+        char path[512];
+        int n = snprintf(path, sizeof(path), "%s.step.%zuMB.txt", prefix, snap.tot >> 20);
+        if (n <= 0 || static_cast<size_t>(n) >= sizeof(path)) {
+            continue;
+        }
+        int fd = static_cast<int>(syscall(
+                SYS_openat, AT_FDCWD, path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644));
+        if (fd < 0) {
+            continue;
+        }
+        peak_list = std::move(snap.list);
+        peak_list_host = snap.host;
+        peak_list_dma = snap.dma;
+        peak_list_tot = snap.tot;
+        DumpLiveToFile(fd, /*dump_peak=*/true);
+        syscall(SYS_close, fd);
+    }
+    step_snaps_.clear();
+}
+
 
 void PointerData::DumpPeakInfo() {
     // Only the primary copy of this library reports. A secondary copy -- this

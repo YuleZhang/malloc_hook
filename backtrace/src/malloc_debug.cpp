@@ -466,6 +466,11 @@ void debug_finalize() {
         DumpHeapToFileUnlocked(file_name, true);
     }
 
+    // Climb mode: one report per DUMP_PEAK_STEP_MB rung (…step.<MB>MB.txt).
+    if (g_debug->TrackPointers()) {
+        g_debug->pointer->DumpStepReports(g_debug->config().backtrace_dump_prefix());
+    }
+
     if (g_debug->TrackPointers()) {
         g_debug->pointer->DumpPeakInfo();
     }

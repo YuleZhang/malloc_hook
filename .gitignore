@@ -20,3 +20,9 @@ test/bench_workload/
 # device binaries, kept out of the repo; the harnesses extract them locally.
 test/ppl_imx896.tar.xz
 test/avr-rear-main.tar.gz
+
+# local, per-checkout symbolization config + generated artifacts (see scripts/maps.example.json)
+/maps.json
+/hash_index_map.json
+/dist/
+*.toptrack.perfetto

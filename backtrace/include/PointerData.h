@@ -160,6 +160,10 @@ struct ListInfoType {
     StackCaptureState capture_state = StackCaptureState::Empty;
     uint8_t terminal_error = 0;
     timeval alloc_time;
+    // Backtrace hash: matches the ".h<hash>" in the per-allocation trace_marker
+    // events and is emitted into the dump so an offline tool can join a Perfetto
+    // slice back to this allocation's symbolized call site.
+    size_t hash_index = 0;
 };
 using Pred = std::function<bool(const ListInfoType&, const ListInfoType&)>;
 
@@ -196,6 +200,9 @@ public:
 
     void DumpLiveToFile(int fd, bool dump_peak = true);
     void DumpPeakInfo();
+    // Climb mode (DUMP_PEAK_STEP_MB): write one report per accumulated step
+    // snapshot, named by that rung's peak size. Called once at teardown.
+    void DumpStepReports(const char* prefix);
     // Snapshots the live allocation stacks because the evaluator-visible
     // footprint (host RSS + dmabuf bytes) has reached a new maximum. Called
     // from the sampler thread, never from the allocation path.
@@ -328,6 +335,13 @@ private:
     size_t peak_list_host = 0;
     size_t peak_list_dma = 0;
     size_t peak_list_tot = 0;
+    // Climb mode: each step rung's snapshot (list + exact totals), captured as it
+    // is crossed and written as a per-step report at teardown. Capped.
+    struct StepSnapshot {
+        std::vector<ListInfoType> list;
+        size_t host = 0, dma = 0, tot = 0;
+    };
+    std::vector<StepSnapshot> step_snaps_;
     // Which criterion produced the retained snapshot, and -- when it was the
     // observed footprint -- what that footprint read at that instant. Reported
     // so the snapshot can be lined up against an external sampler's series
