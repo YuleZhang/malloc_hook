@@ -148,6 +148,67 @@ use to get malloc and free backtrace, include dmabuffer by hook `ioctl` and `clo
   - DUMP_PEAK_VALUE_MB 的单位默认为 MB
   - `DUMP_PEAK_STEP_MB` 控制峰值快照的最小增长间隔，默认 64MB；设置 `DUMP_PEAK_VALUE_MB` 后，工具会在首次超过阈值时保存峰值快照，之后只有峰值再次增长超过该间隔才重建快照，避免在运行时反复抓取和聚合堆栈导致卡住。
 
+* Perfetto 时间线：峰值 + 每分配生命周期 / Perfetto timeline: peak & per-allocation lifetimes
+
+  在抓取 Perfetto trace 的同时让 hook 通过 atrace(`trace_marker`)输出标记，再用
+  `scripts/build_perfetto_alloc_track.py` 把它们汇成一条干净的 "Memory Top Allocations"
+  轨道：峰值时刻 + 每个被跟踪分配的 alloc→free 生命周期。开关可选，不设置时分配/释放
+  热路径只多一次缓存标志判断。
+
+  环境变量 / env:
+  - `MALLOC_HOOK_TRACE_ALLOC=1` — **一个开关统管两类标记**：
+    - 每个被跟踪(带 backtrace，即达到 min-size)的分配写 async begin(alloc)/ end(free)
+      标记，事件名 `memory_<host|dma|mmap>@<ptr>.h<hash>`；`F`(end)即该缓冲的**释放时刻**，
+      于是每块内存是一条 begin→free 的 slice。
+    - 在峰值时刻写 `malloc_hook_peak_snapshot total_mb/host_mb/dma_mb` 及同名计数器
+      (单位 MiB)；需同时设置 `DUMP_PEAK_VALUE_MB` 以开启峰值记录。
+  - 设备前提：进程可写 `/sys/kernel/tracing/trace_marker`(root 或 SELinux permissive)，
+    且 Perfetto 配置里抓取了 `ftrace/print`。不可写时标记自动降级为 no-op。
+
+  离线合成 / offline steps:
+  ```
+  # 1) 开启标记跑一次，同时抓 Perfetto trace(含 ftrace/print)。程序退出得到
+  #    /data/local/tmp/trace/backtrace_heap.exit.*.txt —— 每条分配都带 hash_index。
+  # 2) 符号化 dump 并导出 hash 映射(默认写到 <hook_root>/hash_index_map.json)。
+  #    process_memory_stack.py 会自动加载 <hook_root>/maps.json(工程符号化配置,gitignore,
+  #    schema 见 scripts/maps.example.json),所以无需再传 -w / 排除项:
+  python3 scripts/process_memory_stack.py -f /data/local/tmp/trace --export-hash-map
+  # 3) 生成轨道。--map 省略时默认读 <hook_root>/hash_index_map.json(即上一步产物):
+  python3 scripts/build_perfetto_alloc_track.py --trace <trace.perfetto> --output <out.perfetto>
+  ```
+
+  `--map` 的 JSON schema（键为字符串 hash_index，对应事件名里的 `.h<hash>` 与 dump 里的
+  `hash_index:<N>`）：
+  ```json
+  {
+    "1712": {"memory": "48.00 MB", "variable": "run_img_vec[i]",
+             "code_func": "...", "call_site": "file.cpp:1944", "top_index": 2}
+  }
+  ```
+  只有 `memory`(用于排序)和 `top_index`(用于轨道顺序)是必需的，其余字段仅用于 slice
+  标签。产出在 Perfetto UI 里是一条 "Memory Top Allocations" 轨道(每个分配一条 begin→free
+  slice)加子轨道 `[memory hook] Peak`(例如 `Peak: 455.2 MB (host 434.5 / dma 20.7)`)。
+
+* 工程符号化配置 maps.json / project config
+
+  `process_memory_stack.py`(以及它导出的 hash 映射)本身通用、可入库；工程特定项——源码根、
+  哪些帧算业务/需排除、pipeline 函数命名——放在 hook 根目录一个 **gitignore 的 `maps.json`**
+  里，脚本启动时自动加载。这样 `python <hook>/scripts/process_memory_stack.py ...` 无需额外参数
+  就能解析当前代码库的 trace。字段说明与示例见 `scripts/maps.example.json`；可用环境变量
+  `MALLOC_HOOK_MAPS` 指向别处。缺失该文件时退回通用行为(只按 `src`/`modules` 选帧、不做
+  pipeline 识别)。
+
+* 打包分发 / packaging (cmake + cpack)
+
+  版本号写在仓库根 `VERSION`(作为 tag 的依据，如 `git tag v0.1.0`)。构建后打一个自带
+  hook + Python 工具 + README 的 tar.gz：
+  ```
+  ./build_android.sh arm64-v8a          # 产出 out/lib/liballoc_hook.so
+  (cd build && cpack)                    # 产出 malloc_hook-<版本>-<abi>.tar.gz
+  ```
+  包内布局：`lib/liballoc_hook.so`、`scripts/*.py`、`scripts/maps.example.json`、`README.md`、
+  `VERSION`。解包后 `cp scripts/maps.example.json maps.json` 并按自己代码库改好即可直接用。
+
 * 内存泄露分析步骤
   - 利用 cheakpoint 机制执行两次程序，并对两次的内存调用堆栈输出进行对比，分析内存调用的增量，此时的内存调用是以时间排序，可以从后向前对比
   ``` c++
