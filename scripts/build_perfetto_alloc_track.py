@@ -420,10 +420,16 @@ def build_parser() -> argparse.ArgumentParser:
         description="Add a dedicated 'Memory Top Allocations' track (native TrackEvent) to a Perfetto trace."
     )
     p.add_argument("--trace", type=Path, required=True, help="Input .perfetto trace.")
-    p.add_argument("--map", type=Path, required=True, help="hash_index -> info JSON (from process_memory_stack.py --export-hash-map).")
+    p.add_argument("--map", type=Path, default=None, help="hash_index -> info JSON (from process_memory_stack.py --export-hash-map). Defaults to <hook_root>/hash_index_map.json when omitted.")
     p.add_argument("--output", type=Path, help="Output path. Default <trace>.toptrack.<suffix>.")
     p.add_argument("--track-name", default="Memory Top Allocations", help="Name of the new track.")
     return p
+
+
+# scripts/ lives directly under the hook root; process_memory_stack.py --export-hash-map
+# writes its JSON there by default, so we look for it in the same place.
+HOOK_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DEFAULT_MAP_PATH = Path(HOOK_ROOT) / "hash_index_map.json"
 
 
 def default_output_path(trace_path: Path) -> Path:
@@ -436,10 +442,12 @@ def main(argv=None) -> int:
     if not args.trace.is_file():
         print(f"Error: trace not found: {args.trace}")
         return 1
-    if not args.map.is_file():
-        print(f"Error: map not found: {args.map}")
+    map_path = args.map or DEFAULT_MAP_PATH
+    if not map_path.is_file():
+        hint = "" if args.map else f" (default {DEFAULT_MAP_PATH}; pass --map or run process_memory_stack.py --export-hash-map first)"
+        print(f"Error: map not found: {map_path}{hint}")
         return 1
-    hash_map = _normalize_map(json.loads(args.map.read_text(encoding="utf-8")))
+    hash_map = _normalize_map(json.loads(map_path.read_text(encoding="utf-8")))
     if not hash_map:
         print("Error: map JSON empty or unparseable.")
         return 1

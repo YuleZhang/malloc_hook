@@ -1,6 +1,11 @@
 cmake_minimum_required(VERSION 3.23)
 
-project(malloc_hook LANGUAGES C CXX ASM)
+# Package version: the VERSION file is the source of truth (tag it as v<VERSION>);
+# override with -DMALLOC_HOOK_VERSION=... for a one-off build.
+file(STRINGS ${CMAKE_CURRENT_SOURCE_DIR}/VERSION _MALLOC_HOOK_VERSION_FILE)
+set(MALLOC_HOOK_VERSION "${_MALLOC_HOOK_VERSION_FILE}" CACHE STRING "malloc_hook package version")
+
+project(malloc_hook VERSION ${MALLOC_HOOK_VERSION} LANGUAGES C CXX ASM)
 
 option(MALLOC_HOOK_BUILD_TESTS "Build malloc_hook test binaries" ON)
 option(MALLOC_HOOK_OHOS_MMAP_HOOK "Export mmap/munmap hooks in OHOS builds" OFF)
@@ -60,3 +65,36 @@ add_custom_target(
   COMMAND
     ${CMAKE_COMMAND} -E copy_if_different ${PROJECT_BINARY_DIR}/compile_commands.json
     ${PROJECT_SOURCE_DIR}/compile_commands.json)
+
+# --------------------------------------------------------------------------- #
+# Distribution package (cpack): a self-contained tarball with the hook, the
+# Python trace tooling and the docs, for quick sharing and use.
+#   cmake --build <build> --target package     # or: (cd <build> && cpack)
+# Produces malloc_hook-<version>-<abi>.tar.gz laid out as:
+#   lib/liballoc_hook.so  scripts/*.py  scripts/maps.example.json  README.md  VERSION
+# The `dist` component is EXCLUDE_FROM_ALL so a plain `ninja install` (used by
+# build_android.sh) does not scatter these into the source tree.
+# --------------------------------------------------------------------------- #
+install(TARGETS alloc_hook LIBRARY DESTINATION lib COMPONENT dist EXCLUDE_FROM_ALL)
+install(FILES
+    ${CMAKE_SOURCE_DIR}/scripts/process_memory_stack.py
+    ${CMAKE_SOURCE_DIR}/scripts/build_perfetto_alloc_track.py
+    ${CMAKE_SOURCE_DIR}/scripts/perfetto_proto.py
+    ${CMAKE_SOURCE_DIR}/scripts/maps.example.json
+    DESTINATION scripts COMPONENT dist EXCLUDE_FROM_ALL)
+install(FILES ${CMAKE_SOURCE_DIR}/README.md ${CMAKE_SOURCE_DIR}/VERSION
+    DESTINATION . COMPONENT dist EXCLUDE_FROM_ALL)
+
+set(CPACK_PACKAGE_NAME "malloc_hook")
+set(CPACK_PACKAGE_VERSION "${MALLOC_HOOK_VERSION}")
+set(CPACK_GENERATOR "TGZ")
+set(CPACK_ARCHIVE_COMPONENT_INSTALL ON)
+set(CPACK_COMPONENTS_ALL dist)
+if(DEFINED ANDROID_ABI)
+  set(_MH_ABI "${ANDROID_ABI}")
+else()
+  set(_MH_ABI "${CMAKE_SYSTEM_PROCESSOR}")
+endif()
+set(CPACK_ARCHIVE_DIST_FILE_NAME "malloc_hook-${MALLOC_HOOK_VERSION}-${_MH_ABI}")
+set(CPACK_PACKAGE_FILE_NAME "malloc_hook-${MALLOC_HOOK_VERSION}-${_MH_ABI}")
+include(CPack)

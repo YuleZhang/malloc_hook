@@ -91,8 +91,11 @@ static inline void WriteAllocTraceMarker(char, const void*, size_t, MemType) {}
 
 static bool PeakTraceMarkerEnabled() {
 #if MALLOC_HOOK_HAS_TRACE_MARKER
+    // Peak markers share the single MALLOC_HOOK_TRACE_ALLOC switch with the
+    // per-allocation lifetime markers: one env turns the whole Perfetto marker
+    // stream on or off.
     static bool enabled = [] {
-        const char* value = getenv("MALLOC_HOOK_TRACE_PEAK");
+        const char* value = getenv("MALLOC_HOOK_TRACE_ALLOC");
         return value != nullptr && value[0] != '\0' && strcmp(value, "0") != 0;
     }();
     return enabled;

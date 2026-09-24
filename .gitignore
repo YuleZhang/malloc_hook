@@ -3,3 +3,9 @@
 build/
 out/
 compile_commands.json
+
+# local, per-checkout symbolization config + generated artifacts (see scripts/maps.example.json)
+/maps.json
+/hash_index_map.json
+/dist/
+*.toptrack.perfetto
