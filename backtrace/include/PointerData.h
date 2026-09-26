@@ -58,6 +58,11 @@ struct PeakProcContext {
     RssBreakdown rss;
     std::vector<MappingRss> mappings;
     MappingTotals totals;
+    // The /proc read is intentionally concurrent with the live-allocation walk.
+    // These bounds make its temporal relationship to the retained snapshot
+    // explicit instead of presenting it as an exact same-instant reading.
+    uint64_t read_start_us = 0;
+    uint64_t read_end_us = 0;
     bool filled = false;
 };
 
@@ -241,16 +246,22 @@ private:
     // every shard, and upgrading from one shard to all of them would invert the
     // lock order. It acquires the shards and frame_mutex_ itself.
     void MaybeRecordPeakSnapshot(size_t tracked_total);
-    // Copies the live allocation stacks and the surrounding /proc state into
-    // the retained snapshot. Caller must hold every shard lock; this takes
-    // frame_mutex_. Shared by both peak criteria so the snapshot contents can
-    // never differ depending on what triggered it. `proc` is the already
-    // collected /proc context, or nullptr to collect it under the locks.
+    // Copies the live allocation stacks into the retained snapshot. Caller must
+    // hold every shard lock; this takes frame_mutex_. Shared by both peak
+    // criteria so the snapshot contents can never differ depending on what
+    // triggered it. `proc` is an already collected /proc context. A nullptr
+    // leaves that context for ApplyPeakProcContextLocked(), allowing an observed
+    // sampler to collect it concurrently with this snapshot.
     // Returns false when nothing was retained because no live allocation
     // carries a stack.
     bool TakePeakSnapshotLocked(
             PeakSnapshotSource source, const ObservedMemSample* observed,
-            PeakProcContext* proc);
+            PeakProcContext* proc, size_t* snapshot_generation);
+    // Caller holds every shard lock. The proc read is deliberately applied in a
+    // separate short critical section after the live allocation snapshot.
+    void ApplyPeakProcContextLocked(
+            PeakProcContext* proc, size_t snapshot_generation);
+    static void* PeakProcReaderMain(void* arg);
     // Reads the /proc state a snapshot records. Takes no hook lock, so it can
     // be hoisted out of the locked region by callers that are able to.
     void CollectPeakProcContext(PeakProcContext* out);
@@ -355,6 +366,19 @@ private:
     size_t peak_observed_rss_ = 0;
     size_t peak_observed_dma_ = 0;
     size_t peak_observed_gpu_ = 0;
+    // Changes only while every shard is locked. Used to discard a slower
+    // /proc read if a newer snapshot has already replaced the retained one.
+    size_t peak_snapshot_generation_ = 0;
+    // Only one tracked-allocation contender may pay for the expensive /proc
+    // read at a time. The claim is released after the contender rechecks the
+    // threshold under all shard locks, including when it loses the race.
+    std::atomic<bool> peak_proc_read_inflight_{false};
+    // Monotonic timing for the retained live-list snapshot and its best-effort
+    // /proc context. The context may overlap the snapshot; the report prints
+    // the interval so consumers do not mistake it for an exact instant.
+    uint64_t peak_snapshot_time_us_ = 0;
+    uint64_t peak_proc_read_start_us_ = 0;
+    uint64_t peak_proc_read_end_us_ = 0;
     // Set once an observed peak has been snapshotted. From then on the
     // allocation path must not overwrite it with a tracked-bytes peak.
     std::atomic<bool> observed_peak_active_{false};

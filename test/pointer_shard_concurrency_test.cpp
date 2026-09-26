@@ -166,6 +166,10 @@ int main() {
         return EXIT_FAILURE;
     }
 
+    const std::string peak = DumpLive(true);
+    assert(peak.find("peak_snapshot_timing:") != std::string::npos);
+    assert(peak.find("relation=") != std::string::npos);
+
     // The peak is a monotonic maximum raised with a relaxed CAS loop, so it may
     // land anywhere at or above the largest total actually reached -- but it can
     // never be below the footprint that was demonstrably live. Read from a peak

@@ -95,6 +95,11 @@ void WriteTrackedSummary(
         int fd, size_t host_peak_bytes, size_t dma_peak_bytes,
         size_t total_peak_bytes);
 
+// Writes the same observed RSS/DMA/GPU summary used by the observe-only mode.
+// Report mode calls this before its separate tracked-allocation summary so the
+// headline metrics keep one meaning across both configurations.
+void WriteObservedSummary(int fd, const char* reason);
+
 // The cross-instance primary election: true only in the one copy of this
 // library that is responsible for the process's exit report.
 //

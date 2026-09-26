@@ -132,7 +132,7 @@ size_t ReadMaxRssBytes() {
 // The observed figures: a human summary in the host framework's own shape,
 // followed by the machine-readable lines the full report uses, so one pattern
 // finds either mode's numbers.
-void WriteObservedBlock(int fd, const char* reason) {
+void WriteObservedBlock(int fd, const char* reason, bool tracking_enabled) {
     const ObservedSamplerStats sampler = ObservedPeakSamplerInstance().stats();
     const LineStyle style = StyleFor(fd);
     if (sampler.samples == 0) {
@@ -196,9 +196,15 @@ void WriteObservedBlock(int fd, const char* reason) {
     }
     WriteRule(fd, style, '=');
 
-    dprintf(fd,
-            "%s%sobserve_only probe (%s): no allocation tracking, no stacks%s\n",
-            style.on, kTag, reason, style.off);
+    if (tracking_enabled) {
+        dprintf(fd,
+                "%s%sobserved sampler (%s): allocation tracking/report active%s\n",
+                style.on, kTag, reason, style.off);
+    } else {
+        dprintf(fd,
+                "%s%sobserve_only probe (%s): no allocation tracking, no stacks%s\n",
+                style.on, kTag, reason, style.off);
+    }
     // The peak instant's own composition, which the independent maxima above
     // cannot give: these are the parts as they stood in the one cycle that
     // produced the combined maximum.
@@ -254,6 +260,12 @@ void WriteTrackedSummary(
         WriteMegabyteRow(fd, style, "RSS Max (getrusage):", max_rss_bytes);
     }
     WriteRule(fd, style, '=');
+}
+
+void WriteObservedSummary(int fd, const char* reason) {
+    if (ObservedPeakSamplerInstance().stats().samples != 0) {
+        WriteObservedBlock(fd, reason, true);
+    }
 }
 
 int ResolveMode() {
@@ -371,12 +383,12 @@ void ReportAtExit() {
     }
     // Joins, so the statistics are stable by the time they are formatted.
     ObservedPeakSamplerInstance().Stop();
-    WriteObservedBlock(STDERR_FILENO, "at_exit");
+    WriteObservedBlock(STDERR_FILENO, "at_exit", false);
 }
 
 bool WriteReport(const char* file_name) {
     if (file_name == nullptr) {
-        WriteObservedBlock(STDERR_FILENO, "checkpoint");
+        WriteObservedBlock(STDERR_FILENO, "checkpoint", false);
         return true;
     }
     const int fd =
@@ -387,10 +399,10 @@ bool WriteReport(const char* file_name) {
         dprintf(STDERR_FILENO,
                 "alloc_hook: cannot write observe_only report to %s: %s\n",
                 file_name, strerror(errno));
-        WriteObservedBlock(STDERR_FILENO, "checkpoint");
+        WriteObservedBlock(STDERR_FILENO, "checkpoint", false);
         return false;
     }
-    WriteObservedBlock(fd, "checkpoint");
+    WriteObservedBlock(fd, "checkpoint", false);
     close(fd);
     return true;
 }

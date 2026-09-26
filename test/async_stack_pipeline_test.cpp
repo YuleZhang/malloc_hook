@@ -332,7 +332,8 @@ TEST(AsyncStackPipeline, ShutdownDrainsAndRejectsNewSubmissions) {
             .start = 0x7000, .end = 0x8000, .name = "shutdown.so", .build_id = ""}});
     AsyncStackPipeline pipeline(
             std::move(resolver), std::make_unique<RecordingSymbolizer>(), 4);
-    const auto accepted = pipeline.Submit(MakeRaw(0x7000));
+    // MakeRaw stores a return address; the pipeline resolves its call site.
+    const auto accepted = pipeline.Submit(MakeRaw(0x7000 + kReturnAddressPcAdjust));
     pipeline.Shutdown();
     const auto rejected = pipeline.Submit(MakeRaw(0x7001));
     EXPECT_TRUE(accepted.accepted);
@@ -353,8 +354,10 @@ TEST(AsyncStackPipeline, PartialResolutionPreservesFramesAndFailureState) {
     raw.terminal_error = 7;
     raw.module_generation = 1;
     raw.frame_count = 2;
-    raw.pcs[0] = 0x2001;
-    raw.pcs[1] = 0x2002;
+    // Keep the resolver's sentinel values in call-site space while the raw
+    // record contains return addresses.
+    raw.pcs[0] = 0x2001 + kReturnAddressPcAdjust;
+    raw.pcs[1] = 0x2002 + kReturnAddressPcAdjust;
 
     const auto submitted = pipeline.Submit(raw);
     ASSERT_TRUE(submitted.accepted);
