@@ -58,6 +58,11 @@ struct PeakProcContext {
     RssBreakdown rss;
     std::vector<MappingRss> mappings;
     MappingTotals totals;
+    // The /proc read is intentionally concurrent with the live-allocation walk.
+    // These bounds make its temporal relationship to the retained snapshot
+    // explicit instead of presenting it as an exact same-instant reading.
+    uint64_t read_start_us = 0;
+    uint64_t read_end_us = 0;
     bool filled = false;
 };
 
@@ -364,6 +369,16 @@ private:
     // Changes only while every shard is locked. Used to discard a slower
     // /proc read if a newer snapshot has already replaced the retained one.
     size_t peak_snapshot_generation_ = 0;
+    // Only one tracked-allocation contender may pay for the expensive /proc
+    // read at a time. The claim is released after the contender rechecks the
+    // threshold under all shard locks, including when it loses the race.
+    std::atomic<bool> peak_proc_read_inflight_{false};
+    // Monotonic timing for the retained live-list snapshot and its best-effort
+    // /proc context. The context may overlap the snapshot; the report prints
+    // the interval so consumers do not mistake it for an exact instant.
+    uint64_t peak_snapshot_time_us_ = 0;
+    uint64_t peak_proc_read_start_us_ = 0;
+    uint64_t peak_proc_read_end_us_ = 0;
     // Set once an observed peak has been snapshotted. From then on the
     // allocation path must not overwrite it with a tracked-bytes peak.
     std::atomic<bool> observed_peak_active_{false};

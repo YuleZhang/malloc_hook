@@ -165,6 +165,29 @@ bool RaisePeak(std::atomic<size_t>* peak, size_t candidate) {
     return false;
 }
 
+uint64_t PeakMonotonicMicros() {
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) {
+        return 0;
+    }
+    return static_cast<uint64_t>(now.tv_sec) * 1000000ULL +
+           static_cast<uint64_t>(now.tv_nsec) / 1000ULL;
+}
+
+const char* PeakProcContextRelation(
+        uint64_t read_start_us, uint64_t read_end_us, uint64_t snapshot_us) {
+    if (read_start_us == 0 || read_end_us == 0 || snapshot_us == 0) {
+        return "unknown";
+    }
+    if (read_end_us < snapshot_us) {
+        return "before_snapshot";
+    }
+    if (read_start_us > snapshot_us) {
+        return "after_snapshot";
+    }
+    return "overlaps_snapshot";
+}
+
 struct ModuleRange {
     uintptr_t start = 0;
     uintptr_t end = 0;
@@ -499,6 +522,10 @@ bool PointerData::Initialize(const Config& config) {
     peak_observed_dma_ = 0;
     peak_observed_gpu_ = 0;
     peak_snapshot_generation_ = 0;
+    peak_proc_read_inflight_.store(false, std::memory_order_relaxed);
+    peak_snapshot_time_us_ = 0;
+    peak_proc_read_start_us_ = 0;
+    peak_proc_read_end_us_ = 0;
     observed_peak_active_.store(false, std::memory_order_relaxed);
 
     return true;
@@ -589,6 +616,30 @@ void PointerData::MaybeRecordPeakSnapshot(size_t tracked_total) {
         !ObservedPeakSamplerInstance().Stalled()) {
         return;
     }
+
+    // Several allocation threads can cross the same threshold before any one
+    // of them acquires all shards. Claim the expensive /proc walk before doing
+    // it, then recheck the state under the shard locks below. Without this
+    // claim every contender paid for a full status+smaps walk even though only
+    // one could retain a snapshot.
+    if (peak_proc_read_inflight_.exchange(true, std::memory_order_acquire)) {
+        return;
+    }
+    struct PeakProcReadClaim {
+        std::atomic<bool>* inflight;
+        ~PeakProcReadClaim() {
+            inflight->store(false, std::memory_order_release);
+        }
+    } proc_read_claim{&peak_proc_read_inflight_};
+
+    // The sampler may have won while this contender was waiting to claim the
+    // proc read. Recheck after the claim so a losing criterion does not pay for
+    // a read that can no longer be retained.
+    if (observed_peak_active_.load(std::memory_order_relaxed) &&
+        !ObservedPeakSamplerInstance().Stalled()) {
+        return;
+    }
+
     PeakProcContext proc;
     // The tracked fallback can run before helper threads are allowed to start
     // during loader initialization. Read /proc before taking the tracker locks;
@@ -605,7 +656,9 @@ void PointerData::MaybeRecordPeakSnapshot(size_t tracked_total) {
     // for the run, and the walk is the cost the mode exists to avoid. The hot
     // path does not need to re-test this, because finalization pins the
     // threshold out of reach.
-    if (peak_snapshot_final_) {
+    if ((observed_peak_active_.load(std::memory_order_relaxed) &&
+         !ObservedPeakSamplerInstance().Stalled()) ||
+        peak_snapshot_final_) {
         return;
     }
     const size_t peak_now = peak_tot.load(std::memory_order_relaxed);
@@ -658,6 +711,11 @@ bool PointerData::TakePeakSnapshotLocked(
     if (snapshot_generation != nullptr) {
         *snapshot_generation = peak_snapshot_generation_;
     }
+    // This timestamp marks the committed live-list snapshot. The /proc context
+    // is intentionally collected independently; its interval is retained
+    // below so the report can state whether it was before, after, or overlapping
+    // this point rather than implying exact temporal alignment.
+    peak_snapshot_time_us_ = PeakMonotonicMicros();
     peak_list = std::move(next_peak_list);
     peak_list_host = current_host.load(std::memory_order_relaxed);
     peak_list_dma = current_dma.load(std::memory_order_relaxed);
@@ -696,6 +754,10 @@ bool PointerData::TakePeakSnapshotLocked(
         peak_mappings = std::move(proc->mappings);
         peak_map_totals = proc->totals;
     }
+    if (proc != nullptr) {
+        peak_proc_read_start_us_ = proc->read_start_us;
+        peak_proc_read_end_us_ = proc->read_end_us;
+    }
     peak_live_pointers = 0;
     peak_pointer_buckets = 0;
     for (const PointerShard& shard : shards_) {
@@ -727,6 +789,8 @@ void PointerData::ApplyPeakProcContextLocked(
     peak_rss_shmem_kb = proc->rss.shmem_kb;
     peak_mappings = std::move(proc->mappings);
     peak_map_totals = proc->totals;
+    peak_proc_read_start_us_ = proc->read_start_us;
+    peak_proc_read_end_us_ = proc->read_end_us;
 }
 
 namespace {
@@ -748,10 +812,12 @@ void* PointerData::PeakProcReaderMain(void* arg) {
 }
 
 void PointerData::CollectPeakProcContext(PeakProcContext* out) {
+    out->read_start_us = PeakMonotonicMicros();
     out->rss = ReadSelfRss();
     if (out->rss.valid) {
         CollectMappingRss(&out->mappings, &out->totals, 12);
     }
+    out->read_end_us = PeakMonotonicMicros();
     out->filled = true;
 }
 
@@ -1376,6 +1442,19 @@ void PointerData::DumpLiveToFile(int fd, bool dump_peak) {
             criterion = "none (nothing was snapshotted)";
         }
         dprintf(fd, "peak_criterion: %s\n", criterion);
+        if (dumping_peak) {
+            dprintf(
+                    fd,
+                    "peak_snapshot_timing: snapshot_monotonic_us=%llu "
+                    "proc_context_start_monotonic_us=%llu "
+                    "proc_context_end_monotonic_us=%llu relation=%s\n",
+                    static_cast<unsigned long long>(peak_snapshot_time_us_),
+                    static_cast<unsigned long long>(peak_proc_read_start_us_),
+                    static_cast<unsigned long long>(peak_proc_read_end_us_),
+                    PeakProcContextRelation(
+                            peak_proc_read_start_us_, peak_proc_read_end_us_,
+                            peak_snapshot_time_us_));
+        }
         if (peak_snapshot_source_ == PeakSnapshotSource::Observed) {
             dprintf(fd,
                     "observed_peak(at_snapshot): rss=%fMB dma=%fMB gpu=%fMB "
