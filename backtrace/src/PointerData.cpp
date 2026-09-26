@@ -24,6 +24,7 @@
 #include "ObserveOnlyProbe.h"
 #include "PointerData.h"
 #include "UnwindBacktrace.h"
+#include "debug_disable.h"
 #include "memory_hook.h"
 
 constexpr size_t kBacktraceExitIndex = 0;
@@ -497,6 +498,7 @@ bool PointerData::Initialize(const Config& config) {
     peak_observed_rss_ = 0;
     peak_observed_dma_ = 0;
     peak_observed_gpu_ = 0;
+    peak_snapshot_generation_ = 0;
     observed_peak_active_.store(false, std::memory_order_relaxed);
 
     return true;
@@ -587,6 +589,11 @@ void PointerData::MaybeRecordPeakSnapshot(size_t tracked_total) {
         !ObservedPeakSamplerInstance().Stalled()) {
         return;
     }
+    PeakProcContext proc;
+    // The tracked fallback can run before helper threads are allowed to start
+    // during loader initialization. Read /proc before taking the tracker locks;
+    // the observed sampler uses the concurrent reader below.
+    CollectPeakProcContext(&proc);
     AllShardsGuard shard_guard(this);
     // Everything above was tested without a lock, so several threads can arrive
     // here for the same crossing. Re-tested under the shards, both conditions
@@ -605,8 +612,8 @@ void PointerData::MaybeRecordPeakSnapshot(size_t tracked_total) {
     if (peak_now <= next_peak_record_threshold_.load(std::memory_order_relaxed)) {
         return;
     }
-    const bool retained =
-            TakePeakSnapshotLocked(PeakSnapshotSource::Tracked, nullptr, nullptr);
+    const bool retained = TakePeakSnapshotLocked(
+            PeakSnapshotSource::Tracked, nullptr, &proc, nullptr);
     if (tracked_peak_once_) {
         // Only a snapshot that was actually retained ends the search. Nothing
         // carrying a stack yet means the crossing produced no report material,
@@ -635,12 +642,7 @@ void PointerData::MaybeRecordPeakSnapshot(size_t tracked_total) {
 // Caller holds every shard lock.
 bool PointerData::TakePeakSnapshotLocked(
         PeakSnapshotSource source, const ObservedMemSample* observed,
-        PeakProcContext* proc) {
-    PeakProcContext collected;
-    if (proc == nullptr) {
-        CollectPeakProcContext(&collected);
-        proc = &collected;
-    }
+        PeakProcContext* proc, size_t* snapshot_generation) {
     std::lock_guard<std::mutex> frame_guard(frame_mutex_);
     std::vector<ListInfoType> next_peak_list;
     // Snapshot only allocations that actually carry a stack. Including
@@ -651,6 +653,10 @@ bool PointerData::TakePeakSnapshotLocked(
     GetUniqueList(&next_peak_list, true);
     if (next_peak_list.empty()) {
         return false;
+    }
+    ++peak_snapshot_generation_;
+    if (snapshot_generation != nullptr) {
+        *snapshot_generation = peak_snapshot_generation_;
     }
     peak_list = std::move(next_peak_list);
     peak_list_host = current_host.load(std::memory_order_relaxed);
@@ -682,7 +688,7 @@ bool PointerData::TakePeakSnapshotLocked(
         peak_observed_dma_ = 0;
         peak_observed_gpu_ = 0;
     }
-    if (proc->rss.valid) {
+    if (proc != nullptr && proc->rss.valid) {
         peak_rss_kb = proc->rss.vm_rss_kb;
         peak_rss_anon_kb = proc->rss.anon_kb;
         peak_rss_file_kb = proc->rss.file_kb;
@@ -706,6 +712,41 @@ bool PointerData::TakePeakSnapshotLocked(
     return true;
 }
 
+void PointerData::ApplyPeakProcContextLocked(
+        PeakProcContext* proc, size_t snapshot_generation) {
+    if (proc == nullptr || snapshot_generation != peak_snapshot_generation_) {
+        return;
+    }
+    std::lock_guard<std::mutex> frame_guard(frame_mutex_);
+    if (!proc->rss.valid) {
+        return;
+    }
+    peak_rss_kb = proc->rss.vm_rss_kb;
+    peak_rss_anon_kb = proc->rss.anon_kb;
+    peak_rss_file_kb = proc->rss.file_kb;
+    peak_rss_shmem_kb = proc->rss.shmem_kb;
+    peak_mappings = std::move(proc->mappings);
+    peak_map_totals = proc->totals;
+}
+
+namespace {
+
+struct PeakProcReaderArgs {
+    PointerData* owner;
+    PeakProcContext* output;
+};
+
+}  // namespace
+
+void* PointerData::PeakProcReaderMain(void* arg) {
+    auto* args = static_cast<PeakProcReaderArgs*>(arg);
+    // The /proc parser uses STL containers. Keep its bookkeeping out of the
+    // tracked live allocation set while it runs beside the snapshot walk.
+    DebugDisableSet(true);
+    args->owner->CollectPeakProcContext(args->output);
+    return nullptr;
+}
+
 void PointerData::CollectPeakProcContext(PeakProcContext* out) {
     out->rss = ReadSelfRss();
     if (out->rss.valid) {
@@ -718,34 +759,59 @@ bool PointerData::RecordObservedPeak(const ObservedMemSample& sample) {
     if (g_debug == nullptr || !(g_debug->config().options() & RECORD_MEMORY_PEAK)) {
         return false;
     }
-    // Read before the locks are taken. This runs on the sampler thread, so the
-    // page-table walk costs the sampler its cadence rather than costing every
-    // allocating thread a stall.
     PeakProcContext proc;
-    CollectPeakProcContext(&proc);
-    AllShardsGuard shard_guard(this);
-    // Claimed before the snapshot is attempted, not after: a snapshot skipped
-    // because nothing carries a stack yet must still stop the allocation path
-    // from installing a tracked-bytes peak that the report would then present
-    // as if it were the observed one.
-    observed_peak_active_.store(true, std::memory_order_relaxed);
-    // Deliberately not gated on peak_snapshot_final_. Under first-crossing
-    // retention the allocation path may have reached the floor first -- tracked
-    // bytes can exceed the observed total when large allocations are not yet
-    // faulted in -- and that crossing is only a proxy for this one. Letting the
-    // observed criterion replace it once costs a second stack walk in that case
-    // and buys the alignment the mode is measured against.
-    const bool retained =
-            TakePeakSnapshotLocked(PeakSnapshotSource::Observed, &sample, &proc);
-    if (retained &&
-        g_debug->config().peak_retention() == PeakRetention::FirstCrossing) {
-        // Marking the snapshot final closes the allocation path's fallback as
-        // well: after the crossing there is nothing left to improve on, and a
-        // stalled sampler must not cause a second stack walk. A crossing that
-        // retained nothing -- no live allocation carried a stack yet -- leaves
-        // both paths open so the run can still produce a report.
-        peak_snapshot_final_ = true;
-        next_peak_record_threshold_ = SIZE_MAX;
+    PeakProcReaderArgs reader_args{this, &proc};
+    pthread_t reader_thread{};
+    bool reader_started = false;
+    {
+        ScopedDisableDebugCalls disable;
+        reader_started = pthread_create(
+                &reader_thread, nullptr, &PointerData::PeakProcReaderMain,
+                &reader_args) == 0;
+    }
+    if (!reader_started) {
+        // Thread creation is best effort. Keep the report usable on platforms
+        // that reject a helper thread, while still keeping /proc outside the
+        // allocation locks.
+        CollectPeakProcContext(&proc);
+    }
+
+    size_t snapshot_generation = 0;
+    bool retained = false;
+    {
+        AllShardsGuard shard_guard(this);
+        // Claimed before the snapshot is attempted, not after: a snapshot
+        // skipped because nothing carries a stack yet must still stop the
+        // allocation path from installing a tracked-bytes peak that the report
+        // would then present as if it were the observed one.
+        observed_peak_active_.store(true, std::memory_order_relaxed);
+        // Deliberately not gated on peak_snapshot_final_. Under first-crossing
+        // retention the allocation path may have reached the floor first --
+        // tracked bytes can exceed the observed total when large allocations
+        // are not yet faulted in -- and that crossing is only a proxy for this
+        // one. Letting the observed criterion replace it once costs a second
+        // stack walk in that case and buys the alignment the mode is measured
+        // against.
+        retained = TakePeakSnapshotLocked(
+                PeakSnapshotSource::Observed, &sample, nullptr,
+                &snapshot_generation);
+        if (retained &&
+            g_debug->config().peak_retention() == PeakRetention::FirstCrossing) {
+            // Marking the snapshot final closes the allocation path's fallback
+            // before the /proc reader is joined. A crossing that retained
+            // nothing -- no live allocation carried a stack yet -- leaves both
+            // paths open so the run can still produce a report.
+            peak_snapshot_final_ = true;
+            next_peak_record_threshold_ = SIZE_MAX;
+        }
+    }
+
+    if (reader_started) {
+        pthread_join(reader_thread, nullptr);
+    }
+    if (retained) {
+        AllShardsGuard shard_guard(this);
+        ApplyPeakProcContextLocked(&proc, snapshot_generation);
     }
     return retained;
 }
