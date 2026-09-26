@@ -1724,23 +1724,15 @@ void PointerData::DumpPeakInfo() {
     const size_t host_peak = peak_host.load(std::memory_order_relaxed);
     const size_t dma_peak = peak_dma.load(std::memory_order_relaxed);
     const size_t total_peak = peak_tot.load(std::memory_order_relaxed);
-    observe_only::WriteTrackedSummary(
-            STDERR_FILENO, host_peak, dma_peak, total_peak);
-
     const ObservedSamplerStats sampler = ObservedPeakSamplerInstance().stats();
     if (sampler.samples != 0) {
-        // Printed next to the tracked totals because they are different
-        // quantities: the box above is bytes this process asked for, this one
-        // is what the kernel says it holds.
-        dprintf(STDERR_FILENO,
-                "alloc_hook: observed peak (host rss + dma + gpu, from /proc "
-                "every %ums): rss %.2fMB + dma %.2fMB + gpu %.2fMB = %.2fMB\n",
-                sampler.interval_ms,
-                sampler.peak_total_rss_bytes / 1024.0 / 1024.0,
-                sampler.peak_total_dma_bytes / 1024.0 / 1024.0,
-                sampler.peak_total_gpu_bytes / 1024.0 / 1024.0,
-                sampler.peak_total_bytes / 1024.0 / 1024.0);
-    } else if (!(g_debug->config().options() & BACKTRACE)) {
+        // Keep report mode's headline metrics identical to observe-only mode.
+        // The tracked counters remain useful, but they are not RSS/DMA/total.
+        observe_only::WriteObservedSummary(STDERR_FILENO, "at_exit");
+    }
+    observe_only::WriteTrackedSummary(
+            STDERR_FILENO, host_peak, dma_peak, total_peak);
+    if (sampler.samples == 0 && !(g_debug->config().options() & BACKTRACE)) {
         // The lightweight tracked probe: it never unwound, so it can report how
         // much but not which call site. Point at the report modes that can.
         dprintf(STDERR_FILENO,
