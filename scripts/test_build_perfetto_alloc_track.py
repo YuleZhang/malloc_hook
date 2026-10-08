@@ -4,6 +4,7 @@
 import os
 import sys
 import unittest
+import zlib
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -58,6 +59,23 @@ class AllocationTimingTest(unittest.TestCase):
 
         self.assertEqual([(10, 10), (30, 20)],
                          [(t["ts"], t["dur"]) for t in timings])
+
+    def test_reads_ftrace_events_inside_compressed_packets(self):
+        inner = trace_with_markers([
+            (10, "S|7|memory_host@0x100.h42.s4096|256"),
+            (70, "F|7|memory_host@0x100.h42.s4096|256"),
+        ])
+        trace = P.make_packet(
+            [P.encode_len_field(50, zlib.compress(inner))],
+            sequence_id=1,
+            flags=None,
+        )
+
+        timings = alloc_track.extract_allocation_timings(trace)
+
+        self.assertEqual([(42, 4096, 10, 60)],
+                         [(t["hash_index"], t["size_bytes"], t["ts"], t["dur"])
+                          for t in timings])
 
 
 if __name__ == "__main__":

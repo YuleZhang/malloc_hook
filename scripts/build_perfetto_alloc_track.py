@@ -68,6 +68,20 @@ PEAK_RE = re.compile(
 # --------------------------------------------------------------------------- #
 # 纯 protobuf 解析:取每个 hash 的 (begin_ts, dur)
 # --------------------------------------------------------------------------- #
+def _iter_trace_packets_recursive(trace_bytes: bytes):
+    """Yield top-level and compressed TracePackets.
+
+    Android traces commonly store ftrace packets in ``compressed_packets``. Scanning only the
+    outer packet made this tool report zero allocation slices while still producing a valid
+    larger trace, which looked like a successful CSV-only overlay.
+    """
+    for packet in P.iter_trace_packets(trace_bytes):
+        yield packet
+        for field_number, wire_type, value in P.iter_fields(packet):
+            if field_number == 50 and wire_type == 2:
+                yield from _iter_trace_packets_recursive(P.decompress_packets(value))
+
+
 def extract_allocation_timings(trace_bytes: bytes) -> list[dict]:
     """Return every paired allocation lifetime parsed from ftrace print events.
 
@@ -77,14 +91,7 @@ def extract_allocation_timings(trace_bytes: bytes) -> list[dict]:
     """
     begins = {}  # name -> FIFO list[(hash, size_bytes, ts)]
     lifetimes = []
-    view = memoryview(trace_bytes)
-    off = 0
-    n = len(view)
-    while off < n:
-        key, off = P.read_varint(view, off)
-        sz, off = P.read_varint(view, off)
-        packet = bytes(view[off : off + sz])
-        off += sz
+    for packet in _iter_trace_packets_recursive(trace_bytes):
         if b"memory_" not in packet:
             continue
         for fn, wt, v in P.iter_fields(packet):
@@ -139,14 +146,7 @@ def extract_peak_snapshots(trace_bytes: bytes) -> list:
     the last / largest entry is the true peak.
     """
     snaps = []
-    view = memoryview(trace_bytes)
-    off = 0
-    n = len(view)
-    while off < n:
-        key, off = P.read_varint(view, off)
-        sz, off = P.read_varint(view, off)
-        packet = bytes(view[off : off + sz])
-        off += sz
+    for packet in _iter_trace_packets_recursive(trace_bytes):
         if b"malloc_hook_peak_snapshot" not in packet:
             continue
         for fn, wt, v in P.iter_fields(packet):
