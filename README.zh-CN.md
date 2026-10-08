@@ -137,6 +137,18 @@ python3 scripts/merge_csv_to_perfetto.py --trace <trace.perfetto> --csv <mem_use
 python3 scripts/build_perfetto_alloc_track.py --trace overlay.perfetto --output final.perfetto
 ```
 
+第 3 步**默认还会把原始 `memory_*` marker 从输出里删掉**——该用的那些已经被转成干净的
+native 轨道了。留着它们正是让插桩后的 trace 打不开的原因：marker 名字里嵌了指针，于是
+Perfetto 给每个分配各建一条 async 轨道。一次 28s 的 pipeline run、`BACKTRACE_MIN_SIZE`
+取默认 1024，实测是 35 万个 print 事件、30 MiB（占 trace 的 68%）、**169,935 条轨道**，
+而业务自己的 atrace 只占 5.8%。删掉之后 44.6 MiB / 170,340 轨 → 14.5 MiB / 405 轨，
+counter、`[memory hook]` 轨道、业务 atrace、`sched` 全部不受影响。
+`malloc_hook_peak_snapshot` 会保留（它是 Peak 轨道的来源）。
+
+所以想要完整归因时 `BACKTRACE_MIN_SIZE` 放低就行，trace 依然可用。要回到旧行为用
+`--keep-alloc-markers`；另外第 3 步需要**原始** trace——对它自己的输出再跑一次就没东西
+可配对了，脚本会就此告警。
+
 `process_memory_stack.py` 从 gitignore 的 `<hook_root>/maps.json` 读取工程符号化配置
 （源码根、需排除的转发帧、pipeline 命名；schema 见 `scripts/maps.example.json`，可用
 `$MALLOC_HOOK_MAPS` 指向别处）。文件缺失则退回通用行为。

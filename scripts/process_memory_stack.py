@@ -1018,7 +1018,7 @@ def annotate_perfetto_from_dumps(dump_results, trace_path, output_path):
         return
 
     trace_bytes = trace.read_bytes()
-    new_bytes, stats = alloc_track.build_tracks(trace_bytes, groups)
+    new_bytes, stats, n_stripped = alloc_track.build_tracks(trace_bytes, groups)
 
     out = Path(output_path) if output_path else alloc_track.default_output_path(trace)
     if out.parent and not out.parent.exists():
@@ -1031,6 +1031,7 @@ def annotate_perfetto_from_dumps(dump_results, trace_path, output_path):
         print(f"    映射条目            : {len(hash_map)}")
         print(f"    轨道 slice 数       : {n_slices}")
         print(f"    跳过(trace 无时间戳): {skipped}")
+    print(f"  已精简逐分配 marker    : {n_stripped}")
     print(f"  大小 {len(trace_bytes)} -> {len(new_bytes)} bytes")
 
 

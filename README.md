@@ -162,6 +162,21 @@ python3 scripts/merge_csv_to_perfetto.py --trace <trace.perfetto> --csv <mem_use
 python3 scripts/build_perfetto_alloc_track.py --trace overlay.perfetto --output final.perfetto
 ```
 
+Step 3 also **strips the raw `memory_*` markers from its output by default**, because it
+has just turned the ones that matter into the native track. Leaving them in is what makes
+an instrumented trace unopenable: the marker name embeds the pointer, so Perfetto lays out
+one async track per allocation. On a 28 s pipeline run at the default
+`BACKTRACE_MIN_SIZE=1024` that is 350k print events, 30 MiB (68% of the trace) and
+**169,935 tracks** — against 5.8% for the app's own atrace. Stripping them takes that trace
+from 44.6 MiB / 170,340 tracks to 14.5 MiB / 405 tracks, with counters, the
+`[memory hook]` tracks, the app's atrace and `sched` all untouched. The
+`malloc_hook_peak_snapshot` markers are kept (they are the Peak track's source).
+
+So keep `BACKTRACE_MIN_SIZE` low when you want full attribution — the trace stays usable
+either way. Pass `--keep-alloc-markers` for the old behaviour, and note that step 3 needs
+the **original** trace: run it on its own output and there is nothing left to pair, which
+it warns about.
+
 `process_memory_stack.py` reads project-specific symbolization config (source roots,
 excluded/forwarding frames, pipeline naming) from a gitignored `<hook_root>/maps.json`
 (schema: `scripts/maps.example.json`; `$MALLOC_HOOK_MAPS` overrides). Missing file →

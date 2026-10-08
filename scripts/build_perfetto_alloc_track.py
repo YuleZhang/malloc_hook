@@ -11,7 +11,20 @@
 
 数据来源:process_memory_stack.py 符号化 dump 得到的 hash_index -> 参数 映射;
 时间戳:纯 protobuf 解析原 trace 的 ftrace print 事件,按 `.h<N>` 配对 S/F 取 ts+dur。
-无第三方依赖(不需要 perfetto python 库)。
+无第三方依赖(不需要 perfetto 库)。
+
+**输出默认是精简的。** `MALLOC_HOOK_TRACE_ALLOC=1` 给每个被跟踪的分配写一对
+`memory_<type>@<ptr>` 的 trace_marker,名字里嵌了指针所以每个都唯一,Perfetto 会
+按名字各建一条 async 轨道。实测一次 28s 的 pipeline run(`BACKTRACE_MIN_SIZE`
+取默认 1024):350k 个 print 事件、30 MiB(占 trace 的 68%)、**169,935 条轨道**,
+UI 要为此排 17 万行,直接卡死;而业务自己的 atrace 只占 5.8%。这些原始 marker
+的唯一用途就是在这里配对取时间戳,本脚本用完之后它们就是死重,所以默认在输出里
+删掉(保留 `malloc_hook_peak_snapshot`,它只有几十条且是 Peak 轨道的来源)。
+实测 44.6 MiB / 170,340 轨 -> 8.1 MiB / 405 轨,counter、`[memory hook]` 轨道、
+业务 atrace、sched 全部不受影响。要保留原始 marker 用 `--keep-alloc-markers`。
+
+注意:因此**输入必须是未精简的原始 trace**。对已精简的 trace 再跑一次会得到
+0 条 slice(脚本会就此告警)。
 
 复用 perfetto_proto 的 protobuf 编码 / 时钟对齐(analyze_trace) / packet 合并原语。
 """
@@ -22,6 +35,7 @@ import json
 import os
 import re
 import sys
+import zlib
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -30,6 +44,7 @@ import perfetto_proto as P  # noqa: E402  protobuf/perfetto 编解码底座
 # ---- Perfetto proto 字段号 ----
 # TracePacket
 FTRACE_BUNDLE_FIELD = 1  # ftrace_events
+COMPRESSED_PACKETS_FIELD = 50  # compressed_packets (zlib 包裹的内层 TracePacket 流)
 # FtraceEventBundle
 FTRACE_EVENT_FIELD = 2  # event (repeated)
 # FtraceEvent
@@ -68,6 +83,20 @@ PEAK_RE = re.compile(
 # --------------------------------------------------------------------------- #
 # 纯 protobuf 解析:取每个 hash 的 (begin_ts, dur)
 # --------------------------------------------------------------------------- #
+def _iter_trace_packets_recursive(trace_bytes: bytes):
+    """Yield top-level and compressed TracePackets.
+
+    Android traces commonly store ftrace packets in ``compressed_packets``. Scanning only the
+    outer packet made this tool report zero allocation slices while still producing a valid
+    larger trace, which looked like a successful CSV-only overlay.
+    """
+    for packet in P.iter_trace_packets(trace_bytes):
+        yield packet
+        for field_number, wire_type, value in P.iter_fields(packet):
+            if field_number == 50 and wire_type == 2:
+                yield from _iter_trace_packets_recursive(P.decompress_packets(value))
+
+
 def extract_allocation_timings(trace_bytes: bytes) -> list[dict]:
     """Return every paired allocation lifetime parsed from ftrace print events.
 
@@ -77,14 +106,7 @@ def extract_allocation_timings(trace_bytes: bytes) -> list[dict]:
     """
     begins = {}  # name -> FIFO list[(hash, size_bytes, ts)]
     lifetimes = []
-    view = memoryview(trace_bytes)
-    off = 0
-    n = len(view)
-    while off < n:
-        key, off = P.read_varint(view, off)
-        sz, off = P.read_varint(view, off)
-        packet = bytes(view[off : off + sz])
-        off += sz
+    for packet in _iter_trace_packets_recursive(trace_bytes):
         if b"memory_" not in packet:
             continue
         for fn, wt, v in P.iter_fields(packet):
@@ -139,14 +161,7 @@ def extract_peak_snapshots(trace_bytes: bytes) -> list:
     the last / largest entry is the true peak.
     """
     snaps = []
-    view = memoryview(trace_bytes)
-    off = 0
-    n = len(view)
-    while off < n:
-        key, off = P.read_varint(view, off)
-        sz, off = P.read_varint(view, off)
-        packet = bytes(view[off : off + sz])
-        off += sz
+    for packet in _iter_trace_packets_recursive(trace_bytes):
         if b"malloc_hook_peak_snapshot" not in packet:
             continue
         for fn, wt, v in P.iter_fields(packet):
@@ -182,6 +197,104 @@ def extract_peak_snapshots(trace_bytes: bytes) -> list:
 def _peak_slice_name(total_mb: float, host_mb: float, dma_mb: float, is_max: bool) -> str:
     tag = "Peak" if is_max else "peak step"
     return f"{tag}: {total_mb:.1f} MB (host {host_mb:.1f} / dma {dma_mb:.1f})"
+
+
+# --------------------------------------------------------------------------- #
+# 精简:删掉逐分配的 memory_* marker(默认行为,见模块 docstring)
+# --------------------------------------------------------------------------- #
+ALLOC_MARKER_TAG = b"memory_"
+PEAK_MARKER_TAG = b"malloc_hook_peak_snapshot"
+# field 50 / wire type 2 的 key,用来便宜地判断一个 packet 是否可能内嵌压缩流
+_COMPRESSED_KEY = P.encode_key(COMPRESSED_PACKETS_FIELD, 2)
+
+
+def _copy_field(field_number: int, wire_type: int, value) -> bytes:
+    """Re-encode one protobuf field exactly as iter_fields produced it."""
+    if wire_type == 0:
+        return P.encode_var_field(field_number, value)
+    if wire_type == 2:
+        return P.encode_len_field(field_number, value)
+    if wire_type in (1, 5):
+        return P.encode_key(field_number, wire_type) + value
+    raise ValueError(f"unsupported wire type {wire_type}")
+
+
+def _inflate(payload: bytes) -> tuple[bytes, int]:
+    """Decompress compressed_packets, returning (data, wbits) so we can re-deflate
+    in whatever framing the producer used."""
+    for wbits in (zlib.MAX_WBITS, -zlib.MAX_WBITS):
+        try:
+            return zlib.decompress(payload, wbits), wbits
+        except zlib.error:
+            continue
+    raise ValueError("compressed_packets is present but could not be decompressed")
+
+
+def _deflate(payload: bytes, wbits: int) -> bytes:
+    compressor = zlib.compressobj(wbits=wbits)
+    return compressor.compress(payload) + compressor.flush()
+
+
+def _strip_packet(packet: bytes) -> tuple[bytes, int]:
+    """Rebuild one TracePacket without the per-allocation markers.
+
+    Returns (packet_bytes, n_dropped). When nothing matched, the original bytes are
+    returned unchanged so untouched packets stay byte-identical.
+    """
+    dropped = 0
+    parts = []
+    for field_number, wire_type, value in P.iter_fields(packet):
+        if field_number == FTRACE_BUNDLE_FIELD and wire_type == 2:
+            kept = []
+            for ef, ew, event in P.iter_fields(value):
+                if (
+                    ef == FTRACE_EVENT_FIELD
+                    and ew == 2
+                    and ALLOC_MARKER_TAG in event
+                    and PEAK_MARKER_TAG not in event
+                ):
+                    dropped += 1
+                    continue
+                kept.append(_copy_field(ef, ew, event))
+            parts.append(P.encode_len_field(FTRACE_BUNDLE_FIELD, b"".join(kept)))
+        elif field_number == COMPRESSED_PACKETS_FIELD and wire_type == 2:
+            inner, wbits = _inflate(value)
+            new_inner, inner_dropped = strip_alloc_markers(inner)
+            dropped += inner_dropped
+            if inner_dropped:
+                parts.append(
+                    P.encode_len_field(field_number, _deflate(new_inner, wbits)))
+            else:
+                parts.append(_copy_field(field_number, wire_type, value))
+        else:
+            parts.append(_copy_field(field_number, wire_type, value))
+    if not dropped:
+        return packet, 0
+    return b"".join(parts), dropped
+
+
+def strip_alloc_markers(trace_bytes: bytes) -> tuple[bytes, int]:
+    """Drop liballoc_hook's per-allocation `memory_*` ftrace print events.
+
+    Keeps everything else byte-for-byte, including the `malloc_hook_peak_snapshot`
+    markers, counters, native TrackEvents, compact_sched and the app's own atrace.
+    Recurses into `compressed_packets`, re-deflating only the blobs that changed.
+
+    Returns (new_trace_bytes, n_dropped_events).
+    """
+    out = bytearray()
+    total = 0
+    for root_bytes, packet in P.iter_trace_packet_entries(trace_bytes):
+        if ALLOC_MARKER_TAG not in packet and _COMPRESSED_KEY not in packet:
+            out += root_bytes  # cheap path: cannot hold a marker
+            continue
+        new_packet, dropped = _strip_packet(packet)
+        if dropped:
+            total += dropped
+            out += P.encode_len_field(1, new_packet)  # Trace.packet (field 1 -> key 10)
+        else:
+            out += root_bytes
+    return bytes(out), total
 
 
 # --------------------------------------------------------------------------- #
@@ -261,9 +374,11 @@ def _sub_track_name(info: dict, hi: int, allocation_rank: int | None = None) -> 
     return f"[memory hook] h{hi}"
 
 def build_tracks(
-    trace_bytes: bytes, groups: list[tuple[str, dict]]
-) -> tuple[bytes, list[tuple[str, int, int]]]:
-    """Return (new_trace_bytes, [(track_name, n_slices, n_skipped_no_timing), ...]).
+    trace_bytes: bytes,
+    groups: list[tuple[str, dict]],
+    strip_markers: bool = True,
+) -> tuple[bytes, list[tuple[str, int, int]], int]:
+    """Return (new_trace_bytes, [(track_name, n_slices, n_skipped_no_timing), ...], n_stripped).
 
     groups 里每项是 (轨道名, hash_index -> 参数映射),各自生成一条独立的父轨道。
     多个 dump(峰值 dump / exit dump / 多进程)映射到同一份 trace 时用这个入口:
@@ -272,9 +387,17 @@ def build_tracks(
 
     时间戳解析与时钟对齐对整份 trace 只做一次,所有轨道共用;uuid / 排序序号在
     多个轨道间连续分配,避免碰撞。
+
+    `strip_markers`(默认 True)在时间戳解析之后、合并之前删掉逐分配的 memory_*
+    marker——它们已经被转成干净的 native 轨道,留着只会让 Perfetto 多排十几万条
+    async 轨道。见模块 docstring。
     """
     timings = extract_allocation_timings(trace_bytes)
     peak_snaps = extract_peak_snapshots(trace_bytes)
+    n_stripped = 0
+    if strip_markers:
+        # 顺序很重要:先取完时间戳再删,否则就没东西可配对了。
+        trace_bytes, n_stripped = strip_alloc_markers(trace_bytes)
     meta = P.analyze_trace(trace_bytes)
     seq = meta.overlay_sequence_id
     clk = meta.primary_clock_id
@@ -393,20 +516,24 @@ def build_tracks(
             order += 1
 
     new_bytes = P.merge_overlay_packets(trace_bytes, packets)
-    return new_bytes, stats
+    return new_bytes, stats, n_stripped
 
 
 def build_track(
-    trace_bytes: bytes, hash_map: dict, track_name: str = "Memory Top Allocations"
-) -> tuple[bytes, int, int]:
-    """Return (new_trace_bytes, n_slices, n_skipped_no_timing).
+    trace_bytes: bytes,
+    hash_map: dict,
+    track_name: str = "Memory Top Allocations",
+    strip_markers: bool = True,
+) -> tuple[bytes, int, int, int]:
+    """Return (new_trace_bytes, n_slices, n_skipped_no_timing, n_stripped).
 
     单轨道入口(build_tracks 的常用特例)。每个分配使用独立子 track(挂在父 track 下),
     避免重叠分配的 BEGIN/END 在栈式配对中交错导致生命周期错误。
     """
-    new_bytes, stats = build_tracks(trace_bytes, [(track_name, hash_map)])
+    new_bytes, stats, n_stripped = build_tracks(
+        trace_bytes, [(track_name, hash_map)], strip_markers=strip_markers)
     _, n_slices, skipped = stats[0]
-    return new_bytes, n_slices, skipped
+    return new_bytes, n_slices, skipped, n_stripped
 
 
 # --------------------------------------------------------------------------- #
@@ -429,6 +556,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--map", type=Path, default=None, help="hash_index -> info JSON (from process_memory_stack.py --export-hash-map). Defaults to <hook_root>/hash_index_map.json when omitted.")
     p.add_argument("--output", type=Path, help="Output path. Default <trace>.toptrack.<suffix>.")
     p.add_argument("--track-name", default="Memory Top Allocations", help="Name of the new track.")
+    p.add_argument(
+        "--keep-alloc-markers",
+        action="store_true",
+        help="Keep liballoc_hook's raw per-allocation memory_* trace_marker events in the "
+             "output. They are dropped by default: once this tool has turned them into the "
+             "native track they only cost size and force Perfetto to lay out one async track "
+             "per allocation (170k+ on a default BACKTRACE_MIN_SIZE run).",
+    )
     return p
 
 
@@ -458,14 +593,28 @@ def main(argv=None) -> int:
         print("Error: map JSON empty or unparseable.")
         return 1
     trace_bytes = args.trace.read_bytes()
-    new_bytes, n, skipped = build_track(trace_bytes, hash_map, args.track_name)
+    new_bytes, n, skipped, n_stripped = build_track(
+        trace_bytes, hash_map, args.track_name,
+        strip_markers=not args.keep_alloc_markers)
     out = args.output or default_output_path(args.trace)
     out.write_bytes(new_bytes)
     print(f"wrote {out}")
     print(f"  track            : {args.track_name!r}")
     print(f"  slices added     : {n}")
     print(f"  skipped (no ts)  : {skipped}")
+    if args.keep_alloc_markers:
+        print("  alloc markers    : kept (--keep-alloc-markers)")
+    else:
+        print(f"  alloc markers    : stripped {n_stripped}")
     print(f"  size {len(trace_bytes)} -> {len(new_bytes)} bytes")
+    if n == 0:
+        # Stripping is the default, so the most likely cause is being handed an output
+        # of a previous run. Say so instead of silently writing a trace with an empty track.
+        print(
+            "Warning: no allocation lifetimes matched. The input trace carries no "
+            "memory_* markers — either the run had MALLOC_HOOK_TRACE_ALLOC unset, or "
+            "this trace is already an output of this tool (markers are stripped by "
+            "default). Re-run against the original trace from the device.")
     return 0
 
 
