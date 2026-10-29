@@ -1794,7 +1794,7 @@ void PointerData::DumpPeakInfo() {
     // process's, and it reaches its exit (a dlclose) before the primary does. It
     // must stay silent rather than print a second, near-empty summary. See
     // observe_only::IsPrimary().
-    if (!observe_only::IsPrimary()) {
+    if (!observe_only::OwnsAutomaticReports()) {
         return;
     }
     // No tracker lock: every value printed here is an atomic counter. Taking

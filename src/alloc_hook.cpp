@@ -209,6 +209,20 @@ void* ResolveLibcSymbol(const char* name) {
     return addr;
 }
 
+using ForkFn = pid_t (*)();
+std::atomic<ForkFn> g_real_fork{nullptr};
+
+ForkFn RealForkFunction() {
+    ForkFn fn = g_real_fork.load(std::memory_order_acquire);
+    if (fn == nullptr) {
+        fn = reinterpret_cast<ForkFn>(ResolveLibcSymbol("fork"));
+        if (fn != nullptr) {
+            g_real_fork.store(fn, std::memory_order_release);
+        }
+    }
+    return fn;
+}
+
 void ResolveAllLibcAllocationSymbols() {
     RESOLVE(malloc);
     RESOLVE(free);
@@ -349,6 +363,40 @@ bool ShouldBypassLibcInternalMmap(const void* caller) {
     return g_libc_range.Valid() && g_libc_range.Contains(caller);
 }
 
+void DisableTrackingHeapTagging() {
+#if defined(MALLOC_HOOK_TARGET_OS_ANDROID)
+    // Raw-pointer tracking requires Bionic heap tagging off. Resolve dynamically
+    // because old releases lack mallopt and the NDK declaration is API-gated.
+    using MalloptFn = int (*)(int, int);
+    constexpr int kBionicSetHeapTaggingLevel = -204;
+    constexpr int kHeapTaggingLevelNone = 0;
+    auto mallopt = reinterpret_cast<MalloptFn>(ResolveLibcSymbol("mallopt"));
+    if (mallopt != nullptr &&
+        mallopt(kBionicSetHeapTaggingLevel, kHeapTaggingLevelNone) == 0) {
+        static constexpr char kMessage[] =
+                "alloc_hook: Bionic heap-tagging disable failed\n";
+        syscall(SYS_write, STDERR_FILENO, kMessage, sizeof(kMessage) - 1);
+    }
+#endif
+}
+
+void InitializeTargetScope() {
+    InitState state;
+    // Early tracking can precede Bionic's final tagging setup. Environment
+    // reallocation must use the same policy as those existing allocations.
+    if (g_debug != nullptr && observe_only::CurrentMode() == observe_only::kTrack) {
+        DisableTrackingHeapTagging();
+    }
+    // A preinit fork child must not enter dlsym while inheriting loader locks.
+    // Resolve every forwarding entry in the parent before libc runs callbacks.
+    ResolveAllLibcAllocationSymbols();
+    (void)RealForkFunction();
+    if (observe_only::InitializeTargetProcess() &&
+        observe_only::TargetProcessInitialized()) {
+        (void)observe_only::IsPrimary();
+    }
+}
+
 }  // namespace
 
 // Cleared by the constructor below, once the loader has finished with this
@@ -360,28 +408,14 @@ class AllocHook {
 public:
     AllocHook() {
         InitState state;
-#if defined(MALLOC_HOOK_TARGET_OS_ANDROID)
-        // Disable Bionic heap tagging process-wide: tagged pointers are
-        // incompatible with this interposer's raw-pointer bookkeeping.
-        // This trades allocator memory-tag diagnostics for hook correctness.
-        // Resolve mallopt at runtime: the symbol is absent from old Bionic
-        // releases and its declaration is gated by the compile-time API level.
-        using MalloptFn = int (*)(int, int);
-        constexpr int kBionicSetHeapTaggingLevel = -204;
-        constexpr int kHeapTaggingLevelNone = 0;
-        auto mallopt = reinterpret_cast<MalloptFn>(ResolveLibcSymbol("mallopt"));
-        if (mallopt != nullptr) {
-            if (mallopt(kBionicSetHeapTaggingLevel, kHeapTaggingLevelNone) == 0) {
-                static constexpr char kMessage[] =
-                        "alloc_hook: Bionic heap-tagging disable failed\n";
-                syscall(SYS_write, STDERR_FILENO, kMessage, sizeof(kMessage) - 1);
-            }
-        }
-#endif
+        DisableTrackingHeapTagging();
         ResolveAllLibcAllocationSymbols();
         void* ptr[2] = {&Db_storage, &Pd_storage};
         debug_initialize(ptr);
         CacheLibcRange();
+        if (!in_preinit_phase) {
+            debug_start_helper_threads();
+        }
     }
     ~AllocHook() { debug_finalize(); }
 
@@ -433,16 +467,11 @@ AllocHook& AllocHook::inst() {
 }
 
 __attribute__((constructor(201))) void mark_init_done() {
+    InitializeTargetScope();
     in_preinit_phase = false;
-    // Elect the process's primary copy here, at load, rather than at exit. A
-    // preloaded library's constructors run at process startup, before the app
-    // can dlopen this same file into a linker namespace, so the whole-life
-    // LD_PRELOAD copy stamps its pid first and every later namespace copy stays
-    // secondary. Deciding it at report time would be backwards: the namespace
-    // copy reports first (via its dlclose destructor) yet holds the near-empty
-    // numbers. See observe_only::IsPrimary(). Both the tracker's exit summary
-    // and the observe-only summary are gated on this.
-    (void)observe_only::IsPrimary();
+    if (!observe_only::IsTargetProcess()) {
+        return;
+    }
     // The loader is done with us, so pthread_create works from here on. If a
     // preinit allocation already built the tracker, this is where its threads
     // start; if not, AllocHook's constructor starts them itself.
@@ -485,6 +514,22 @@ __attribute__((destructor(201))) void report_observe_only_probe() {
 // so the gate sends the call straight to libc and the tracker is never
 // constructed at all. See ObserveOnlyProbe.h.
 extern "C" {
+pid_t fork() {
+    const int saved_errno = errno;
+    // Executable preinit callbacks run before this library's constructors.
+    // Publish scope before libc invokes any application child callbacks.
+    if (!observe_only::TargetProcessInitialized()) {
+        InitializeTargetScope();
+    }
+    ForkFn fn = RealForkFunction();
+    if (fn == nullptr) {
+        errno = ENOSYS;
+        return -1;
+    }
+    errno = saved_errno;
+    return fn();
+}
+
 // 程序初始化会间接调用 malloc 和 free
 void* malloc(size_t size) {
     RESOLVE(malloc);
@@ -676,6 +721,9 @@ void* mmap64(void* addr, size_t size, int prot, int flags, int fd, off_t offset)
 #endif
 
 void checkpoint(const char* file_name) {
+    if (observe_only::Suppressed()) {
+        return;
+    }
     // Observe-only runs have no live allocation table to report. Constructing the
     // tracker now to answer this would report the allocations that happen from
     // here on as if they were the process's, so the observed figures are written

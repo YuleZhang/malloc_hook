@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 
 #include "Config.h"
 #include "ObserveOnlyProbe.h"
@@ -17,6 +18,7 @@ extern "C" char** environ;
 namespace observe_only {
 
 std::atomic<int> g_mode{kUndecided};
+std::atomic<int> g_fork_depth{0};
 
 namespace {
 
@@ -27,6 +29,46 @@ namespace {
 std::atomic<int> g_primary{-1};
 
 constexpr char kPrimaryPidEnv[] = "ALLOC_HOOK_PRIMARY_PID";
+constexpr char kTargetPidEnv[] = "ALLOC_HOOK_TARGET_PID";
+std::atomic<pid_t> g_target_pid{0};
+std::atomic<bool> g_target_ready{false};
+std::atomic<bool> g_target_guarded{false};
+
+bool ParsePid(const char* text, pid_t* pid) {
+    if (text == nullptr || *text == '\0') {
+        return false;
+    }
+    pid_t value = 0;
+    for (const char* p = text; *p != '\0'; ++p) {
+        if (*p < '0' || *p > '9') {
+            return false;
+        }
+        const int digit = *p - '0';
+        if (value > (std::numeric_limits<pid_t>::max() - digit) / 10) {
+            return false;
+        }
+        value = value * 10 + digit;
+    }
+    if (value == 0) {
+        return false;
+    }
+    *pid = value;
+    return true;
+}
+
+pid_t TargetIdentity(pid_t self) {
+    const pid_t cached = g_target_pid.load(std::memory_order_relaxed);
+    if (cached != 0) {
+        return cached;
+    }
+    const char* stamped = getenv(kTargetPidEnv);
+    pid_t target = self;
+    if (stamped != nullptr && !ParsePid(stamped, &target)) {
+        target = -1;
+    }
+    g_target_pid.store(target, std::memory_order_relaxed);
+    return target;
+}
 
 // The pid stamped in ALLOC_HOOK_PRIMARY_PID, or -1 when unset or unparseable.
 long ReadStampedPrimaryPid() {
@@ -268,6 +310,99 @@ void WriteObservedSummary(int fd, const char* reason) {
     }
 }
 
+static void PrepareTargetFork() {
+    g_fork_depth.fetch_add(1, std::memory_order_relaxed);
+}
+
+static void FinishTargetForkInParent() {
+    g_fork_depth.fetch_sub(1, std::memory_order_relaxed);
+}
+
+bool InForkChild() {
+    const pid_t target = g_target_pid.load(std::memory_order_relaxed);
+    return target > 0 && target != getpid();
+}
+
+void SuppressAfterFork() {
+    g_mode.store(kSuppressed, std::memory_order_relaxed);
+    g_fork_depth.store(0, std::memory_order_relaxed);
+}
+
+bool TargetProcessInitialized() {
+    return g_target_ready.load(std::memory_order_acquire);
+}
+
+bool InitializeTargetProcess() {
+    if (TargetProcessInitialized()) {
+        return IsTargetProcess();
+    }
+    const int saved_errno = errno;
+    const pid_t pid = getpid();
+    pid_t target = TargetIdentity(pid);
+    // libc can publish environ only after executable preinit. Do not create a
+    // partial environment there: cache identity/guards now, publish at load.
+    const bool environment_ready = environ != nullptr;
+    const char* stamped = environment_ready ? getenv(kTargetPidEnv) : nullptr;
+    if (target > 0 && stamped != nullptr) {
+        pid_t published;
+        if (!ParsePid(stamped, &published) || published != target) {
+            target = -1;
+        }
+    }
+    if (target > 0 && environment_ready && stamped == nullptr) {
+        char buffer[32];
+        snprintf(buffer, sizeof(buffer), "%d", static_cast<int>(target));
+        if (setenv(kTargetPidEnv, buffer, 1) != 0) {
+            // Continuing without an inherited identity would let exec children
+            // become targets. Fail explicitly instead of silently widening scope.
+            static const char message[] =
+                    "alloc_hook: cannot publish target PID; refusing unscoped run\n";
+            const ssize_t written = write(STDERR_FILENO, message, sizeof(message) - 1);
+            (void)written;
+            _exit(EXIT_FAILURE);
+        }
+    }
+    // Every target copy needs its own cache switched in a fork child, including
+    // observe-only copies which never construct the allocation tracker.
+    if (target == pid && !g_target_guarded.load(std::memory_order_relaxed)) {
+        if (pthread_atfork(PrepareTargetFork, FinishTargetForkInParent, SuppressAfterFork) != 0) {
+            WriteLine(STDERR_FILENO,
+                      "alloc_hook: cannot install target fork guards; tracking disabled\n");
+            if (!environment_ready) {
+                _exit(EXIT_FAILURE);
+            }
+            target = -1;
+        } else {
+            g_target_guarded.store(true, std::memory_order_relaxed);
+        }
+    }
+    g_target_pid.store(target, std::memory_order_relaxed);
+    if (target != pid) {
+        SuppressAfterFork();
+    }
+    g_target_ready.store(environment_ready || target < 0, std::memory_order_release);
+    errno = saved_errno;
+    return target == pid;
+}
+
+bool IsTargetProcess() {
+    if (Suppressed()) {
+        return false;
+    }
+    const pid_t target = g_target_pid.load(std::memory_order_relaxed);
+    // Before constructor-time publication, mode resolution already rejects
+    // inherited target markers without requiring a tracker or helper thread.
+    return target == 0 || target == getpid();
+}
+
+bool OwnsAutomaticReports() { return IsTargetProcess() && IsPrimary(); }
+
+bool IsSecondaryCopy() {
+    const int known = g_primary.load(std::memory_order_acquire);
+    return known == 0 ||
+           (known < 0 && ReadStampedPrimaryPid() == static_cast<long>(getpid()));
+}
+
 int ResolveMode() {
     // The loader publishes `environ` before it runs any constructor, but an
     // allocation can reach this earlier still. Staying undecided costs one
@@ -282,13 +417,19 @@ int ResolveMode() {
     // perror() would otherwise report this getenv's errno instead of its own.
     const int saved_errno = errno;
     unsigned interval_ms = 0;
-    const int mode = Config::ObserveOnlyRequested(&interval_ms) ? kBypass : kTrack;
+    const pid_t pid = getpid();
+    const int mode = TargetIdentity(pid) != pid
+            ? kSuppressed
+            : (Config::ObserveOnlyRequested(&interval_ms) ? kBypass : kTrack);
     g_mode.store(mode, std::memory_order_relaxed);
     errno = saved_errno;
     return mode;
 }
 
 bool IsPrimary() {
+    if (environ == nullptr) {
+        return false;
+    }
     const int known = g_primary.load(std::memory_order_acquire);
     if (known >= 0) {
         return known == 1;
@@ -323,7 +464,7 @@ bool IsPrimary() {
 
 bool StartProbe() {
     unsigned interval_ms = 0;
-    if (!Bypassed() || !Config::ObserveOnlyRequested(&interval_ms)) {
+    if (CurrentMode() != kBypass || !Config::ObserveOnlyRequested(&interval_ms)) {
         return false;
     }
     // Only the primary copy of this library runs the sampler and registers the
@@ -331,7 +472,7 @@ bool StartProbe() {
     // linker namespace an app dlopen created -- would otherwise sample its own
     // near-empty namespace and print a second, misleading summary. See
     // IsPrimary().
-    if (!IsPrimary()) {
+    if (!OwnsAutomaticReports()) {
         return false;
     }
     g_probe_pid = getpid();
@@ -372,7 +513,7 @@ bool StartProbe() {
 }
 
 void ReportAtExit() {
-    if (g_probe_pid == 0 || getpid() != g_probe_pid) {
+    if (!IsTargetProcess() || g_probe_pid == 0 || getpid() != g_probe_pid) {
         // Either the probe never started here, or this is a fork child: it
         // inherited this handler but not the sampler thread, so the figures it
         // would print are the parent's.
@@ -387,6 +528,9 @@ void ReportAtExit() {
 }
 
 bool WriteReport(const char* file_name) {
+    if (Suppressed()) {
+        return false;
+    }
     if (file_name == nullptr) {
         WriteObservedBlock(STDERR_FILENO, "checkpoint", false);
         return true;
