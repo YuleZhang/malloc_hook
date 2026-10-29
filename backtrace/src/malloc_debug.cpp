@@ -87,6 +87,7 @@ static int g_signal_pipe[2] = {-1, -1};
 static pthread_t g_signal_thread;
 static bool g_signal_thread_started = false;
 static bool g_signal_debug_enabled = false;
+static pid_t g_signal_owner_pid = 0;
 static bool SignalDebugEnabled() {
     return g_signal_debug_enabled;
 }
@@ -171,6 +172,13 @@ static bool ShouldTrackAllocation(
 }
 
 static void singal_dump_heap(int) {
+    // A child can run application callbacks before our suppression callback.
+    // getpid() is async-signal-safe and also rejects that early fork window.
+    if (getpid() != g_signal_owner_pid ||
+        observe_only::g_mode.load(std::memory_order_relaxed) ==
+                observe_only::kSuppressed) {
+        return;
+    }
     if (g_signal_pipe[1] != -1) {
         const char command = 'd';
         ssize_t bytes = write(g_signal_pipe[1], &command, sizeof(command));
@@ -283,7 +291,7 @@ static void StartObservedPeakSampler() {
     // otherwise run a second /proc sampler and, at its own teardown, print a
     // second summary describing only its near-empty namespace. See
     // observe_only::IsPrimary().
-    if (!observe_only::IsPrimary()) {
+    if (!observe_only::OwnsAutomaticReports()) {
         return;
     }
     if (!(g_debug->config().options() & RECORD_MEMORY_PEAK)) {
@@ -346,10 +354,9 @@ static void HookAtForkChild() {
         g_debug->pointer->UnlockAfterFork();
     }
     ScopedConcurrentLock::ReinitAfterForkInChild();
-    // Both helper threads are gone. Clearing their bookkeeping keeps the child
-    // from joining thread ids that were never valid in this process; the child
-    // keeps accounting allocations, it just has no signal dump or sampler until
-    // something restarts them.
+    // Both helper threads are gone. The child no longer tracks allocations or
+    // reports the inherited parent table; its libc operations remain usable.
+    observe_only::SuppressAfterFork();
     g_signal_thread_started = false;
     ObservedPeakSamplerInstance().ResetAfterForkInChild();
 }
@@ -381,10 +388,12 @@ bool debug_initialize(void* init_space[]) {
     // there is no window in which a fork could find a half-built barrier.
     RegisterForkHandlers();
 
-    if (g_debug->config().options() & DUMP_ON_SINGAL) {
+    if ((g_debug->config().options() & DUMP_ON_SINGAL) &&
+        !observe_only::Suppressed() && !observe_only::IsSecondaryCopy()) {
         if (!PrepareSignalDumpChannel()) {
             return false;
         }
+        g_signal_owner_pid = getpid();
         struct sigaction enable_act = {};
         enable_act.sa_handler = singal_dump_heap;
         sigemptyset(&enable_act.sa_mask);
@@ -415,7 +424,7 @@ bool debug_initialize(void* init_space[]) {
 // calls it directly when initialization happens after that point. Idempotent
 // because both paths can fire in either order.
 void debug_start_helper_threads() {
-    if (g_debug == nullptr) {
+    if (g_debug == nullptr || !observe_only::OwnsAutomaticReports()) {
         return;
     }
     static bool started = false;
@@ -437,7 +446,7 @@ void debug_start_helper_threads() {
 }
 
 void debug_finalize() {
-    if (g_debug == nullptr) {
+    if (g_debug == nullptr || !observe_only::IsTargetProcess()) {
         return;
     }
 
@@ -454,7 +463,8 @@ void debug_finalize() {
     // Turn off capturing allocations calls.
     DebugDisableSet(true);
 
-    if ((g_debug->config().options() & BACKTRACE) &&
+    const bool automatic_reports = observe_only::OwnsAutomaticReports();
+    if (automatic_reports && (g_debug->config().options() & BACKTRACE) &&
         g_debug->config().backtrace_dump_on_exit()) {
         char file_name[512];
         // The PID is part of the name so a report can be tied back to the
@@ -467,7 +477,7 @@ void debug_finalize() {
     }
 
     // Climb mode: one report per DUMP_PEAK_STEP_MB rung (…step.<MB>MB.txt).
-    if (g_debug->TrackPointers()) {
+    if (automatic_reports && g_debug->TrackPointers()) {
         g_debug->pointer->DumpStepReports(g_debug->config().backtrace_dump_prefix());
     }
 
@@ -481,6 +491,9 @@ void debug_finalize() {
 }
 
 void debug_dump_heap(const char* file_name) {
+    if (!observe_only::IsTargetProcess()) {
+        return;
+    }
     ScopedConcurrentLock lock;
     DumpHeapToFileUnlocked(file_name, false);
 }

@@ -26,6 +26,7 @@ set(COMMON_EXPORTS
     checkpoint
     close
     free
+    fork
     ioctl
     malloc
     memalign

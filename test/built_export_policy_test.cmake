@@ -33,6 +33,7 @@ set(EXPECTED_EXPORTS
     calloc
     checkpoint
     free
+    fork
     malloc
     memalign
     posix_memalign

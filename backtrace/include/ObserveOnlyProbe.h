@@ -44,11 +44,15 @@ enum Mode : int {
     kBypass = 1,
     // Normal tracking.
     kTrack = 2,
+    // Descendant process: no tracking, sampling, helpers, or reports.
+    kSuppressed = 3,
 };
 
-// Latched once per process. Public so the gate below can inline its fast path
-// into the interposers.
+// Latched per process; a fork child switches to suppressed before returning.
+// Public so the gate below can inline its fast path into the interposers.
 extern std::atomic<int> g_mode;
+extern std::atomic<int> g_fork_depth;
+bool InForkChild();
 
 // Reads the environment and latches the answer, returning the resolved mode.
 // Returns kUndecided without latching when the environment is not readable yet,
@@ -56,14 +60,38 @@ extern std::atomic<int> g_mode;
 // this process's mode from an empty one.
 int ResolveMode();
 
-// The interposition gate: one relaxed load once the mode is latched.
-inline bool Bypassed() {
+// The interposition gate: cached atomic reads on the normal allocation path.
+inline int CurrentMode() {
+    // Child callbacks registered by the application can precede ours. Only the
+    // cold fork window needs a PID check; normal allocations read cached state.
+    if (__builtin_expect(g_fork_depth.load(std::memory_order_relaxed) != 0, 0) &&
+        InForkChild()) {
+        return kSuppressed;
+    }
     const int mode = g_mode.load(std::memory_order_relaxed);
     if (__builtin_expect(mode == kUndecided, 0)) {
-        return ResolveMode() == kBypass;
+        return ResolveMode();
     }
-    return mode == kBypass;
+    return mode;
 }
+
+inline bool Bypassed() {
+    const int mode = CurrentMode();
+    return mode == kBypass || mode == kSuppressed;
+}
+
+inline bool Suppressed() { return CurrentMode() == kSuppressed; }
+
+// Called under the adapter's initialization guard before helper startup. The
+// inherited target PID is never replaced by descendants.
+bool InitializeTargetProcess();
+bool TargetProcessInitialized();
+bool IsTargetProcess();
+bool OwnsAutomaticReports();
+// Read-only before constructor election; never publishes an environment stamp.
+bool IsSecondaryCopy();
+// Lock-free child-side state transition, also used by the tracker's fork handler.
+void SuppressAfterFork();
 
 // Starts the footprint sampler with no tracker attached, and returns whether
 // this process is now running as an observe-only probe. A no-op returning false
@@ -123,8 +151,8 @@ void WriteObservedSummary(int fd, const char* reason);
 // library's constructors run at process startup, strictly before the app can
 // dlopen anything into a new namespace, the whole-life LD_PRELOAD copy always
 // wins and every later namespace copy sees its own pid already stamped and
-// stays secondary. Pid-stamped rather than a bare flag so a fork child, which
-// inherits the parent's environ, re-elects a primary under its own pid.
+// stays secondary. This election only coordinates copies within a PID;
+// ALLOC_HOOK_TARGET_PID separately suppresses inherited descendant processes.
 //
 // Idempotent and thread-safe within a copy: the decision is latched the first
 // time it is asked for. Both exit summaries -- the observe-only "Memory Usage

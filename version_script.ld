@@ -5,6 +5,7 @@
 global:
     malloc;
     free;
+    fork;
     calloc;
     realloc;
     aligned_alloc;

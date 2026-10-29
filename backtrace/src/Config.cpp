@@ -95,7 +95,9 @@ static const char kAllocHookEnvManifest[] =
         "match) when ALLOC_HOOK_PEAK_SAMPLE_MS is unset; a host framework's own "
         "knob.\n"
         "  (internal) ALLOC_HOOK_PRIMARY_PID  cross-copy report election, set by "
-        "the library itself -- not a user knob.\n";
+        "the library itself -- not a user knob.\n"
+        "  (internal) ALLOC_HOOK_TARGET_PID  target process identity, inherited by "
+        "descendants to bypass tracking, sampling, and reports -- not a user knob.\n";
 
 static int DefaultBacktraceSignal() {
 #if defined(__BIONIC__)
