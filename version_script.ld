@@ -16,6 +16,11 @@ global:
     mremap;
     ioctl;
     close;
+    dup;
+    dup2;
+    dup3;
+    fcntl;
+    fcntl64;
     mmap64;
     checkpoint;
 

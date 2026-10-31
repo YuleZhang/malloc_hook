@@ -2,6 +2,7 @@
 
 #include <sys/types.h>
 #include <cstddef>
+#include <cstdint>
 
 bool debug_initialize(void* init_space[]);
 // Starts the hook's helper threads. Separate from debug_initialize() because
@@ -23,5 +24,16 @@ int debug_munmap(void* addr, size_t size);
 void* debug_mremap(void* old_addr, size_t old_size, size_t new_size,
                    int flags, void* new_addr);
 int debug_ioctl(int fd, unsigned long request, void* arg);
+using DebugCloseOperation = int (*)(int fd, void* context);
+int debug_close_with(int fd, DebugCloseOperation operation, void* context);
 int debug_close(int fd);
+int debug_dup(int old_fd);
+int debug_dup2(int old_fd, int new_fd);
+int debug_dup3(int old_fd, int new_fd, int flags);
+using DebugFcntlOperation =
+        int (*)(int fd, int command, uintptr_t argument, void* context);
+int debug_fcntl_with(
+        int fd, int command, uintptr_t argument, DebugFcntlOperation operation,
+        void* context);
+int debug_fcntl(int fd, int command, uintptr_t argument);
 void* debug_mmap64(void* addr, size_t size, int prot, int flags, int fd, off_t offset);

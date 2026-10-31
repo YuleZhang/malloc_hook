@@ -25,6 +25,10 @@ set(COMMON_EXPORTS
     calloc
     checkpoint
     close
+    dup
+    dup2
+    dup3
+    fcntl
     free
     fork
     ioctl
@@ -71,6 +75,8 @@ set(CPP_EXPORTS
     _ZnwjSt11align_val_tRKSt9nothrow_t)
 
 set(ALL_FIXTURE_SYMBOLS ${COMMON_EXPORTS} ${CPP_EXPORTS}
+    android_fdsan_close_with_tag
+    fcntl64
     helper_private
     _ZN11unwindstack12HiddenSymbolEv
     _ZN7android4base12HiddenSymbolEv
@@ -88,7 +94,7 @@ foreach(SYMBOL IN LISTS ALL_FIXTURE_SYMBOLS)
     "extern \"C\" void fixture_${SYMBOL_INDEX}() {}\n")
 endforeach()
 
-function(verify_policy COMPILER POLICY SCRIPT EXPECT_CPP EXPECT_MMAP)
+function(verify_policy COMPILER POLICY SCRIPT EXPECT_CPP EXPECT_MMAP EXPECT_FDSAN EXPECT_FCNTL64)
   get_filename_component(COMPILER_NAME "${COMPILER}" NAME)
   set(OUTPUT_DIR "${TEST_BINARY_DIR}/${COMPILER_NAME}-${POLICY}")
   file(MAKE_DIRECTORY "${OUTPUT_DIR}")
@@ -130,6 +136,12 @@ function(verify_policy COMPILER POLICY SCRIPT EXPECT_CPP EXPECT_MMAP)
   if(NOT EXPECT_MMAP)
     list(REMOVE_ITEM EXPECTED_EXPORTS mmap mmap64 mremap munmap)
   endif()
+  if(EXPECT_FDSAN)
+    list(APPEND EXPECTED_EXPORTS android_fdsan_close_with_tag)
+  endif()
+  if(EXPECT_FCNTL64)
+    list(APPEND EXPECTED_EXPORTS fcntl64)
+  endif()
   if(EXPECT_CPP)
     list(APPEND EXPECTED_EXPORTS ${CPP_EXPORTS})
   endif()
@@ -158,9 +170,9 @@ foreach(COMPILER IN LISTS COMPILERS)
   # export, mmap family included. The OHOS default of *not* exporting mmap is
   # produced by the CMake strip pass (ENABLE_MMAP_HOOK_EXPORT=OFF), and is
   # verified end to end against the built library by built_platform_export_policy.
-  verify_policy("${COMPILER}" android version_script.ld FALSE TRUE)
-  verify_policy("${COMPILER}" linux version_script.ld FALSE TRUE)
-  verify_policy("${COMPILER}" ohos version_script_ohos.ld TRUE TRUE)
+  verify_policy("${COMPILER}" android version_script_android.ld FALSE TRUE TRUE FALSE)
+  verify_policy("${COMPILER}" linux version_script.ld FALSE TRUE FALSE TRUE)
+  verify_policy("${COMPILER}" ohos version_script_ohos.ld TRUE TRUE FALSE FALSE)
 endforeach()
 
 message(STATUS "Verified platform export policies with: ${COMPILERS}")

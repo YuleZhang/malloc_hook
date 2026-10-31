@@ -170,7 +170,7 @@ if(MALLOC_HOOK_TARGET_OS STREQUAL "android")
   set(MALLOC_HOOK_EXPORT_POLICY android)
   set(MALLOC_HOOK_EXPORT_RESOURCE_HOOKS 1)
   set(MALLOC_HOOK_EXPORT_CPP_NEW_HOOK 0)
-  set(VERSION_SCRIPT ${CMAKE_SOURCE_DIR}/version_script.ld)
+  set(VERSION_SCRIPT ${CMAKE_SOURCE_DIR}/version_script_android.ld)
 elseif(MALLOC_HOOK_TARGET_OS STREQUAL "linux")
   set(MALLOC_HOOK_EXPORT_POLICY linux)
   set(MALLOC_HOOK_EXPORT_RESOURCE_HOOKS 1)
@@ -192,12 +192,14 @@ endif()
 
 # The selected version script lists every hook this project can export. Symbols
 # for a capability that is off in this build are stripped here so the linker is
-# never asked to export a hook that was not compiled in: ioctl/close when
-# resource tracking is off (host smoke builds), and the mmap family when mmap
-# export is off (OHOS default, or an explicit opt-out on any platform).
+# never asked to export a hook that was not compiled in: resource/fd lifecycle
+# hooks when resource tracking is off, and the mmap family when mmap export is
+# off (OHOS default, or an explicit opt-out on any platform).
 set(_malloc_hook_strip_symbols "")
 if(NOT MALLOC_HOOK_EXPORT_RESOURCE_HOOKS)
-  list(APPEND _malloc_hook_strip_symbols "ioctl" "close")
+  list(APPEND _malloc_hook_strip_symbols
+       "ioctl" "close" "dup" "dup2" "dup3" "fcntl" "fcntl64"
+       "android_fdsan_close_with_tag")
 endif()
 if(NOT MALLOC_HOOK_EXPORT_MMAP_HOOK)
   list(APPEND _malloc_hook_strip_symbols "mmap" "mmap64" "munmap" "mremap")
@@ -364,6 +366,18 @@ if(BUILD_TESTING)
       "-DREPO_ROOT=${CMAKE_SOURCE_DIR}"
       "-DTEST_BINARY_DIR=${CMAKE_BINARY_DIR}/platform_export_policy"
       -P ${CMAKE_SOURCE_DIR}/test/platform_export_policy_test.cmake)
+  if(MALLOC_HOOK_TARGET_OS STREQUAL "android" AND
+     MALLOC_HOOK_EXPORT_RESOURCE_HOOKS)
+    set(_malloc_hook_expect_fdsan 1)
+  else()
+    set(_malloc_hook_expect_fdsan 0)
+  endif()
+  if(MALLOC_HOOK_TARGET_OS STREQUAL "linux" AND
+     MALLOC_HOOK_EXPORT_RESOURCE_HOOKS)
+    set(_malloc_hook_expect_fcntl64 1)
+  else()
+    set(_malloc_hook_expect_fcntl64 0)
+  endif()
   add_test(
     NAME built_platform_export_policy
     COMMAND ${CMAKE_COMMAND}
@@ -371,6 +385,8 @@ if(BUILD_TESTING)
       "-DEXPECT_MMAP=${MALLOC_HOOK_EXPORT_MMAP_HOOK}"
       "-DEXPECT_RESOURCE=${MALLOC_HOOK_EXPORT_RESOURCE_HOOKS}"
       "-DEXPECT_CPP=${MALLOC_HOOK_EXPORT_CPP_NEW_HOOK}"
+      "-DEXPECT_FDSAN=${_malloc_hook_expect_fdsan}"
+      "-DEXPECT_FCNTL64=${_malloc_hook_expect_fcntl64}"
       -P ${CMAKE_SOURCE_DIR}/test/built_export_policy_test.cmake)
   add_test(
     NAME fast_capture_boundary_compile

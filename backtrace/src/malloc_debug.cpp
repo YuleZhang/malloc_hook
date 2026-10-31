@@ -1,14 +1,15 @@
-#include <signal.h>
-#include <fcntl.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <limits.h>
+#include <signal.h>
 #include <sys/mman.h>
 #include <sys/param.h>  // powerof2 ---> ((((x) - 1) & (x)) == 0)
-#include <unistd.h>
 #include <sys/stat.h>
-#include <cstring>
-#include <cstdlib>
+#include <unistd.h>
+#include <atomic>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -23,6 +24,7 @@
 #include "AsyncStackPipeline.h"
 #include "Config.h"
 #include "DebugData.h"
+#include "DmaLifecycle.h"
 #include "HookSourcePolicy.h"
 #include "ObserveOnlyProbe.h"
 #include "ObservedMemory.h"
@@ -82,6 +84,11 @@ private:
 pthread_rwlock_t ScopedConcurrentLock::lock_;
 
 DebugData* g_debug;
+static std::mutex mapping_operation_mutex;
+
+#if MALLOC_HOOK_ENABLE_DMA_CAPTURE
+static void ResetDmaLifecycleAfterForkInChild();
+#endif
 
 static int g_signal_pipe[2] = {-1, -1};
 static pthread_t g_signal_thread;
@@ -354,6 +361,9 @@ static void HookAtForkChild() {
         g_debug->pointer->UnlockAfterFork();
     }
     ScopedConcurrentLock::ReinitAfterForkInChild();
+#if MALLOC_HOOK_ENABLE_DMA_CAPTURE
+    ResetDmaLifecycleAfterForkInChild();
+#endif
     // Both helper threads are gone. The child no longer tracks allocations or
     // reports the inherited parent table; its libc operations remain usable.
     observe_only::SuppressAfterFork();
@@ -759,14 +769,44 @@ struct PendingIonAllocation {
     size_t size = 0;
 };
 
-struct DmaFdInfo {
-    size_t size = 0;
-    bool tracked = false;
+class PointerSink final : public dma_lifecycle::Sink {
+public:
+    void Track(const void* token, size_t size) override {
+        if (g_debug != nullptr && g_debug->TrackPointers()) {
+            g_debug->pointer->Add(token, size, size, DMA);
+        }
+    }
+
+    void Resize(const void* token, size_t size) override {
+        if (g_debug != nullptr && g_debug->TrackPointers()) {
+            g_debug->pointer->Remap(token, token, size);
+        }
+    }
+
+    void Release(const void* token) override {
+        if (g_debug != nullptr && g_debug->TrackPointers()) {
+            g_debug->pointer->Remove(token);
+        }
+    }
 };
 
-static std::mutex state_mutex;
+struct DmaDescriptor {
+    size_t size = 0;
+    dma_lifecycle::Identity identity;
+};
+
+static PointerSink pointer_sink;
+static dma_lifecycle::Tracker lifecycle(pointer_sink);
+static std::atomic<bool> lifecycle_ready{false};
+static_assert(
+        std::atomic<bool>::is_always_lock_free,
+        "fork-child lifecycle readiness must be async-signal-safe");
+struct LifecycleReadyMarker {
+    LifecycleReadyMarker() { lifecycle_ready.store(true, std::memory_order_release); }
+};
+static LifecycleReadyMarker lifecycle_ready_marker;
+static std::mutex ion_state_mutex;
 static std::unordered_map<uint64_t, PendingIonAllocation> pending_ion_allocations;
-static std::unordered_map<int, DmaFdInfo> dma_fds;
 
 static uint64_t IonHandleKey(int ion_fd, ion_user_handle_t handle) {
     return (static_cast<uint64_t>(static_cast<uint32_t>(ion_fd)) << 32) |
@@ -794,65 +834,16 @@ static bool IsIonFree(unsigned long request) {
     return IsIonRequest(request, 1, sizeof(struct ion_handle_data));
 }
 
-static void ForgetDmaFd(int fd) {
-    std::lock_guard<std::mutex> guard(state_mutex);
-    dma_fds.erase(fd);
-}
-
-static bool RegisterDmaFd(int fd, size_t size, bool* should_track) {
-    if (fd < 0 || size == 0) {
-        return false;
-    }
-    std::lock_guard<std::mutex> guard(state_mutex);
-    auto [entry, inserted] = dma_fds.emplace(fd, DmaFdInfo{size, false});
-    *should_track = inserted || !entry->second.tracked;
-    entry->second.size = size;
-    return true;
-}
-
-static bool LookupDmaFd(int fd, size_t* size, bool* tracked = nullptr) {
-    std::lock_guard<std::mutex> guard(state_mutex);
-    auto entry = dma_fds.find(fd);
-    if (entry == dma_fds.end()) {
-        return false;
-    }
-    *size = entry->second.size;
-    if (tracked != nullptr) {
-        *tracked = entry->second.tracked;
-    }
-    return true;
-}
-
-static void MarkDmaFdTracked(int fd) {
-    std::lock_guard<std::mutex> guard(state_mutex);
-    auto entry = dma_fds.find(fd);
-    if (entry != dma_fds.end()) {
-        entry->second.tracked = true;
-    }
-}
-
-static bool TakeDmaFd(int fd, size_t* size, bool* tracked) {
-    std::lock_guard<std::mutex> guard(state_mutex);
-    auto entry = dma_fds.find(fd);
-    if (entry == dma_fds.end()) {
-        return false;
-    }
-    *size = entry->second.size;
-    *tracked = entry->second.tracked;
-    dma_fds.erase(entry);
-    return true;
-}
-
 static void RecordIonAllocation(int ion_fd, ion_user_handle_t handle, size_t size) {
     if (size == 0) {
         return;
     }
-    std::lock_guard<std::mutex> guard(state_mutex);
+    std::lock_guard<std::mutex> guard(ion_state_mutex);
     pending_ion_allocations[IonHandleKey(ion_fd, handle)] = PendingIonAllocation{size};
 }
 
 static size_t LookupIonAllocation(int ion_fd, ion_user_handle_t handle) {
-    std::lock_guard<std::mutex> guard(state_mutex);
+    std::lock_guard<std::mutex> guard(ion_state_mutex);
     auto key = IonHandleKey(ion_fd, handle);
     auto entry = pending_ion_allocations.find(key);
     if (entry == pending_ion_allocations.end()) {
@@ -862,12 +853,12 @@ static size_t LookupIonAllocation(int ion_fd, ion_user_handle_t handle) {
 }
 
 static void DropIonAllocation(int ion_fd, ion_user_handle_t handle) {
-    std::lock_guard<std::mutex> guard(state_mutex);
+    std::lock_guard<std::mutex> guard(ion_state_mutex);
     pending_ion_allocations.erase(IonHandleKey(ion_fd, handle));
 }
 
 static void DropIonAllocationsForFd(int ion_fd) {
-    std::lock_guard<std::mutex> guard(state_mutex);
+    std::lock_guard<std::mutex> guard(ion_state_mutex);
     const uint32_t fd_key = static_cast<uint32_t>(ion_fd);
     for (auto entry = pending_ion_allocations.begin();
          entry != pending_ion_allocations.end();) {
@@ -879,32 +870,61 @@ static void DropIonAllocationsForFd(int ion_fd) {
     }
 }
 
-static bool is_dma_buf(int fd, size_t* size) {
-    if (LookupDmaFd(fd, size)) {
-        return true;
+static dma_lifecycle::Identity IdentityForFd(int fd) {
+    struct stat status = {};
+    if (fd < 0 || fstat(fd, &status) != 0) {
+        return {};
     }
+    return dma_lifecycle::Identity{
+            static_cast<uint64_t>(status.st_dev), static_cast<uint64_t>(status.st_ino)};
+}
+
+static bool FdLinkNamesDmaBuf(int fd) {
+    char path[64];
+    char target[PATH_MAX];
+    const int path_length = snprintf(path, sizeof(path), "/proc/self/fd/%d", fd);
+    if (path_length <= 0 || static_cast<size_t>(path_length) >= sizeof(path)) {
+        return false;
+    }
+    const ssize_t length = readlink(path, target, sizeof(target) - 1);
+    if (length <= 0) {
+        return false;
+    }
+    target[length] = '\0';
+    return strncmp(target, "/dmabuf", 7) == 0 ||
+           strncmp(target, "anon_inode:dmabuf", 17) == 0;
+}
+
+static size_t FdReportedSize(int fd) {
+    struct stat status = {};
+    return fstat(fd, &status) == 0 && status.st_size > 0
+                 ? static_cast<size_t>(status.st_size)
+                 : 0;
+}
+
+static bool QueryDmaBufRaw(int fd, DmaDescriptor* descriptor) {
+    descriptor->size = FdReportedSize(fd);
+    descriptor->identity = IdentityForFd(fd);
+    bool is_dmabuf_file = FdLinkNamesDmaBuf(fd);
     std::string fdinfo = "/proc/self/fdinfo/" + std::to_string(fd);
     auto fp = std::unique_ptr<FILE, decltype(&fclose)>{fopen(fdinfo.c_str(), "re"), fclose};
     if (fp == nullptr) {
-        return false;
+        return is_dmabuf_file && descriptor->size != 0;
     }
 
-    bool is_dmabuf_file = false;
-    uint64_t inode = -1;
+    uint64_t fdinfo_inode = 0;
     char* line = nullptr;
     size_t len = 0;
     while (getline(&line, &len, fp.get()) > 0) {
         switch (line[0]) {
             case 'i':
                 if (strncmp(line, "ino:", 4) == 0) {
-                    char* c = line + 4;
-                    inode = strtoull(c, nullptr, 10);
+                    fdinfo_inode = strtoull(line + 4, nullptr, 10);
                 }
                 break;
             case 's':
                 if (strncmp(line, "size:", 5) == 0) {
-                    char* c = line + 5;
-                    *size = strtoull(c, nullptr, 10);
+                    descriptor->size = strtoull(line + 5, nullptr, 10);
                 }
                 break;
             case 'e':
@@ -918,22 +938,37 @@ static bool is_dma_buf(int fd, size_t* size) {
     }
     m_sys_free(line);
 
-    if (!is_dmabuf_file) {
+    if (!descriptor->identity.valid() && fdinfo_inode != 0) {
+        descriptor->identity.inode = fdinfo_inode;
+    }
+    if (!is_dmabuf_file || descriptor->size == 0) {
         return false;
     }
+    return true;
+}
 
-    if (inode == static_cast<uint64_t>(-1)) {
-        // Fallback to stat() on the fd path to get inode number
-        std::string fd_path = "/proc/self/fd/" + std::to_string(fd);
-
-        struct stat sb;
-        if (stat(fd_path.c_str(), &sb) < 0) {
-            return false;
-        }
-        inode = sb.st_ino;
+static bool QueryDmaBuf(int fd, DmaDescriptor* descriptor) {
+    const dma_lifecycle::Identity current_identity = IdentityForFd(fd);
+    dma_lifecycle::Identity known_identity;
+    size_t known_size = 0;
+    if (lifecycle.LookupFd(fd, &known_size, &known_identity) &&
+        current_identity.valid() && known_identity == current_identity) {
+        descriptor->size = known_size;
+        descriptor->identity = known_identity;
+        return true;
     }
+    return QueryDmaBufRaw(fd, descriptor);
+}
 
-    return *size > 0;
+static bool DescribeDmaFdRaw(
+        int fd, size_t* object_size, dma_lifecycle::Identity* identity) {
+    DmaDescriptor descriptor;
+    if (!QueryDmaBufRaw(fd, &descriptor)) {
+        return false;
+    }
+    *object_size = descriptor.size;
+    *identity = descriptor.identity;
+    return true;
 }
 
 static void IonPathLog(const char* tag, unsigned long request, size_t sz) {
@@ -985,8 +1020,13 @@ static bool handle_dma_node(unsigned long request, void* arg, int* fd, size_t* s
                 }
                 struct CAM_MEM_DEV_ION_NODE_STRUCT* heap = (struct CAM_MEM_DEV_ION_NODE_STRUCT*)arg;
                 *fd = heap->memID;
-            }
-            return is_dma_buf(*fd, size);
+                DmaDescriptor descriptor;
+                if (!QueryDmaBuf(*fd, &descriptor)) {
+                    return false;
+                }
+                *size = descriptor.size;
+                return true;
+        }
         default:
             return false;
     }
@@ -1027,25 +1067,61 @@ static bool HandleIonIoctl(
     return false;
 }
 
-static bool ShouldTrackDmaMapping(int fd, int flags, size_t* size) {
-    if (fd < 0 || !(flags & MAP_SHARED)) {
-        return false;
-    }
-    bool tracked = false;
-    if (LookupDmaFd(fd, size, &tracked)) {
-        return !tracked;
-    }
-    if (!is_dma_buf(fd, size)) {
-        return false;
-    }
-    bool should_track = false;
-    return RegisterDmaFd(fd, *size, &should_track) && should_track;
-}
-
 }  // namespace DMA_BUF
+
+static void ResetDmaLifecycleAfterForkInChild() {
+    if (DMA_BUF::lifecycle_ready.exchange(false, std::memory_order_acq_rel)) {
+        DMA_BUF::lifecycle.ResetAfterForkInChild();
+    }
+}
 #endif
 
-static void* CallMmap(void* addr, size_t size, int prot, int flags, int fd, off_t offset) {
+static int CallDup(int old_fd) {
+    if (m_sys_dup != nullptr) {
+        return m_sys_dup(old_fd);
+    }
+#if defined(SYS_dup)
+    return static_cast<int>(syscall(SYS_dup, old_fd));
+#else
+    return static_cast<int>(syscall(SYS_fcntl, old_fd, F_DUPFD, 0));
+#endif
+}
+
+static int CallDup2(int old_fd, int new_fd) {
+    if (m_sys_dup2 != nullptr) {
+        return m_sys_dup2(old_fd, new_fd);
+    }
+#if defined(SYS_dup2)
+    return static_cast<int>(syscall(SYS_dup2, old_fd, new_fd));
+#elif defined(SYS_dup3)
+    return static_cast<int>(syscall(SYS_dup3, old_fd, new_fd, 0));
+#else
+    errno = ENOSYS;
+    return -1;
+#endif
+}
+
+static int CallDup3(int old_fd, int new_fd, int flags) {
+    if (m_sys_dup3 != nullptr) {
+        return m_sys_dup3(old_fd, new_fd, flags);
+    }
+#if defined(SYS_dup3)
+    return static_cast<int>(syscall(SYS_dup3, old_fd, new_fd, flags));
+#else
+    errno = ENOSYS;
+    return -1;
+#endif
+}
+
+static int CallFcntl(int fd, int command, uintptr_t argument) {
+    if (m_sys_fcntl != nullptr) {
+        return m_sys_fcntl(fd, command, argument);
+    }
+    return static_cast<int>(syscall(SYS_fcntl, fd, command, argument));
+}
+
+static void* CallMmap(
+        void* addr, size_t size, int prot, int flags, int fd, off_t offset) {
     if (m_sys_mmap != nullptr) {
         return m_sys_mmap(addr, size, prot, flags, fd, offset);
     }
@@ -1126,70 +1202,188 @@ int debug_ioctl(int fd, unsigned long request, void* arg) {
                 DMA_BUF::handle_dma_node(
                         normalized_request, arg, &node_fd, &node_sz);
         if (recognized) {
-            bool should_track = false;
-            if (DMA_BUF::RegisterDmaFd(node_fd, node_sz, &should_track) &&
-                should_track) {
-                ScopedConcurrentLock lock;
-                void* ptr = reinterpret_cast<void*>(node_fd);
-                g_debug->pointer->Add(ptr, node_sz, node_sz, DMA);
-                DMA_BUF::MarkDmaFdTracked(node_fd);
-            }
+            ScopedConcurrentLock lock;
+            DMA_BUF::DmaDescriptor descriptor;
+            const dma_lifecycle::Identity identity =
+                    DMA_BUF::QueryDmaBufRaw(node_fd, &descriptor)
+                            ? descriptor.identity
+                            : DMA_BUF::IdentityForFd(node_fd);
+            DMA_BUF::lifecycle.RegisterFd(node_fd, node_sz, identity);
         }
     }
 
     return ret;
+#endif
+}
+
+namespace {
+int RawCloseOperation(int fd, void*) {
+    return static_cast<int>(syscall(SYS_close, fd));
+}
+}  // namespace
+
+int debug_close_with(int fd, DebugCloseOperation operation, void* context) {
+#if !MALLOC_HOOK_ENABLE_DMA_CAPTURE
+    return operation(fd, context);
+#else
+    if (DebugCallsDisabledOrAsyncWorker() || g_debug == nullptr ||
+        !g_debug->TrackPointers()) {
+        return operation(fd, context);
+    }
+
+    ScopedConcurrentLock lock;
+    ScopedDisableDebugCalls disable;
+    const int result =
+            DMA_BUF::lifecycle.CloseFd(fd, [&] { return operation(fd, context); });
+    const int close_errno = errno;
+    if (result == 0 || close_errno != EBADF) {
+        DMA_BUF::DropIonAllocationsForFd(fd);
+    }
+    errno = close_errno;
+    return result;
 #endif
 }
 
 int debug_close(int fd) {
-#if !MALLOC_HOOK_ENABLE_DMA_CAPTURE
-    return (int)syscall(SYS_close, fd);
-#else
-    if (DebugCallsDisabledOrAsyncWorker()) {
-        return (int)syscall(SYS_close, fd);
-    }
-
-    ScopedDisableDebugCalls disable;
-
-    int ret = (int)syscall(SYS_close, fd);
-    if (hook_source::SyscallSucceeded(ret) && g_debug->TrackPointers()) {
-        size_t size = 0;
-        bool tracked = false;
-        if (DMA_BUF::TakeDmaFd(fd, &size, &tracked) && tracked) {
-            ScopedConcurrentLock lock;
-            void* ptr = reinterpret_cast<void*>(fd);
-            g_debug->pointer->Remove(ptr);
-        }
-        DMA_BUF::DropIonAllocationsForFd(fd);
-    }
-    return ret;
-#endif
+    return debug_close_with(fd, RawCloseOperation, nullptr);
 }
 
-static void TrackMmapResult(
-        void* result, size_t size, int flags, int fd, bool pending_ioctl) {
+int debug_dup(int old_fd) {
+#if MALLOC_HOOK_ENABLE_DMA_CAPTURE
+    if (!DebugCallsDisabledOrAsyncWorker() && g_debug != nullptr &&
+        g_debug->TrackPointers()) {
+        ScopedConcurrentLock lock;
+        ScopedDisableDebugCalls disable;
+        const auto describe = [old_fd](
+                                      size_t* size, dma_lifecycle::Identity* identity) {
+            return DMA_BUF::DescribeDmaFdRaw(old_fd, size, identity);
+        };
+        return DMA_BUF::lifecycle.DuplicateFd(
+                old_fd, -1, describe, [&] { return CallDup(old_fd); });
+    }
+#endif
+    return CallDup(old_fd);
+}
+
+int debug_dup2(int old_fd, int new_fd) {
+#if MALLOC_HOOK_ENABLE_DMA_CAPTURE
+    if (!DebugCallsDisabledOrAsyncWorker() && g_debug != nullptr &&
+        g_debug->TrackPointers()) {
+        ScopedConcurrentLock lock;
+        ScopedDisableDebugCalls disable;
+        const auto describe = [old_fd](
+                                      size_t* size, dma_lifecycle::Identity* identity) {
+            return DMA_BUF::DescribeDmaFdRaw(old_fd, size, identity);
+        };
+        return DMA_BUF::lifecycle.DuplicateFd(
+                old_fd, new_fd, describe, [&] { return CallDup2(old_fd, new_fd); });
+    }
+#endif
+    return CallDup2(old_fd, new_fd);
+}
+
+int debug_dup3(int old_fd, int new_fd, int flags) {
+#if MALLOC_HOOK_ENABLE_DMA_CAPTURE
+    if (!DebugCallsDisabledOrAsyncWorker() && g_debug != nullptr &&
+        g_debug->TrackPointers()) {
+        ScopedConcurrentLock lock;
+        ScopedDisableDebugCalls disable;
+        const auto describe = [old_fd](
+                                      size_t* size, dma_lifecycle::Identity* identity) {
+            return DMA_BUF::DescribeDmaFdRaw(old_fd, size, identity);
+        };
+        return DMA_BUF::lifecycle.DuplicateFd(old_fd, new_fd, describe, [&] {
+            return CallDup3(old_fd, new_fd, flags);
+        });
+    }
+#endif
+    return CallDup3(old_fd, new_fd, flags);
+}
+
+namespace {
+int RawFcntlOperation(int fd, int command, uintptr_t argument, void*) {
+    return CallFcntl(fd, command, argument);
+}
+}  // namespace
+
+int debug_fcntl_with(
+        int fd, int command, uintptr_t argument, DebugFcntlOperation operation,
+        void* context) {
+#if MALLOC_HOOK_ENABLE_DMA_CAPTURE
+    if ((command == F_DUPFD
+#ifdef F_DUPFD_CLOEXEC
+         || command == F_DUPFD_CLOEXEC
+#endif
+         ) &&
+        !DebugCallsDisabledOrAsyncWorker() && g_debug != nullptr &&
+        g_debug->TrackPointers()) {
+        ScopedConcurrentLock lock;
+        ScopedDisableDebugCalls disable;
+        const auto describe = [fd](size_t* size, dma_lifecycle::Identity* identity) {
+            return DMA_BUF::DescribeDmaFdRaw(fd, size, identity);
+        };
+        return DMA_BUF::lifecycle.DuplicateFd(fd, -1, describe, [&] {
+            return operation(fd, command, argument, context);
+        });
+    }
+#endif
+    return operation(fd, command, argument, context);
+}
+
+int debug_fcntl(int fd, int command, uintptr_t argument) {
+    return debug_fcntl_with(fd, command, argument, RawFcntlOperation, nullptr);
+}
+
+static void RemoveDisplacedPointerMapping(void* address) {
+    if (address == MAP_FAILED || !g_debug->TrackPointers()) {
+        return;
+    }
+    PointerInfoType displaced{};
+    if (g_debug->pointer->TakeEntry(address, &displaced)) {
+        g_debug->pointer->TraceEntryReleased(address, displaced);
+        g_debug->pointer->RemoveBacktrace(displaced.hash_index);
+    }
+}
+
+static void TrackAnonymousMmap(void* result, size_t size, int flags, int fd) {
     if (!g_debug->TrackPointers()) {
         return;
     }
-    switch (hook_source::ClassifyMmap(result, flags, fd, pending_ioctl)) {
-        case hook_source::MmapCaptureKind::Anonymous:
-            g_debug->pointer->Add(result, size, size, MMAP);
-            return;
-        case hook_source::MmapCaptureKind::PendingIoctl:
-            g_debug->pointer->Add(result, size, size, DMA);
-            return;
-        case hook_source::MmapCaptureKind::None:
-            break;
+    if (hook_source::ClassifyMmap(result, flags, fd, /*pending_ioctl=*/false) ==
+        hook_source::MmapCaptureKind::Anonymous) {
+        g_debug->pointer->Add(result, size, size, MMAP);
     }
+}
+
+static void* MapAndTrackDma(
+        int fd, size_t size, int flags, bool pending_ioctl,
+        const dma_lifecycle::Tracker::MapOperation& operation) {
 #if MALLOC_HOOK_ENABLE_DMA_CAPTURE
-    if (result != MAP_FAILED) {
-        size_t dma_size = 0;
-        if (DMA_BUF::ShouldTrackDmaMapping(fd, flags, &dma_size)) {
-            g_debug->pointer->Add(reinterpret_cast<void*>(fd), dma_size, dma_size, DMA);
-            DMA_BUF::MarkDmaFdTracked(fd);
-        }
+    if (pending_ioctl) {
+        return DMA_BUF::lifecycle.Map(-1, size, /*mapping_only=*/true, {}, operation);
     }
+    if (fd >= 0 && (flags & MAP_SHARED)) {
+        const auto describe = [fd](size_t* object_size,
+                                   dma_lifecycle::Identity* identity) {
+            DMA_BUF::DmaDescriptor descriptor;
+            if (!DMA_BUF::QueryDmaBufRaw(fd, &descriptor)) {
+                return false;
+            }
+            *object_size = descriptor.size;
+            *identity = descriptor.identity;
+            return true;
+        };
+        return DMA_BUF::lifecycle.Map(
+                fd, size, /*mapping_only=*/false, describe, operation);
+    }
+    return DMA_BUF::lifecycle.Map(fd, size, /*mapping_only=*/false, {}, operation);
+#else
+    (void)fd;
+    (void)size;
+    (void)flags;
+    (void)pending_ioctl;
 #endif
+    return operation();
 }
 
 void* debug_mmap64(void* addr, size_t size, int prot, int flags, int fd, off_t offset) {
@@ -1201,6 +1395,7 @@ void* debug_mmap64(void* addr, size_t size, int prot, int flags, int fd, off_t o
 #endif
     }
 
+    std::lock_guard<std::mutex> mapping_guard(mapping_operation_mutex);
     ScopedConcurrentLock lock;
     ScopedDisableDebugCalls disable;
 
@@ -1215,13 +1410,16 @@ void* debug_mmap64(void* addr, size_t size, int prot, int flags, int fd, off_t o
         return MAP_FAILED;
     }
 
+    const auto operation = [&] {
 #if !defined(mmap64)
-    void* result = CallMmap64(addr, size, prot, flags, fd, offset);
+        return CallMmap64(addr, size, prot, flags, fd, offset);
 #else
-    void* result = CallMmap(addr, size, prot, flags, fd, offset);
+        return CallMmap(addr, size, prot, flags, fd, offset);
 #endif
-
-    TrackMmapResult(result, size, flags, fd, pending_ioctl);
+    };
+    void* result = MapAndTrackDma(fd, size, flags, pending_ioctl, operation);
+    RemoveDisplacedPointerMapping(result);
+    TrackAnonymousMmap(result, size, flags, fd);
 
     return result;
 }
@@ -1231,6 +1429,7 @@ void* debug_mmap(void* addr, size_t size, int prot, int flags, int fd, off_t off
         return CallMmap(addr, size, prot, flags, fd, offset);
     }
 
+    std::lock_guard<std::mutex> mapping_guard(mapping_operation_mutex);
     ScopedConcurrentLock lock;
     ScopedDisableDebugCalls disable;
 
@@ -1245,8 +1444,12 @@ void* debug_mmap(void* addr, size_t size, int prot, int flags, int fd, off_t off
         return MAP_FAILED;
     }
 
-    void* result = CallMmap(addr, size, prot, flags, fd, offset);
-    TrackMmapResult(result, size, flags, fd, pending_ioctl);
+    const auto operation = [&] {
+        return CallMmap(addr, size, prot, flags, fd, offset);
+    };
+    void* result = MapAndTrackDma(fd, size, flags, pending_ioctl, operation);
+    RemoveDisplacedPointerMapping(result);
+    TrackAnonymousMmap(result, size, flags, fd);
 
     return result;
 }
@@ -1256,6 +1459,7 @@ int debug_munmap(void* addr, size_t size) {
         return CallMunmap(addr, size);
     }
 
+    std::lock_guard<std::mutex> mapping_guard(mapping_operation_mutex);
     ScopedConcurrentLock lock;
     ScopedDisableDebugCalls disable;
 
@@ -1265,7 +1469,12 @@ int debug_munmap(void* addr, size_t size) {
     const bool had_entry =
             g_debug->TrackPointers() && g_debug->pointer->TakeEntry(addr, &previous);
 
+#if MALLOC_HOOK_ENABLE_DMA_CAPTURE
+    int ret = DMA_BUF::lifecycle.Unmap(
+            addr, size, [&] { return CallMunmap(addr, size); });
+#else
     int ret = CallMunmap(addr, size);
+#endif
     if (hook_source::SyscallSucceeded(ret)) {
         if (had_entry) {
             g_debug->pointer->TraceEntryReleased(addr, previous);
@@ -1288,10 +1497,23 @@ void* debug_mremap(
         return MAP_FAILED;
     }
 
+    std::lock_guard<std::mutex> mapping_guard(mapping_operation_mutex);
     ScopedConcurrentLock lock;
     ScopedDisableDebugCalls disable;
+    bool dma_handled = false;
+#if MALLOC_HOOK_ENABLE_DMA_CAPTURE
+    void* result = DMA_BUF::lifecycle.Remap(
+            old_addr, old_size, new_size, flags,
+            [&] { return CallMremap(old_addr, old_size, new_size, flags, new_addr); },
+            &dma_handled);
+#else
     void* result = CallMremap(old_addr, old_size, new_size, flags, new_addr);
-    if (hook_source::MappingSucceeded(result) && g_debug->TrackPointers()) {
+#endif
+    if (hook_source::MappingSucceeded(result) && dma_handled) {
+        RemoveDisplacedPointerMapping(result);
+    }
+    if (hook_source::MappingSucceeded(result) && g_debug->TrackPointers() &&
+        !dma_handled) {
         if ((flags & ALLOC_HOOK_MREMAP_DONTUNMAP) != 0) {
             // MREMAP_DONTUNMAP leaves the source range mapped and live, so the
             // process now holds two mappings rather than one that moved.

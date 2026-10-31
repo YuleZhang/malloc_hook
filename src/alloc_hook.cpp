@@ -4,13 +4,15 @@
 #if defined(MALLOC_HOOK_TARGET_OS_OHOS)
 #include <asm-generic/ioctl.h>
 #endif
+#include <pthread.h>
 #include <unistd.h>
 #include <algorithm>
+#include <atomic>
+#include <cerrno>
+#include <climits>
 #include <cstdarg>
 #include <cstddef>
 #include <cstdint>
-#include <climits>
-#include <cerrno>
 #include <cstring>
 #include <new>
 
@@ -231,6 +233,15 @@ void ResolveAllLibcAllocationSymbols() {
     RESOLVE(memalign);
     RESOLVE(aligned_alloc);
     RESOLVE(posix_memalign);
+#if MALLOC_HOOK_EXPORT_RESOURCE_HOOKS
+    RESOLVE(dup);
+    RESOLVE(dup2);
+    RESOLVE(dup3);
+    RESOLVE(fcntl);
+#if defined(MALLOC_HOOK_TARGET_OS_LINUX)
+    RESOLVE(fcntl64);
+#endif
+#endif
 #if MALLOC_HOOK_EXPORT_MMAP_HOOK
     RESOLVE(mmap);
     RESOLVE(munmap);
@@ -248,6 +259,173 @@ int CallRealIoctl(int fd, unsigned long request, void* arg) {
 
 int CallRealClose(int fd) {
     return static_cast<int>(syscall(SYS_close, fd));
+}
+
+int CallRealDup(int old_fd) {
+    RESOLVE(dup);
+    return m_sys_dup != nullptr ? m_sys_dup(old_fd)
+                                : static_cast<int>(syscall(SYS_dup, old_fd));
+}
+
+int CallRealDup2(int old_fd, int new_fd) {
+    RESOLVE(dup2);
+    if (m_sys_dup2 != nullptr) {
+        return m_sys_dup2(old_fd, new_fd);
+    }
+#if defined(SYS_dup2)
+    return static_cast<int>(syscall(SYS_dup2, old_fd, new_fd));
+#else
+    return static_cast<int>(syscall(SYS_dup3, old_fd, new_fd, 0));
+#endif
+}
+
+int CallRealDup3(int old_fd, int new_fd, int flags) {
+    RESOLVE(dup3);
+    if (m_sys_dup3 != nullptr) {
+        return m_sys_dup3(old_fd, new_fd, flags);
+    }
+#if defined(SYS_dup3)
+    return static_cast<int>(syscall(SYS_dup3, old_fd, new_fd, flags));
+#else
+    errno = ENOSYS;
+    return -1;
+#endif
+}
+
+int CallRealFcntl(int fd, int command, uintptr_t argument) {
+    RESOLVE(fcntl);
+    return m_sys_fcntl != nullptr
+                 ? m_sys_fcntl(fd, command, argument)
+                 : static_cast<int>(syscall(SYS_fcntl, fd, command, argument));
+}
+#if defined(MALLOC_HOOK_TARGET_OS_LINUX)
+int CallRealFcntl64(int fd, int command, uintptr_t argument) {
+    RESOLVE(fcntl64);
+    return m_sys_fcntl64 != nullptr ? m_sys_fcntl64(fd, command, argument)
+                                    : CallRealFcntl(fd, command, argument);
+}
+
+int InvokeRealFcntl64(int fd, int command, uintptr_t argument, void*) {
+    return CallRealFcntl64(fd, command, argument);
+}
+#endif
+
+#if defined(MALLOC_HOOK_TARGET_OS_ANDROID)
+using FdsanCloseFn = int (*)(int, uint64_t);
+std::atomic<FdsanCloseFn> g_real_fdsan_close{nullptr};
+pthread_mutex_t g_fdsan_resolve_mutex = PTHREAD_MUTEX_INITIALIZER;
+std::atomic<bool> g_fdsan_resolution_attempted{false};
+
+FdsanCloseFn RealFdsanCloseFunction() {
+    FdsanCloseFn function = g_real_fdsan_close.load(std::memory_order_acquire);
+    if (function != nullptr ||
+        g_fdsan_resolution_attempted.load(std::memory_order_acquire)) {
+        return function;
+    }
+    pthread_mutex_lock(&g_fdsan_resolve_mutex);
+    if (!g_fdsan_resolution_attempted.load(std::memory_order_acquire)) {
+        function = reinterpret_cast<FdsanCloseFn>(
+                ResolveLibcSymbol("android_fdsan_close_with_tag"));
+        g_real_fdsan_close.store(function, std::memory_order_release);
+        g_fdsan_resolution_attempted.store(true, std::memory_order_release);
+    } else {
+        function = g_real_fdsan_close.load(std::memory_order_acquire);
+    }
+    pthread_mutex_unlock(&g_fdsan_resolve_mutex);
+    return function;
+}
+
+struct FdsanCloseContext {
+    FdsanCloseFn function = nullptr;
+    uint64_t tag = 0;
+};
+
+int InvokeFdsanClose(int fd, void* opaque) {
+    auto* context = static_cast<FdsanCloseContext*>(opaque);
+    return context->function(fd, context->tag);
+}
+#endif
+
+enum class FcntlArgumentKind { None, Integer, Pointer, Word };
+
+FcntlArgumentKind FcntlArgumentKindForCommand(int command) {
+    switch (command) {
+        case F_GETFD:
+        case F_GETFL:
+#ifdef F_GETOWN
+        case F_GETOWN:
+#endif
+#ifdef F_GETSIG
+        case F_GETSIG:
+#endif
+#ifdef F_GETLEASE
+        case F_GETLEASE:
+#endif
+#ifdef F_GETPIPE_SZ
+        case F_GETPIPE_SZ:
+#endif
+#ifdef F_GET_SEALS
+        case F_GET_SEALS:
+#endif
+            return FcntlArgumentKind::None;
+
+        case F_DUPFD:
+        case F_SETFD:
+        case F_SETFL:
+#ifdef F_DUPFD_CLOEXEC
+        case F_DUPFD_CLOEXEC:
+#endif
+#ifdef F_SETOWN
+        case F_SETOWN:
+#endif
+#ifdef F_SETSIG
+        case F_SETSIG:
+#endif
+#ifdef F_SETLEASE
+        case F_SETLEASE:
+#endif
+#ifdef F_SETPIPE_SZ
+        case F_SETPIPE_SZ:
+#endif
+#ifdef F_ADD_SEALS
+        case F_ADD_SEALS:
+#endif
+            return FcntlArgumentKind::Integer;
+
+        case F_GETLK:
+        case F_SETLK:
+        case F_SETLKW:
+#ifdef F_GETOWN_EX
+        case F_GETOWN_EX:
+#endif
+#ifdef F_SETOWN_EX
+        case F_SETOWN_EX:
+#endif
+#ifdef F_OFD_GETLK
+        case F_OFD_GETLK:
+#endif
+#ifdef F_OFD_SETLK
+        case F_OFD_SETLK:
+#endif
+#ifdef F_OFD_SETLKW
+        case F_OFD_SETLKW:
+#endif
+#ifdef F_GET_RW_HINT
+        case F_GET_RW_HINT:
+#endif
+#ifdef F_SET_RW_HINT
+        case F_SET_RW_HINT:
+#endif
+#ifdef F_GET_FILE_RW_HINT
+        case F_GET_FILE_RW_HINT:
+#endif
+#ifdef F_SET_FILE_RW_HINT
+        case F_SET_FILE_RW_HINT:
+#endif
+            return FcntlArgumentKind::Pointer;
+        default:
+            return FcntlArgumentKind::Word;
+    }
 }
 #endif
 
@@ -391,6 +569,9 @@ void InitializeTargetScope() {
     // Resolve every forwarding entry in the parent before libc runs callbacks.
     ResolveAllLibcAllocationSymbols();
     (void)RealForkFunction();
+#if defined(MALLOC_HOOK_TARGET_OS_ANDROID) && MALLOC_HOOK_EXPORT_RESOURCE_HOOKS
+    (void)RealFdsanCloseFunction();
+#endif
     if (observe_only::InitializeTargetProcess() &&
         observe_only::TargetProcessInitialized()) {
         (void)observe_only::IsPrimary();
@@ -442,6 +623,22 @@ public:
         return debug_ioctl(fd, request, arg);
     }
     int close(int fd) { return debug_close(fd); }
+    int close_with(int fd, DebugCloseOperation operation, void* context) {
+        return debug_close_with(fd, operation, context);
+    }
+    int dup(int old_fd) { return debug_dup(old_fd); }
+    int dup2(int old_fd, int new_fd) { return debug_dup2(old_fd, new_fd); }
+    int dup3(int old_fd, int new_fd, int flags) {
+        return debug_dup3(old_fd, new_fd, flags);
+    }
+    int fcntl_with(
+            int fd, int command, uintptr_t argument, DebugFcntlOperation operation,
+            void* context) {
+        return debug_fcntl_with(fd, command, argument, operation, context);
+    }
+    int fcntl(int fd, int command, uintptr_t argument) {
+        return debug_fcntl(fd, command, argument);
+    }
 #if !defined(mmap64)
     void* mmap64(void* addr, size_t size, int prot, int flags, int fd, off_t offset) {
         return debug_mmap64(addr, size, prot, flags, fd, offset);
@@ -495,13 +692,17 @@ __attribute__((destructor(201))) void report_observe_only_probe() {
 
 // Hook-source capability contract:
 // - Current creation sources are the malloc family, C++ new/new[], successful
-//   anonymous mmap/mmap64, and selected successful resource-allocating ioctl
-//   calls. Successful mremap preserves the original stack identity while
-//   updating the tracked mapping identity and size.
-// - Release paths reuse stored identity and never capture a new allocation stack.
-// - mmap/ioctl interposition covers exported libc calls only; direct syscalls are
-//   an explicit limitation. Platform export policy decides which sources are
-//   enabled without changing the shared capture contract.
+//   anonymous mmap/mmap64, selected successful resource-allocating ioctl calls,
+//   and DMA-BUF mappings discovered by fd identity. DMA ownership follows the
+//   object across fd aliases (dup family/fcntl) and mapped ranges.
+//   Successful mremap preserves the original stack identity while updating the
+//   tracked mapping ownership and size.
+// - Release paths reuse stored object identity. close, Android fdsan close,
+//   munmap, and replacement dup operations all terminate only the ownership they
+//   actually release; the object closes when its final fd/mapping owner is gone.
+// - mmap/ioctl/close/dup/fcntl interposition covers exported libc calls only;
+//   direct syscalls are an explicit limitation. Platform export policy decides
+//   which sources are enabled without changing the shared lifecycle contract.
 // - ARCH-01 source ownership is local to this adapter: malloc family and C++
 //   new creation enter the shared tracker, anonymous mmap is success-only when
 //   exported, and resource ioctl records are success/filter gated. Direct
@@ -704,6 +905,105 @@ int close(int fd) {
     }
     return AllocHook::inst().close(fd);
 }
+
+int dup(int old_fd) {
+    if (in_preinit_phase || InitState::allocHook_setup || observe_only::Bypassed()) {
+        return CallRealDup(old_fd);
+    }
+    return AllocHook::inst().dup(old_fd);
+}
+
+int dup2(int old_fd, int new_fd) {
+    if (in_preinit_phase || InitState::allocHook_setup || observe_only::Bypassed()) {
+        return CallRealDup2(old_fd, new_fd);
+    }
+    return AllocHook::inst().dup2(old_fd, new_fd);
+}
+
+int dup3(int old_fd, int new_fd, int flags) {
+    if (in_preinit_phase || InitState::allocHook_setup || observe_only::Bypassed()) {
+        return CallRealDup3(old_fd, new_fd, flags);
+    }
+    return AllocHook::inst().dup3(old_fd, new_fd, flags);
+}
+
+int fcntl(int fd, int command, ...) {
+    uintptr_t argument = 0;
+    const FcntlArgumentKind kind = FcntlArgumentKindForCommand(command);
+    if (kind != FcntlArgumentKind::None) {
+        va_list ap;
+        va_start(ap, command);
+        switch (kind) {
+            case FcntlArgumentKind::Integer:
+                argument = static_cast<uintptr_t>(va_arg(ap, int));
+                break;
+            case FcntlArgumentKind::Pointer:
+                argument = reinterpret_cast<uintptr_t>(va_arg(ap, void*));
+                break;
+            case FcntlArgumentKind::Word:
+                argument = va_arg(ap, uintptr_t);
+                break;
+            case FcntlArgumentKind::None:
+                break;
+        }
+        va_end(ap);
+    }
+    if (in_preinit_phase || InitState::allocHook_setup || observe_only::Bypassed()) {
+        return CallRealFcntl(fd, command, argument);
+    }
+    return AllocHook::inst().fcntl(fd, command, argument);
+}
+
+#if defined(MALLOC_HOOK_TARGET_OS_LINUX)
+int fcntl64(int fd, int command, ...) {
+    uintptr_t argument = 0;
+    const FcntlArgumentKind kind = FcntlArgumentKindForCommand(command);
+    if (kind != FcntlArgumentKind::None) {
+        va_list ap;
+        va_start(ap, command);
+        switch (kind) {
+            case FcntlArgumentKind::Integer:
+                argument = static_cast<uintptr_t>(va_arg(ap, int));
+                break;
+            case FcntlArgumentKind::Pointer:
+                argument = reinterpret_cast<uintptr_t>(va_arg(ap, void*));
+                break;
+            case FcntlArgumentKind::Word:
+                argument = va_arg(ap, uintptr_t);
+                break;
+            case FcntlArgumentKind::None:
+                break;
+        }
+        va_end(ap);
+    }
+    if (in_preinit_phase || InitState::allocHook_setup || observe_only::Bypassed()) {
+        return CallRealFcntl64(fd, command, argument);
+    }
+    return AllocHook::inst().fcntl_with(
+            fd, command, argument, InvokeRealFcntl64, nullptr);
+}
+#endif
+
+#if defined(MALLOC_HOOK_TARGET_OS_ANDROID)
+int android_fdsan_close_with_tag(int fd, uint64_t tag) {
+    FdsanCloseFn function = RealFdsanCloseFunction();
+    if (function == nullptr) {
+        // On API levels before fdsan, exporting this weak symbol changes an
+        // application's null-check result. Preserve Bionic's documented fallback
+        // by performing the same tracked ordinary close instead of returning ENOSYS.
+        if (in_preinit_phase || InitState::allocHook_setup ||
+            observe_only::Bypassed()) {
+            return CallRealClose(fd);
+        }
+        return AllocHook::inst().close(fd);
+    }
+    if (in_preinit_phase || InitState::allocHook_setup || observe_only::Bypassed()) {
+        return function(fd, tag);
+    }
+    FdsanCloseContext context{function, tag};
+    return AllocHook::inst().close_with(fd, InvokeFdsanClose, &context);
+}
+#endif
 #endif
 
 #if MALLOC_HOOK_EXPORT_MMAP_HOOK && !defined(mmap64)
