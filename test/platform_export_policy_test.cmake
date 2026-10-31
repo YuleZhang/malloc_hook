@@ -170,9 +170,9 @@ foreach(COMPILER IN LISTS COMPILERS)
   # export, mmap family included. The OHOS default of *not* exporting mmap is
   # produced by the CMake strip pass (ENABLE_MMAP_HOOK_EXPORT=OFF), and is
   # verified end to end against the built library by built_platform_export_policy.
-  verify_policy("${COMPILER}" android version_script_android.ld FALSE TRUE TRUE FALSE)
-  verify_policy("${COMPILER}" linux version_script.ld FALSE TRUE FALSE TRUE)
-  verify_policy("${COMPILER}" ohos version_script_ohos.ld TRUE TRUE FALSE FALSE)
+  verify_policy("${COMPILER}" android export/android.ld FALSE TRUE TRUE FALSE)
+  verify_policy("${COMPILER}" linux export/linux.ld FALSE TRUE FALSE TRUE)
+  verify_policy("${COMPILER}" ohos export/ohos.ld TRUE TRUE FALSE FALSE)
 endforeach()
 
 message(STATUS "Verified platform export policies with: ${COMPILERS}")

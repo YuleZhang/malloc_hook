@@ -1,6 +1,6 @@
-/* Android and generic Linux currently share this documented C hook ABI.
- * Platform selection remains explicit in CMake so either policy can diverge
- * without changing capture or bookkeeping code. */
+/* Generic Linux hook ABI. Shares the C hook set with Android and adds fcntl64,
+ * which is where glibc redirects F_DUPFD* when a large-file build is in effect.
+ * No android_fdsan_close_with_tag: libc on this platform has no such symbol. */
 {
 global:
     malloc;

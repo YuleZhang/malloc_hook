@@ -1,7 +1,8 @@
-/* OHOS ABI: C allocation/resource hooks plus C++ allocation hooks, and the
+/* OHOS hook ABI. C allocation/resource hooks, the C++ sized-new family, and the
  * mmap family. mmap/munmap/mremap are stripped from this manifest by CMake when
  * ENABLE_MMAP_HOOK_EXPORT is off (the OHOS default), so this one script covers
- * both the default and the opt-in build. */
+ * both the default and the opt-in build. fcntl64 is absent because musl does not
+ * provide that symbol. */
 {
 global:
     malloc;
