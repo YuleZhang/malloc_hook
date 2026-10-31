@@ -18,6 +18,10 @@ global:
     mremap;
     ioctl;
     close;
+    dup;
+    dup2;
+    dup3;
+    fcntl;
     checkpoint;
     _Znwm;
     _Znwj;

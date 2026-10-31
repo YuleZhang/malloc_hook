@@ -17,6 +17,16 @@ target_compile_features(hook_source_policy_test PRIVATE cxx_std_17)
 target_include_directories(hook_source_policy_test PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../backtrace/include)
 
+add_executable(dma_lifecycle_test
+    dma_lifecycle_test.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/../backtrace/src/DmaLifecycle.cpp)
+target_compile_features(dma_lifecycle_test PRIVATE cxx_std_17)
+target_include_directories(dma_lifecycle_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../backtrace/include)
+target_link_libraries(dma_lifecycle_test PRIVATE Threads::Threads)
+add_test(NAME dma_lifecycle COMMAND dma_lifecycle_test)
+set_tests_properties(dma_lifecycle PROPERTIES TIMEOUT 10)
+
 # Config.cpp reaches for <bionic/reserved_signals.h> to pick the default dump
 # signal. That header is AOSP-internal and is not in the NDK sysroot; the
 # library target resolves it through the vendored copy under unwindstack/. Any
@@ -168,6 +178,15 @@ if(NOT ANDROID AND NOT OHOS)
     # Preloads the built library into a real process, so what each mode costs and
     # what it produces is checked end to end rather than per unit. Host-only by
     # construction: it runs the library it just built.
+    add_executable(fd_interposer_workload fd_interposer_workload.cpp)
+    target_compile_features(fd_interposer_workload PRIVATE cxx_std_17)
+    add_test(
+        NAME fd_interposer_runtime
+        COMMAND ${CMAKE_COMMAND} -E env
+            "LD_PRELOAD=$<TARGET_FILE:alloc_hook>"
+            $<TARGET_FILE:fd_interposer_workload>)
+    set_tests_properties(fd_interposer_runtime PROPERTIES TIMEOUT 10)
+
     add_executable(observe_only_workload observe_only_workload.cpp)
     target_compile_features(observe_only_workload PRIVATE cxx_std_17)
     add_test(

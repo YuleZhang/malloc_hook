@@ -12,7 +12,13 @@ foreach(route IN ITEMS
     "AllocHook::inst().munmap(addr, size)"
     "AllocHook::inst().mremap(old_addr, old_size, new_size, flags, new_addr)"
     "AllocHook::inst().ioctl(fd, request_value, arg)"
-    "AllocHook::inst().close(fd)")
+    "AllocHook::inst().close(fd)"
+    "AllocHook::inst().dup(old_fd)"
+    "AllocHook::inst().dup2(old_fd, new_fd)"
+    "AllocHook::inst().dup3(old_fd, new_fd, flags)"
+    "AllocHook::inst().fcntl(fd, command, argument)"
+    "AllocHook::inst().fcntl_with("
+    "AllocHook::inst().close_with(fd, InvokeFdsanClose, &context)")
   string(FIND "${source}" "${route}" position)
   if(position EQUAL -1)
     message(FATAL_ERROR "Missing unified hook-source route: ${route}")
@@ -44,7 +50,9 @@ endforeach()
 foreach(contract IN ITEMS
     "direct syscalls are"
     "success-only"
-    "Release paths reuse stored identity")
+    "stored object identity"
+    "fd aliases (dup family/fcntl)"
+    "On API levels before fdsan")
   string(FIND "${source}" "${contract}" position)
   if(position EQUAL -1)
     message(FATAL_ERROR "Missing hook-source contract documentation: ${contract}")

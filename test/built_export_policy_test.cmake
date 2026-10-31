@@ -1,9 +1,10 @@
 cmake_minimum_required(VERSION 3.23)
 
 if(NOT DEFINED LIBRARY OR NOT DEFINED EXPECT_MMAP OR
-   NOT DEFINED EXPECT_RESOURCE OR NOT DEFINED EXPECT_CPP)
+   NOT DEFINED EXPECT_RESOURCE OR NOT DEFINED EXPECT_CPP OR
+   NOT DEFINED EXPECT_FDSAN OR NOT DEFINED EXPECT_FCNTL64)
   message(FATAL_ERROR
-    "LIBRARY, EXPECT_MMAP, EXPECT_RESOURCE, and EXPECT_CPP are required")
+    "LIBRARY, EXPECT_MMAP, EXPECT_RESOURCE, EXPECT_CPP, EXPECT_FDSAN, and EXPECT_FCNTL64 are required")
 endif()
 if(NOT EXISTS "${LIBRARY}")
   message(FATAL_ERROR "Built hook library does not exist: ${LIBRARY}")
@@ -39,7 +40,13 @@ set(EXPECTED_EXPORTS
     posix_memalign
     realloc)
 if(EXPECT_RESOURCE)
-  list(APPEND EXPECTED_EXPORTS ioctl close)
+  list(APPEND EXPECTED_EXPORTS ioctl close dup dup2 dup3 fcntl)
+endif()
+if(EXPECT_FDSAN)
+  list(APPEND EXPECTED_EXPORTS android_fdsan_close_with_tag)
+endif()
+if(EXPECT_FCNTL64)
+  list(APPEND EXPECTED_EXPORTS fcntl64)
 endif()
 if(EXPECT_MMAP)
   list(APPEND EXPECTED_EXPORTS mmap mmap64 mremap munmap)
