@@ -166,7 +166,11 @@ void Inspect() {
     p.Text("target", "android");
     p.Text("android_sdk", sdk);
 #else
+#ifdef ALLOC_PROBE_TARGET_OS
+    p.Text("target", ALLOC_PROBE_TARGET_OS);
+#else
     p.Text("target", "linux_or_ohos");
+#endif
 #endif
     p.Write();
     Json abi;
