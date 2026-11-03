@@ -69,6 +69,9 @@ backends. The three flow stages map onto these pieces:
   and off by default on OHOS to limit loader/vendor interference. Resource hooks
   are exported only when DMA capture is built in.
 
+
+Standalone device probe: `alloc_hook_probe` runs without `LD_PRELOAD` or `liballoc_hook.so`. Read-only `inspect` discovers allocator and kernel evidence interfaces; opt-in `run` records real-UAPI memory lifecycles as JSONL. Packaged under `out/bin/` (Linux: `out/linux-*/bin/`). See [`Device memory probe`](docs/DEVICE_MEMORY_PROBE.zh-CN.md).
+
 ## Documentation
 
 | Document | What it covers |
