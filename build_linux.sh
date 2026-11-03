@@ -17,11 +17,13 @@ environment:
   ARM_GNU_TOOLCHAIN_PATH   aarch64-none-linux-gnu toolchain root (arm64 only)
   ALLOC_HOOK_BUILD_TESTS   ON/OFF; defaults to OFF for arm64 and ON for host
   ALLOC_HOOK_DMA_CAPTURE   ON/OFF; defaults to ON
+  MALLOC_HOOK_BUILD_PROBE  ON/OFF; defaults to ON
 EOF
     exit 1
 }
 
 DMA_CAPTURE="${ALLOC_HOOK_DMA_CAPTURE:-ON}"
+BUILD_PROBE="${MALLOC_HOOK_BUILD_PROBE:-ON}"
 
 case "${BUILD_ARCH}" in
     arm64)
@@ -50,6 +52,7 @@ CMAKE_ARGS=(
     -DCMAKE_BUILD_TYPE=Release
     -DMALLOC_HOOK_ENABLE_DMA_CAPTURE="${DMA_CAPTURE}"
     -DMALLOC_HOOK_BUILD_TESTS="${BUILD_TESTS}"
+    -DMALLOC_HOOK_BUILD_PROBE="${BUILD_PROBE}"
 )
 
 READELF=readelf
@@ -77,7 +80,11 @@ fi
 
 rm -rf "${BUILD_DIR}"
 cmake "${CMAKE_ARGS[@]}"
-cmake --build "${BUILD_DIR}" --target alloc_hook
+if [[ "${BUILD_PROBE}" == "ON" ]]; then
+    cmake --build "${BUILD_DIR}" --target alloc_hook alloc_hook_probe
+else
+    cmake --build "${BUILD_DIR}" --target alloc_hook
+fi
 
 ARTIFACT="${BUILD_DIR}/liballoc_hook.so"
 if [[ ! -f "${ARTIFACT}" ]]; then
@@ -99,6 +106,22 @@ fi
 
 mkdir -p "${OUT_DIR}"
 cp -f "${ARTIFACT}" "${OUT_DIR}/"
+if [[ "${BUILD_PROBE}" == "ON" ]]; then
+    PROBE_ARTIFACT="${BUILD_DIR}/probe/alloc_hook_probe"
+    if [[ ! -x "${PROBE_ARTIFACT}" ]]; then
+        echo "build reported success but ${PROBE_ARTIFACT} is missing" >&2
+        exit 1
+    fi
+    PROBE_MACHINE=$("${READELF}" -h "${PROBE_ARTIFACT}" | awk -F: '/Machine:/ {gsub(/^ +/, "", $2); print $2}')
+    if [[ -n "${EXPECT_MACHINE}" && "${PROBE_MACHINE}" != *"${EXPECT_MACHINE}"* ]]; then
+        echo "probe ABI mismatch: expected ${EXPECT_MACHINE}, got ${PROBE_MACHINE}" >&2
+        exit 1
+    fi
+    PROBE_OUT="${OUT_DIR%/lib}/bin"
+    mkdir -p "${PROBE_OUT}"
+    cp -f "${PROBE_ARTIFACT}" "${PROBE_OUT}/"
+    echo "Built: ${PROBE_OUT}/alloc_hook_probe"
+fi
 
 if [[ "${BUILD_TESTS}" == "ON" && "${BUILD_ARCH}" == "host" ]]; then
     cmake --build "${BUILD_DIR}"
