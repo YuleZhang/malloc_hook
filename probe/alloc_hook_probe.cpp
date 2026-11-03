@@ -256,9 +256,14 @@ struct Legacy {
     std::vector<int> fds, handles;
     void* mapping = MAP_FAILED;
     size_t mapped_bytes = 0;
-    ~Legacy() {
-        if (mapping != MAP_FAILED) munmap(mapping, mapped_bytes);
+    ~Legacy() { Cleanup(); }
+    void Cleanup() {
+        if (mapping != MAP_FAILED) {
+            munmap(mapping, mapped_bytes);
+            mapping = MAP_FAILED;
+        }
         for (int fd : fds) close(fd);
+        fds.clear();
         if (client >= 0) {
             for (int h : handles) {
                 ion_handle_data a = {};
@@ -266,7 +271,9 @@ struct Legacy {
                 ioctl(client, ALLOC_HOOK_ION_IOC_FREE, &a);
             }
             close(client);
+            client = -1;
         }
+        handles.clear();
     }
     void UntrackFd(int fd) {
         auto it = std::find(fds.begin(), fds.end(), fd);
@@ -280,6 +287,7 @@ struct Legacy {
 void LegacyCase(const Options& o, char letter, Stats* stats) {
     const char id[] = {letter, 0};
     Legacy state;
+    Sample(o, id, "baseline", 0, 0);
     state.client = open("/dev/ion", O_RDWR | O_CLOEXEC);
     if (state.client < 0) {
         ++stats->skipped;
@@ -377,6 +385,8 @@ void LegacyCase(const Options& o, char letter, Stats* stats) {
         ok = release(alloc.handle);
         ok = close_fd(fd) && ok;
     }
+    state.Cleanup();
+    Sample(o, id, "after_cleanup", 0, 0);
     if (ok) { ++stats->passed; Finished(id, "pass", "UAPI sequence completed; verify backing separately"); }
     else { ++stats->failed; Finished(id, "fail", "one or more UAPI operations failed"); }
 }
@@ -384,6 +394,7 @@ void DirectCase(const Options& o, const std::string& backend, bool mapping, Stat
     const char* id = mapping ? "mapping" : "direct";
     const bool heap = backend == "dma-heap";
     const std::string path = heap ? "/dev/dma_heap/" + o.heap : "/dev/ion";
+    Sample(o, id, "baseline", 0, 0);
     int allocator = open(path.c_str(), O_RDWR | O_CLOEXEC);
     if (allocator < 0) {
         ++s->skipped;
@@ -432,6 +443,7 @@ void DirectCase(const Options& o, const std::string& backend, bool mapping, Stat
         ok = (ret == 0) && ok;
     }
     close(allocator);
+    Sample(o, id, "after_cleanup", 0, 0);
     if (ok) { ++s->passed; Finished(id, "pass", "UAPI sequence completed; verify backing separately"); }
     else { ++s->failed; Finished(id, "fail", "one or more UAPI operations failed"); }
 }
