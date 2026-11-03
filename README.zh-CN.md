@@ -53,6 +53,9 @@ flowchart LR
   由 `ENABLE_MMAP_HOOK_EXPORT` 控制的统一能力，Android 和 glibc Linux 默认开启，OHOS 默认
   关闭以减少 loader 和厂商运行时受到的影响。只有在构建了 DMA 抓取时才导出资源 hook。
 
+
+独立设备内存探测：`alloc_hook_probe` 可不加载 `liballoc_hook.so` 直接运行，默认只读检测 ION/DMA-HEAP/FDINFO 能力；显式 `run` 时执行最小真实 UAPI 生命周期实验，输出 JSONL。构建时默认安装到 `out/bin/`（Linux 打包在 `out/linux-*/bin/`）。使用说明见 [`docs/DEVICE_MEMORY_PROBE.zh-CN.md`](docs/DEVICE_MEMORY_PROBE.zh-CN.md)。
+
 ## 文档
 
 | 文档 | 覆盖内容 |
