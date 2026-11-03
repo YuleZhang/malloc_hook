@@ -1,0 +1,50 @@
+name: Standalone device memory probe
+
+on:
+  pull_request:
+    paths:
+      - "probe/**"
+      - ".github/workflows/alloc-hook-probe.yml"
+  push:
+    branches:
+      - main
+    paths:
+      - "probe/**"
+      - ".github/workflows/alloc-hook-probe.yml"
+
+jobs:
+  host-smoke:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        compiler: [g++, clang++]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build standalone probe without liballoc_hook.so
+        run: |
+          cmake -S probe -B build-probe -G Ninja -DCMAKE_CXX_COMPILER=${{ matrix.compiler }}
+          cmake --build build-probe --verbose
+      - name: Run non-allocating device inspection
+        run: |
+          ctest --test-dir build-probe --output-on-failure
+          build-probe/alloc_hook_probe inspect > probe-inspect.jsonl
+          python3 - <<'PY'
+          import json
+          rows = [json.loads(line) for line in open("probe-inspect.jsonl", encoding="utf-8")]
+          kinds = {row["kind"] for row in rows}
+          assert {"platform", "compiled_abi", "capability", "limitation"} <= kinds, kinds
+          assert all("readable" in row for row in rows if row["kind"] == "capability")
+          PY
+      - name: Validate unsupported-device status (no fake PASS)
+        run: |
+          set +e
+          build-probe/alloc_hook_probe run --backend dma-heap --heap nonexistent-probe-heap --bytes 4096 > probe-unsupported.jsonl
+          rc=$?
+          set -e
+          test "$rc" -eq 3
+          python3 - <<'PY'
+          import json
+          rows = [json.loads(line) for line in open("probe-unsupported.jsonl", encoding="utf-8")]
+          assert not any(r.get("status") == "pass" for r in rows), rows
+          PY

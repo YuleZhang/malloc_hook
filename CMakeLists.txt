@@ -8,6 +8,7 @@ set(MALLOC_HOOK_VERSION "${_MALLOC_HOOK_VERSION_FILE}" CACHE STRING "malloc_hook
 project(malloc_hook VERSION ${MALLOC_HOOK_VERSION} LANGUAGES C CXX ASM)
 
 option(MALLOC_HOOK_BUILD_TESTS "Build malloc_hook test binaries" ON)
+option(MALLOC_HOOK_BUILD_PROBE "Build and package standalone device memory probe" ON)
 # mmap/munmap/mremap interposition is a platform-neutral capability, but its
 # default differs: OHOS leaves it off to limit loader/vendor runtime
 # interference, while Android and glibc Linux export it by policy. The target
@@ -304,6 +305,7 @@ add_custom_target(print_build_options
   COMMAND ${CMAKE_COMMAND} -E echo "  MALLOC_HOOK_ENABLE_DMA_CAPTURE=${MALLOC_HOOK_ENABLE_DMA_CAPTURE}"
   COMMAND ${CMAKE_COMMAND} -E echo "  ENABLE_MMAP_HOOK_EXPORT=${ENABLE_MMAP_HOOK_EXPORT}"
   COMMAND ${CMAKE_COMMAND} -E echo "  MALLOC_HOOK_BUILD_TESTS=${MALLOC_HOOK_BUILD_TESTS}"
+  COMMAND ${CMAKE_COMMAND} -E echo "  MALLOC_HOOK_BUILD_PROBE=${MALLOC_HOOK_BUILD_PROBE}"
   COMMAND ${CMAKE_COMMAND} -E echo "  MALLOC_HOOK_BUILD_GL_TESTS=${MALLOC_HOOK_BUILD_GL_TESTS}"
   COMMAND ${CMAKE_COMMAND} -E echo "  build_gl_tests_effective=${_malloc_hook_build_gl_tests_effective}"
   COMMAND ${CMAKE_COMMAND} -E echo "  compiler_unwind=${MALLOC_HOOK_HAVE_COMPILER_UNWIND}"
@@ -336,6 +338,9 @@ if(MALLOC_HOOK_TARGET_OS STREQUAL "android")
   set(MALLOC_HOOK_HAVE_UNWINDSTACK ON)
 endif()
 add_subdirectory(backtrace)
+if(MALLOC_HOOK_BUILD_PROBE)
+  add_subdirectory(probe)
+endif()
 
 # 添加 .so
 add_library(alloc_hook SHARED ${CMAKE_SOURCE_DIR}/src/alloc_hook.cpp)

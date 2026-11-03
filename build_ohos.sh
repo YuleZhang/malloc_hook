@@ -74,8 +74,12 @@ cmake -S "${SRC_DIR}" -B "${BUILD_DIR}" -G Ninja \
     -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_INSTALL_PREFIX="${SRC_DIR}" \
     -DENABLE_MMAP_HOOK_EXPORT="${ENABLE_MMAP_HOOK_EXPORT:-OFF}" \
-    -DMALLOC_HOOK_BUILD_TESTS=OFF
+    -DMALLOC_HOOK_BUILD_TESTS=OFF \
+    -DMALLOC_HOOK_BUILD_PROBE="${MALLOC_HOOK_BUILD_PROBE:-ON}"
 cmake --build "${BUILD_DIR}" --target install -v
 cmake --build "${BUILD_DIR}" --target print_build_options
 
 echo "Built: ${SRC_DIR}/out/lib/liballoc_hook.so"
+if [[ "${MALLOC_HOOK_BUILD_PROBE:-ON}" == "ON" ]]; then
+    echo "Built: ${SRC_DIR}/out/bin/alloc_hook_probe"
+fi
