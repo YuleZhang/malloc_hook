@@ -8,6 +8,7 @@
 #include <fcntl.h>
 #include <dirent.h>
 #include <unistd.h>
+#include <time.h>
 #ifdef __ANDROID__
 #include <sys/system_properties.h>
 #endif
