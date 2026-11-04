@@ -220,7 +220,7 @@ step 写一份 `<prefix>.step.<MB>MB.txt`，文件名即该段峰值大小——
 版本号以仓库根 `VERSION` 为准（打 tag `v<VERSION>`）。平台构建后 `(cd <build> && cpack)`
 产出 `malloc_hook-<版本>-<abi>.tar.gz`，布局为 `lib/liballoc_hook.so` + `scripts/*.py` +
 `scripts/maps.example.json` + `README.md` + `VERSION`。`dist` 组件为 `EXCLUDE_FROM_ALL`，
-不影响各平台 `build_*.sh` 自身的 `ninja install`。
+不影响统一 `build.sh <os>` 入口的 install 步骤。
 
 ## 支持的平台
 

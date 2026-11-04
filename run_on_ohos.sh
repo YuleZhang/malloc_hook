@@ -28,7 +28,7 @@ MIN_SIZE="${BACKTRACE_MIN_SIZE:-40960}"
 
 if [[ ! -f "${LOCAL_LIB}" ]]; then
     echo "missing hook library: ${LOCAL_LIB}" >&2
-    echo "run ./build_ohos.sh first" >&2
+    echo "run ./build.sh ohos first" >&2
     exit 1
 fi
 
