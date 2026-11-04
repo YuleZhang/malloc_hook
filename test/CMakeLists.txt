@@ -179,6 +179,19 @@ if(NOT ANDROID AND NOT OHOS)
             -P ${CMAKE_CURRENT_SOURCE_DIR}/observe_only_runtime_test.cmake)
     set_tests_properties(observe_only_runtime PROPERTIES TIMEOUT 60)
 
+    if(MALLOC_HOOK_TARGET_OS STREQUAL "linux" AND MALLOC_HOOK_ENABLE_DMA_CAPTURE)
+        add_executable(fd_close_transaction_test fd_close_transaction_test.cpp)
+        target_compile_features(fd_close_transaction_test PRIVATE cxx_std_17)
+        target_compile_definitions(fd_close_transaction_test PRIVATE
+            MALLOC_HOOK_DMA_ACCOUNTING_TEST=1)
+        target_include_directories(fd_close_transaction_test PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/../backtrace/include)
+        target_link_libraries(fd_close_transaction_test PRIVATE
+            helper Threads::Threads)
+        add_test(NAME fd_close_transaction COMMAND fd_close_transaction_test)
+        set_tests_properties(fd_close_transaction PROPERTIES TIMEOUT 10)
+    endif()
+
     if(MALLOC_HOOK_TARGET_OS STREQUAL "linux")
         add_executable(linux_mmap_ioctl_regression_test
             linux_mmap_ioctl_regression_test.cpp)

@@ -70,7 +70,8 @@ set(CPP_EXPORTS
     _ZnwjSt11align_val_t
     _ZnwjSt11align_val_tRKSt9nothrow_t)
 
-set(ALL_FIXTURE_SYMBOLS ${COMMON_EXPORTS} ${CPP_EXPORTS}
+set(FDSAN_EXPORT android_fdsan_close_with_tag)
+set(ALL_FIXTURE_SYMBOLS ${COMMON_EXPORTS} ${CPP_EXPORTS} ${FDSAN_EXPORT}
     helper_private
     _ZN11unwindstack12HiddenSymbolEv
     _ZN7android4base12HiddenSymbolEv
@@ -88,7 +89,7 @@ foreach(SYMBOL IN LISTS ALL_FIXTURE_SYMBOLS)
     "extern \"C\" void fixture_${SYMBOL_INDEX}() {}\n")
 endforeach()
 
-function(verify_policy COMPILER POLICY SCRIPT EXPECT_CPP EXPECT_MMAP)
+function(verify_policy COMPILER POLICY SCRIPT EXPECT_CPP EXPECT_MMAP EXPECT_FDSAN)
   get_filename_component(COMPILER_NAME "${COMPILER}" NAME)
   set(OUTPUT_DIR "${TEST_BINARY_DIR}/${COMPILER_NAME}-${POLICY}")
   file(MAKE_DIRECTORY "${OUTPUT_DIR}")
@@ -133,6 +134,9 @@ function(verify_policy COMPILER POLICY SCRIPT EXPECT_CPP EXPECT_MMAP)
   if(EXPECT_CPP)
     list(APPEND EXPECTED_EXPORTS ${CPP_EXPORTS})
   endif()
+  if(EXPECT_FDSAN)
+    list(APPEND EXPECTED_EXPORTS ${FDSAN_EXPORT})
+  endif()
   list(SORT EXPECTED_EXPORTS)
 
   if(NOT ACTUAL_EXPORTS STREQUAL EXPECTED_EXPORTS)
@@ -158,9 +162,12 @@ foreach(COMPILER IN LISTS COMPILERS)
   # export, mmap family included. The OHOS default of *not* exporting mmap is
   # produced by the CMake strip pass (ENABLE_MMAP_HOOK_EXPORT=OFF), and is
   # verified end to end against the built library by built_platform_export_policy.
-  verify_policy("${COMPILER}" android version_script.ld FALSE TRUE)
-  verify_policy("${COMPILER}" linux version_script.ld FALSE TRUE)
-  verify_policy("${COMPILER}" ohos version_script_ohos.ld TRUE TRUE)
+  # Android and Linux share a *raw* manifest; CMake strips the Android-only
+  # fdsan symbol for Linux in the effective linker policy. Both raw fixture
+  # links must supply that symbol to avoid undefined-global-link failures.
+  verify_policy("${COMPILER}" android version_script.ld FALSE TRUE TRUE)
+  verify_policy("${COMPILER}" linux version_script.ld FALSE TRUE TRUE)
+  verify_policy("${COMPILER}" ohos version_script_ohos.ld TRUE TRUE FALSE)
 endforeach()
 
 message(STATUS "Verified platform export policies with: ${COMPILERS}")

@@ -1,0 +1,69 @@
+name: DMA fdsan close accounting
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/fdsan-close-accounting.yml'
+      - 'CMakeLists.txt'
+      - 'version_script.ld'
+      - 'backtrace/**'
+      - 'src/alloc_hook.cpp'
+      - 'test/**'
+  workflow_dispatch:
+
+jobs:
+  linux-full-ctest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Configure
+        run: >
+          cmake -S . -B build-fdsan -G Ninja
+          -DCMAKE_BUILD_TYPE=Release
+          -DMALLOC_HOOK_BUILD_TESTS=ON
+          -DMALLOC_HOOK_BUILD_GL_TESTS=OFF
+      - name: Build entire host test suite
+        run: cmake --build build-fdsan -j2
+      - name: Run complete host CTest (includes ABI gates)
+        run: ctest --test-dir build-fdsan --output-on-failure
+
+  android-arm64-export:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Use hosted Android SDK / NDK
+        run: |
+          SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          if ! ls "$SDK"/ndk/*/build/cmake/android.toolchain.cmake >/dev/null 2>&1; then
+            "$SDK/cmdline-tools/latest/bin/sdkmanager" --sdk_root="$SDK" --install "ndk;27.2.12479018"
+          fi
+          NDK_DIR=$(dirname "$(dirname "$(dirname "$(ls "$SDK"/ndk/*/build/cmake/android.toolchain.cmake | sort -V | tail -1)")")")
+          echo "NDK_DIR=$NDK_DIR" >> "$GITHUB_ENV"
+          echo "Using NDK: $NDK_DIR"
+      - name: Build Android liballoc_hook.so
+        run: |
+          cmake -S . -B build-android -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE="$NDK_DIR/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-29 \
+            -DCMAKE_BUILD_TYPE=Release -DMALLOC_HOOK_BUILD_TESTS=OFF \
+            -DMALLOC_HOOK_BUILD_GL_TESTS=OFF \
+            -DMALLOC_HOOK_BUILD_FDSAN_DEVICE_GATE=ON
+          cmake --build build-android --target alloc_hook android_fdsan_device_gate -j2
+      - name: Verify Android .so exports Bionic tagged close
+        run: |
+          cmake -DLIBRARY="$GITHUB_WORKSPACE/build-android/liballoc_hook.so" \
+            -DEXPECT_MMAP=1 -DEXPECT_RESOURCE=1 -DEXPECT_CPP=0 \
+            -DEXPECT_FDSAN=1 -P test/built_export_policy_test.cmake
+      - name: Publish device gate and matching hook library
+        uses: actions/upload-artifact@v4
+        with:
+          name: fdsan-device-gate-android-arm64
+          path: |
+            build-android/liballoc_hook.so
+            build-android/android_fdsan_device_gate
+          if-no-files-found: error
+          retention-days: 14

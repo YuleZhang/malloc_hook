@@ -23,5 +23,10 @@ int debug_munmap(void* addr, size_t size);
 void* debug_mremap(void* old_addr, size_t old_size, size_t new_size,
                    int flags, void* new_addr);
 int debug_ioctl(int fd, unsigned long request, void* arg);
+using DebugCloseOperation = int (*)(int fd, void* context);
+int debug_close_with(int fd, DebugCloseOperation operation, void* context);
 int debug_close(int fd);
+#if defined(MALLOC_HOOK_DMA_ACCOUNTING_TEST)
+void debug_seed_dma_fd_for_test(int fd, size_t size);
+#endif
 void* debug_mmap64(void* addr, size_t size, int prot, int flags, int fd, off_t offset);

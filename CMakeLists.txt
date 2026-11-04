@@ -8,6 +8,8 @@ set(MALLOC_HOOK_VERSION "${_MALLOC_HOOK_VERSION_FILE}" CACHE STRING "malloc_hook
 project(malloc_hook VERSION ${MALLOC_HOOK_VERSION} LANGUAGES C CXX ASM)
 
 option(MALLOC_HOOK_BUILD_TESTS "Build malloc_hook test binaries" ON)
+option(MALLOC_HOOK_BUILD_FDSAN_DEVICE_GATE
+  "Build an Android on-device Bionic fdsan / DMA-HEAP regression executable" OFF)
 option(MALLOC_HOOK_BUILD_PROBE "Build and package standalone device memory probe" ON)
 # mmap/munmap/mremap interposition is a platform-neutral capability, but its
 # default differs: OHOS leaves it off to limit loader/vendor runtime
@@ -198,7 +200,10 @@ endif()
 # export is off (OHOS default, or an explicit opt-out on any platform).
 set(_malloc_hook_strip_symbols "")
 if(NOT MALLOC_HOOK_EXPORT_RESOURCE_HOOKS)
-  list(APPEND _malloc_hook_strip_symbols "ioctl" "close")
+  list(APPEND _malloc_hook_strip_symbols "ioctl" "close"
+       "android_fdsan_close_with_tag")
+elseif(NOT MALLOC_HOOK_TARGET_OS STREQUAL "android")
+  list(APPEND _malloc_hook_strip_symbols "android_fdsan_close_with_tag")
 endif()
 if(NOT MALLOC_HOOK_EXPORT_MMAP_HOOK)
   list(APPEND _malloc_hook_strip_symbols "mmap" "mmap64" "munmap" "mremap")
@@ -362,6 +367,12 @@ endif()
 # 安装到 out/lib 目录
 install(TARGETS alloc_hook DESTINATION out/lib)
 
+if(MALLOC_HOOK_TARGET_OS STREQUAL "android" AND MALLOC_HOOK_EXPORT_RESOURCE_HOOKS)
+  set(_malloc_hook_expect_fdsan 1)
+else()
+  set(_malloc_hook_expect_fdsan 0)
+endif()
+
 if(BUILD_TESTING)
   add_test(
     NAME platform_export_policy
@@ -376,6 +387,7 @@ if(BUILD_TESTING)
       "-DEXPECT_MMAP=${MALLOC_HOOK_EXPORT_MMAP_HOOK}"
       "-DEXPECT_RESOURCE=${MALLOC_HOOK_EXPORT_RESOURCE_HOOKS}"
       "-DEXPECT_CPP=${MALLOC_HOOK_EXPORT_CPP_NEW_HOOK}"
+      "-DEXPECT_FDSAN=${_malloc_hook_expect_fdsan}"
       -P ${CMAKE_SOURCE_DIR}/test/built_export_policy_test.cmake)
   add_test(
     NAME fast_capture_boundary_compile
@@ -463,6 +475,18 @@ if(BUILD_TESTING)
         "-DOHOS_ARCH=arm64-v8a"
         -P ${CMAKE_SOURCE_DIR}/test/toolchain_build_gate_test.cmake)
   endif()
+endif()
+
+# Keep the device gate independent from the broad host/gmock suite. NDK CI can
+# build it with MALLOC_HOOK_BUILD_TESTS=OFF, and a tester can push one small ELF
+# alongside liballoc_hook.so to an actual Android API >= 29 device.
+if(ANDROID AND MALLOC_HOOK_BUILD_FDSAN_DEVICE_GATE)
+  add_executable(android_fdsan_device_gate test/android_fdsan_device_gate.cpp)
+  target_compile_features(android_fdsan_device_gate PRIVATE cxx_std_17)
+  target_include_directories(android_fdsan_device_gate PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/backtrace/driver/dma_heap)
+  target_link_libraries(android_fdsan_device_gate PRIVATE ${CMAKE_DL_LIBS})
+  install(TARGETS android_fdsan_device_gate DESTINATION out/bin)
 endif()
 
 if (MALLOC_HOOK_BUILD_TESTS)

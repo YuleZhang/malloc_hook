@@ -6,6 +6,7 @@
 #endif
 #include <unistd.h>
 #include <algorithm>
+#include <atomic>
 #include <cstdarg>
 #include <cstddef>
 #include <cstdint>
@@ -17,6 +18,10 @@
 #include <dlfcn.h>
 #include <fcntl.h>
 #include <link.h>
+#include <pthread.h>
+#if defined(MALLOC_HOOK_TARGET_OS_ANDROID)
+#include <android/api-level.h>
+#endif
 
 #include "DebugData.h"
 #include "ObserveOnlyProbe.h"
@@ -249,6 +254,45 @@ int CallRealIoctl(int fd, unsigned long request, void* arg) {
 int CallRealClose(int fd) {
     return static_cast<int>(syscall(SYS_close, fd));
 }
+
+#if defined(MALLOC_HOOK_TARGET_OS_ANDROID)
+// Preserve the *real* Bionic ownership-tag check. Bionic calls ___close,
+// which does not go through the public close interposer.
+using FdsanCloseFn = int (*)(int, uint64_t);
+std::atomic<FdsanCloseFn> g_real_fdsan_close{nullptr};
+pthread_mutex_t g_fdsan_resolve_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+FdsanCloseFn RealFdsanCloseFunction() {
+    FdsanCloseFn fn = g_real_fdsan_close.load(std::memory_order_acquire);
+    if (fn != nullptr) {
+        return fn;
+    }
+
+    // ResolveLibcSymbol can reject a nested/concurrent attempt while another
+    // symbol is being resolved. A null lookup is NOT a permanent property of
+    // Bionic: do not cache failure or turn a transient recursion guard into a
+    // permanent ENOSYS on every subsequent tagged close.
+    if (g_resolving_symbols) {
+        return nullptr;
+    }
+    pthread_mutex_lock(&g_fdsan_resolve_mutex);
+    fn = g_real_fdsan_close.load(std::memory_order_relaxed);
+    if (fn == nullptr && !g_resolving_symbols) {
+        fn = reinterpret_cast<FdsanCloseFn>(
+                ResolveLibcSymbol("android_fdsan_close_with_tag"));
+        if (fn != nullptr) {
+            g_real_fdsan_close.store(fn, std::memory_order_release);
+        }
+    }
+    pthread_mutex_unlock(&g_fdsan_resolve_mutex);
+    return fn;
+}
+struct FdsanCloseContext { FdsanCloseFn fn; uint64_t tag; };
+int InvokeFdsanClose(int fd, void* opaque) {
+    auto* context = static_cast<FdsanCloseContext*>(opaque);
+    return context->fn(fd, context->tag);
+}
+#endif
 #endif
 
 #if MALLOC_HOOK_EXPORT_MMAP_HOOK
@@ -390,6 +434,11 @@ void InitializeTargetScope() {
     // A preinit fork child must not enter dlsym while inheriting loader locks.
     // Resolve every forwarding entry in the parent before libc runs callbacks.
     ResolveAllLibcAllocationSymbols();
+#if defined(MALLOC_HOOK_TARGET_OS_ANDROID) && MALLOC_HOOK_EXPORT_RESOURCE_HOOKS
+    // Cache Bionic's tagged-close entry in the parent before fork; a suppressed
+    // child must not need to acquire a possibly inherited symbol-resolve lock.
+    (void)RealFdsanCloseFunction();
+#endif
     (void)RealForkFunction();
     if (observe_only::InitializeTargetProcess() &&
         observe_only::TargetProcessInitialized()) {
@@ -442,6 +491,9 @@ public:
         return debug_ioctl(fd, request, arg);
     }
     int close(int fd) { return debug_close(fd); }
+    int close_with(int fd, DebugCloseOperation op, void* context) {
+        return debug_close_with(fd, op, context);
+    }
 #if !defined(mmap64)
     void* mmap64(void* addr, size_t size, int prot, int flags, int fd, off_t offset) {
         return debug_mmap64(addr, size, prot, flags, fd, offset);
@@ -704,6 +756,32 @@ int close(int fd) {
     }
     return AllocHook::inst().close(fd);
 }
+
+#if defined(MALLOC_HOOK_TARGET_OS_ANDROID)
+int android_fdsan_close_with_tag(int fd, uint64_t tag) {
+    const int saved_errno = errno;
+    FdsanCloseFn fn = RealFdsanCloseFunction();
+    errno = saved_errno;
+    if (fn == nullptr) {
+        // Older devices have no fdsan. For API >=29 an unresolved symbol is
+        // an error: never silently bypass ownership validation using raw close.
+        const int api = android_get_device_api_level();
+        if (api < 0 || api >= 29) {
+            errno = ENOSYS;
+            return -1;
+        }
+        if (in_preinit_phase || InitState::allocHook_setup || observe_only::Bypassed()) {
+            return CallRealClose(fd);
+        }
+        return AllocHook::inst().close(fd);
+    }
+    if (in_preinit_phase || InitState::allocHook_setup || observe_only::Bypassed()) {
+        return fn(fd, tag);
+    }
+    FdsanCloseContext context{fn, tag};
+    return AllocHook::inst().close_with(fd, InvokeFdsanClose, &context);
+}
+#endif
 #endif
 
 #if MALLOC_HOOK_EXPORT_MMAP_HOOK && !defined(mmap64)
