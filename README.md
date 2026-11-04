@@ -177,10 +177,11 @@ Full command lines, output, and how to read every report field are in
 
 ### Trigger a checkpoint from C/C++ business code
 
-Insert the following directly at the point where you want a live memory
-snapshot (for example, after model warmup or before and after a pipeline stage).
-The target is **the current process**; no external shell command or PID lookup
-is needed.
+Copy the helper below into a C++ source file. Call
+`DumpAllocHookCheckpoint();` **at the exact point in your workload** where
+you want a live memory snapshot (for example, after model warmup, or before
+and after a pipeline stage). The target is **the current process**: no
+external shell command or PID lookup is needed.
 
 ```cpp
 #include <cerrno>
@@ -190,13 +191,16 @@ is needed.
 #include <unistd.h>
 
 // Android / Bionic: trigger a checkpoint at this exact point in your code.
-if (kill(getpid(), 33) == -1) {
-    std::fprintf(stderr, "malloc_hook checkpoint failed: %s\n",
-                 std::strerror(errno));
+static void DumpAllocHookCheckpoint() {
+    if (kill(getpid(), 33) == -1) {
+        std::fprintf(stderr, "malloc_hook checkpoint failed: %s\n",
+                     std::strerror(errno));
+    }
 }
 ```
 
-The signal in the example matches `backtrace/src/Config.cpp` on Android:
+Call `DumpAllocHookCheckpoint();` from your existing function at the chosen
+checkpoint location. The signal in the example matches `backtrace/src/Config.cpp` on Android:
 `BIONIC_SIGNAL_BACKTRACE = 33`. For other supported platforms, replace
 **only the second argument** to `kill`:
 

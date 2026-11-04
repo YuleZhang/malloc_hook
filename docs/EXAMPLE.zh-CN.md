@@ -99,6 +99,7 @@ mmap 和资源 hook 受目标平台导出策略控制。直接系统调用和未
 
 导出的 C 函数 `checkpoint(const char*)` 可以将报告写到指定路径。
 更常见的用法是**在业务 C++ 代码的准确时机触发**（下面是 Android 示例，
+复制辅助函数后，在需要观察的位置调用 `DumpAllocHookCheckpoint();`。
 要求当前进程已加载并初始化 Hook）：
 
 ```cpp
@@ -109,9 +110,11 @@ mmap 和资源 hook 受目标平台导出策略控制。直接系统调用和未
 #include <unistd.h>
 
 // Android / Bionic：在业务代码需要观察内存的准确时机插入
-if (kill(getpid(), 33) == -1) {
-    std::fprintf(stderr, "malloc_hook checkpoint failed: %s\n",
-                 std::strerror(errno));
+static void DumpAllocHookCheckpoint() {
+    if (kill(getpid(), 33) == -1) {
+        std::fprintf(stderr, "malloc_hook checkpoint failed: %s\n",
+                     std::strerror(errno));
+    }
 }
 ```
 

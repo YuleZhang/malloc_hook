@@ -149,9 +149,10 @@ backtrace 信号，OHOS 为 `46`，其他平台为 `SIGRTMIN+6`）。
 
 ### 在业务 C/C++ 代码指定时机触发 checkpoint
 
-直接把下面代码插在**需要观察内存状态的业务位置**，例如 warmup 完成后、
-HDR Merge 前后或某次 execute 结束时。这里通过 `getpid()` 给**当前进程**
-发送信号，不需要终端命令、adb/hdc 或手动查找 PID。
+把以下辅助函数复制进 C++ 源文件，并在**需要观察内存状态的业务位置**
+调用 `DumpAllocHookCheckpoint();`，例如 warmup 完成后、HDR Merge 前后
+或某次 execute 结束时。这里通过 `getpid()` 给**当前进程**发送信号，
+不需要终端命令、adb/hdc 或手动查找 PID。
 
 ```cpp
 #include <cerrno>
@@ -161,9 +162,11 @@ HDR Merge 前后或某次 execute 结束时。这里通过 `getpid()` 给**当�
 #include <unistd.h>
 
 // Android / Bionic：在业务代码需要观察内存的准确时机插入
-if (kill(getpid(), 33) == -1) {
-    std::fprintf(stderr, "malloc_hook checkpoint failed: %s\n",
-                 std::strerror(errno));
+static void DumpAllocHookCheckpoint() {
+    if (kill(getpid(), 33) == -1) {
+        std::fprintf(stderr, "malloc_hook checkpoint failed: %s\n",
+                     std::strerror(errno));
+    }
 }
 ```
 
