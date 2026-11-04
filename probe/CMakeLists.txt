@@ -17,6 +17,10 @@ target_include_directories(alloc_hook_probe PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/../backtrace/driver/dma_heap)
 if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
   target_compile_options(alloc_hook_probe PRIVATE -Wall -Wextra -Werror)
+  if(OHOS OR MALLOC_HOOK_TARGET_OS STREQUAL "ohos")
+    target_compile_options(alloc_hook_probe PRIVATE
+      -Wno-error=unused-command-line-argument)
+  endif()
 endif()
 install(TARGETS alloc_hook_probe RUNTIME DESTINATION out/bin)
 
