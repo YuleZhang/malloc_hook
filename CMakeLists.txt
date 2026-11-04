@@ -519,11 +519,15 @@ endif()
 # Distribution package (cpack): a self-contained tarball with the hook, the
 # Python trace tooling and the docs, for quick sharing and use.
 #   cmake --build <build> && (cd <build> && cpack)
-# -> malloc_hook-<version>-<abi>.tar.gz : lib/ + scripts/ + README + VERSION.
+# -> malloc_hook-<version>-<abi>.tar.gz : lib/ + bin/ + scripts/ + README + VERSION.
 # The `dist` component is EXCLUDE_FROM_ALL so a plain `ninja install` (used by
 # the platform build_*.sh scripts) is unaffected.
 # --------------------------------------------------------------------------- #
 install(TARGETS alloc_hook LIBRARY DESTINATION lib COMPONENT dist EXCLUDE_FROM_ALL)
+if(TARGET alloc_hook_probe)
+  install(TARGETS alloc_hook_probe
+      RUNTIME DESTINATION bin COMPONENT dist EXCLUDE_FROM_ALL)
+endif()
 install(FILES
     ${CMAKE_SOURCE_DIR}/scripts/process_memory_stack.py
     ${CMAKE_SOURCE_DIR}/scripts/build_perfetto_alloc_track.py
