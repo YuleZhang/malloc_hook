@@ -2,12 +2,17 @@
 set -euo pipefail
 
 BUILD_ARCH="${1:-arm64-v8a}"
-SRC_DIR=$(cd "$(dirname "$0")" && pwd)
+SRC_DIR=$(cd "$(dirname "$0")/../.." && pwd)
 NDK_URL="${OHOS_NDK_URL:-}"
 DEPS_DIR="${SRC_DIR}/.deps"
 AUTO_NDK_DIR="${DEPS_DIR}/ohos_ndk/native"
 
 case "${BUILD_ARCH}" in
+    -h|--help)
+        echo "usage: ./build.sh ohos [arm64-v8a|armeabi-v7a|x86_64]"
+        echo "Set OHOS_NDK_ROOT or NDK_ROOT; optionally ENABLE_MMAP_HOOK_EXPORT=ON."
+        exit 0
+        ;;
     arm64-v8a|armeabi-v7a|x86_64) ;;
     *)
         echo "BUILD_ARCH must be one of: arm64-v8a, armeabi-v7a, x86_64" >&2

@@ -5,6 +5,13 @@ if(NOT DEFINED REPO_ROOT)
 endif()
 
 foreach(required_file IN ITEMS
+    build.sh
+    test/build_entrypoint_test.cmake
+    scripts/build/android.sh
+    scripts/build/linux.sh
+    scripts/build/ohos.sh
+    cmake/exports/android-linux.ld
+    cmake/exports/ohos.ld
     test/platform_export_policy_test.cmake
     test/built_export_policy_test.cmake
     test/platform_capture_compile_test.cmake
@@ -21,6 +28,18 @@ foreach(required_file IN ITEMS
   endif()
 endforeach()
 
+file(READ "${REPO_ROOT}/build.sh" build_dispatcher)
+foreach(required_os IN ITEMS android linux ohos)
+  string(FIND "${build_dispatcher}" "android|linux|ohos)" os_position)
+  if(os_position EQUAL -1)
+    message(FATAL_ERROR "Build dispatcher does not route ${required_os}")
+  endif()
+endforeach()
+if(EXISTS "${REPO_ROOT}/build_android.sh" OR
+   EXISTS "${REPO_ROOT}/build_linux.sh" OR
+   EXISTS "${REPO_ROOT}/build_ohos.sh")
+  message(FATAL_ERROR "Legacy root build scripts must not be reintroduced")
+endif()
 file(READ "${REPO_ROOT}/CMakeLists.txt" root_cmake)
 foreach(required_registration IN ITEMS
     "NAME platform_export_policy"
