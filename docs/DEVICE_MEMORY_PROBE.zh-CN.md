@@ -12,17 +12,22 @@
 
 默认 \`MALLOC_HOOK_BUILD_PROBE=ON\`。
 
-- Android：原仓库 \`build_android.sh\` 的 \`ninja install\` 同时安装 \`out/bin/alloc_hook_probe\`。该脚本后续的设备自动测试仍需原有 \`alloc_hook_test\` 环境；只编译或手工安装 probe 可直接使用 CMake。
-- OHOS：\`build_ohos.sh\` 同样在 \`out/bin/\` 安装独立 probe。
-- glibc Linux / embedded Linux：\`build_linux.sh arm64\` 或 \`build_linux.sh host\` 分别发布 \`out/linux-arm64/bin/alloc_hook_probe\` / \`out/linux-host/bin/alloc_hook_probe\`。
+- Android：设置 \`ANDROID_NDK_ROOT\`（或 \`NDK_ROOT\`）后执行 \`./build.sh android arm64-v8a\`，安装独立 probe 到 \`out/android-arm64-v8a/out/bin/alloc_hook_probe\`。其他 ABI 使用对应的 \`out/android-<abi>/out/bin/\` 目录。
+- OHOS：设置 \`OHOS_NDK_ROOT\`（或 \`NDK_ROOT\`）后执行 \`./build.sh ohos arm64-v8a\`，安装独立 probe 到 \`out/bin/alloc_hook_probe\`。
+- glibc Linux / embedded Linux：\`./build.sh linux arm64\` 或 \`./build.sh linux host\` 分别发布 \`out/linux-arm64/bin/alloc_hook_probe\` / \`out/linux-host/bin/alloc_hook_probe\`。arm64 交叉编译需要设置 \`ARM_GNU_TOOLCHAIN_PATH\`；host 默认运行本机测试。
+
+以上命令从仓库根目录执行，OS 参数必须显式提供。Android 构建不再自动执行 \`adb\` 部署或设备测试；probe 不依赖 \`alloc_hook_test\`，构建后按下一节手工部署、执行。
+
 - 只编译 probe（不构建 hook 依赖）：\`cmake -S probe -B build-probe -G Ninja && cmake --build build-probe\`。跨平台时使用对应 NDK / aarch64 交叉工具链。
 
-禁用：\`-DMALLOC_HOOK_BUILD_PROBE=OFF\`。
+使用统一构建入口时，禁用 probe：\`MALLOC_HOOK_BUILD_PROBE=OFF ./build.sh <os> [arch]\`。直接配置 CMake 时使用 \`-DMALLOC_HOOK_BUILD_PROBE=OFF\`。
 
 ## 第一步：只读能力探测
 
+下面以 Android arm64-v8a 为例（主机端执行）：
+
 \`\`\`bash
-adb push out/bin/alloc_hook_probe /data/local/tmp/
+adb push out/android-arm64-v8a/out/bin/alloc_hook_probe /data/local/tmp/
 adb shell chmod 755 /data/local/tmp/alloc_hook_probe
 adb shell /data/local/tmp/alloc_hook_probe inspect \
   > device-capability.jsonl
