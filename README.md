@@ -175,37 +175,55 @@ Which mode a run is in is decided entirely by which variables above are set:
 Full command lines, output, and how to read every report field are in
 [`docs/get_hook_report.md`](docs/get_hook_report.md).
 
-### Trigger a checkpoint in a running process
+### Trigger a checkpoint from C/C++ business code
 
-A checkpoint signal asks the target process to write its current report; **it
-does not terminate the process**. Send the platform-specific signal to its PID:
+Insert the following directly at the point where you want a live memory
+snapshot (for example, after model warmup or before and after a pipeline stage).
+The target is **the current process**; no external shell command or PID lookup
+is needed.
 
-```sh
-# Android / Bionic: BIONIC_SIGNAL_BACKTRACE = SIGRTMIN + 1 (signal 33)
-adb shell kill -33 <pid>
+```cpp
+#include <cerrno>
+#include <cstdio>
+#include <cstring>
+#include <signal.h>
+#include <unistd.h>
 
-# OpenHarmony
-hdc shell kill -46 <pid>
-
-# glibc Linux: SIGRTMIN + 6
-kill -s RTMIN+6 <pid>
+// Android / Bionic: trigger a checkpoint at this exact point in your code.
+if (kill(getpid(), 33) == -1) {
+    std::fprintf(stderr, "malloc_hook checkpoint failed: %s\n",
+                 std::strerror(errno));
+}
 ```
 
-The signal handler only queues the request; a dedicated worker writes the
-report. Look for `*.signal.pid_<pid>.time_<t>.txt` under
-`ALLOC_HOOK_DUMP_PREFIX` (default `/data/local/tmp/trace/backtrace_heap`).
-On Android, signal 33 is Bionic's reserved backtrace signal; do not substitute
-`SIGKILL`, `SIGTERM`, or the ART/heapprofd profiling signal. See the
-[Bionic reserved signal definitions](https://android.googlesource.com/platform/bionic/+/refs/heads/main/libc/platform/bionic/reserved_signals.h).
+The signal in the example matches `backtrace/src/Config.cpp` on Android:
+`BIONIC_SIGNAL_BACKTRACE = 33`. For other supported platforms, replace
+**only the second argument** to `kill`:
 
-For example, on an Android device with target PID 1234:
+| Target | In-process expression |
+| --- | --- |
+| Android/Bionic | `kill(getpid(), 33)` |
+| OpenHarmony/OHOS | `kill(getpid(), 46)` |
+| glibc Linux | `kill(getpid(), SIGRTMIN + 6)` |
 
-```sh
-adb shell kill -33 1234
-```
+The call is asynchronous: `kill()` returning `0` means the signal was sent,
+**not** that the checkpoint file was written. After the handler queues the
+request, the library's worker writes
+`<prefix>.signal.pid_<pid>.time_<t>.txt` (default prefix:
+`/data/local/tmp/trace/backtrace_heap`; configurable through
+`ALLOC_HOOK_DUMP_PREFIX`). The process continues running.
 
-To stop the process, use its normal shutdown path or a separate termination
-signal after collecting the checkpoint. `SIGKILL` cannot flush the worker.
+**Prerequisites:** `liballoc_hook.so` must already be loaded into this
+process, initialization must have installed its signal handler, and the
+checkpoint worker must be ready. Do not send this signal to an uninstrumented
+process: its default action may terminate the process. An observe-only run
+does not produce allocation-stack checkpoints. To capture call stacks rather
+than only tracked totals, enable a reporting mode that records stacks at
+startup (see `DUMP_PEAK_VALUE_MB` / `DUMP_PEAK_STEP_MB` above).
+See the [Android Bionic reserved-signal definitions](https://android.googlesource.com/platform/bionic/+/refs/heads/main/libc/platform/bionic/reserved_signals.h).
+
+This is **not** `SIGKILL` or a request to exit. `SIGKILL` cannot flush
+the reporting worker.
 
 ## Perfetto timeline & offline tooling
 

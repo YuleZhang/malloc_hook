@@ -97,13 +97,30 @@ mmap 和资源 hook 受目标平台导出策略控制。直接系统调用和未
 
 ## 5. 检查点和输出
 
-导出的 C 函数 `checkpoint(const char*)` 会将存活分配报告写入指定路径。平台的
-backtrace 信号会将同一工作排入专用 worker（Android 为 Bionic 保留的 backtrace 信号，
-OHOS 为 `46`，其他平台为 `SIGRTMIN+6`）：
+导出的 C 函数 `checkpoint(const char*)` 可以将报告写到指定路径。
+更常见的用法是**在业务 C++ 代码的准确时机触发**（下面是 Android 示例，
+要求当前进程已加载并初始化 Hook）：
 
-```sh
-kill -46 <pid>   # OHOS；请使用对应平台的 backtrace 信号
+```cpp
+#include <cerrno>
+#include <cstdio>
+#include <cstring>
+#include <signal.h>
+#include <unistd.h>
+
+// Android / Bionic：在业务代码需要观察内存的准确时机插入
+if (kill(getpid(), 33) == -1) {
+    std::fprintf(stderr, "malloc_hook checkpoint failed: %s\n",
+                 std::strerror(errno));
+}
 ```
+
+OHOS 将调用改为 `kill(getpid(), 46)`；glibc Linux 使用
+`kill(getpid(), SIGRTMIN + 6)`。信号只投递异步报告任务，
+`kill()` 返回成功不代表文件已经生成，正确安装 Hook handler 后不会终止进程。
+报告保存为 `<prefix>.signal.pid_<pid>.time_<t>.txt`，前缀由
+`ALLOC_HOOK_DUMP_PREFIX` 配置。**不要在 Hook 信号处理器安装前，
+或未加载 Hook 的进程中直接发送该信号**。
 
 报告包含 host/资源总量、分配大小和类型、时间戳、抓栈状态/错误、解析状态，以及
 模块快照和符号器可用时的符号化栈。正常退出会在报告前刷新尚未处理的唯一栈。

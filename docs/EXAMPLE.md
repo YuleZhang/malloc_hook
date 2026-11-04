@@ -105,14 +105,32 @@ capture failures.
 
 ## 5. Checkpoints and output
 
-The exported C function `checkpoint(const char*)` writes a live-allocation
-report to the requested path. The platform's backtrace signal queues the same
-work onto a dedicated worker (Bionic's reserved backtrace signal on Android,
-`46` on OHOS, `SIGRTMIN+6` elsewhere):
+The exported C function `checkpoint(const char*)` writes a report to a
+requested path. Alternatively, you can request a live checkpoint **at a chosen
+point in your C++ workload** by sending the project's dump signal to the
+current process (Android example; requires the hook to be initialized):
 
-```sh
-kill -46 <pid>   # OHOS; use the platform's backtrace signal
+```cpp
+#include <cerrno>
+#include <cstdio>
+#include <cstring>
+#include <signal.h>
+#include <unistd.h>
+
+// Android / Bionic: trigger a checkpoint at this exact point in your code.
+if (kill(getpid(), 33) == -1) {
+    std::fprintf(stderr, "malloc_hook checkpoint failed: %s\n",
+                 std::strerror(errno));
+}
 ```
+
+For OHOS use `kill(getpid(), 46)`; for glibc Linux use
+`kill(getpid(), SIGRTMIN + 6)`. The signal queues an asynchronous worker
+report; `kill()` success does not mean the file is ready. The process is
+**not** terminated by a properly installed hook handler. Reports are named
+`<prefix>.signal.pid_<pid>.time_<t>.txt` using `ALLOC_HOOK_DUMP_PREFIX`.
+Do not send this signal before the hook's handler is installed or into an
+uninstrumented process.
 
 The report contains host/resource totals, allocation sizes and types, timestamps,
 capture state/error, resolution state, and symbolized frames when the module

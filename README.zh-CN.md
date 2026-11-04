@@ -147,37 +147,51 @@ backtrace 信号，OHOS 为 `46`，其他平台为 `SIGRTMIN+6`）。
 完整命令行、输出和每个报告字段的读法见
 [`docs/get_hook_report.zh-CN.md`](docs/get_hook_report.zh-CN.md)。
 
-### 对运行中的进程主动触发 checkpoint（重点）
+### 在业务 C/C++ 代码指定时机触发 checkpoint
 
-checkpoint 信号让**目标进程输出当前存活分配报告，不会杀死目标进程**。
-给目标 PID 发送与平台匹配的信号：
+直接把下面代码插在**需要观察内存状态的业务位置**，例如 warmup 完成后、
+HDR Merge 前后或某次 execute 结束时。这里通过 `getpid()` 给**当前进程**
+发送信号，不需要终端命令、adb/hdc 或手动查找 PID。
 
-```sh
-# Android / Bionic：BIONIC_SIGNAL_BACKTRACE = SIGRTMIN + 1，即 signal 33
-adb shell kill -33 <pid>
+```cpp
+#include <cerrno>
+#include <cstdio>
+#include <cstring>
+#include <signal.h>
+#include <unistd.h>
 
-# OpenHarmony
-hdc shell kill -46 <pid>
-
-# glibc Linux：SIGRTMIN + 6
-kill -s RTMIN+6 <pid>
+// Android / Bionic：在业务代码需要观察内存的准确时机插入
+if (kill(getpid(), 33) == -1) {
+    std::fprintf(stderr, "malloc_hook checkpoint failed: %s\n",
+                 std::strerror(errno));
+}
 ```
 
-例如 Android 设备上目标进程 PID 为 1234：
+上例的 `33` 对应 Android/Bionic 的 `BIONIC_SIGNAL_BACKTRACE`，
+与本仓库 `backtrace/src/Config.cpp` 的信号选择一致。其他平台只需
+**替换 `kill` 的第二个参数**：
 
-```sh
-adb shell kill -33 1234
-```
+| 目标平台 | 业务代码中的调用 |
+| --- | --- |
+| Android / Bionic | `kill(getpid(), 33)` |
+| OpenHarmony / OHOS | `kill(getpid(), 46)` |
+| glibc Linux | `kill(getpid(), SIGRTMIN + 6)` |
 
-信号处理函数只负责将请求放入队列，随后由专用 worker 写报告。
-到目标进程 stderr/log 输出以及 `ALLOC_HOOK_DUMP_PREFIX` 指定目录查找
-`*.signal.pid_<pid>.time_<t>.txt`（默认前缀为
-`/data/local/tmp/trace/backtrace_heap`）。
+`kill()` 返回 `0` 仅表示信号发送成功，**不代表报告已经写完**。
+信号处理函数把任务提交给 Hook 的 worker，报告异步写成
+`<prefix>.signal.pid_<pid>.time_<t>.txt`，默认前缀为
+`/data/local/tmp/trace/backtrace_heap`，可以通过 `ALLOC_HOOK_DUMP_PREFIX`
+修改。目标进程继续执行，不会因为 checkpoint 而退出。
 
-**注意：** Android 的 33 是 Bionic 保留的 backtrace 信号，不要误用
-`SIGKILL`、`SIGTERM` 或 ART/heapprofd 的信号。Linux 的信号编号不要照搬到
-Android/OHOS。信号只触发 checkpoint；终止进程应使用正常退出流程，
-不要用 `SIGKILL` 期待它刷新 worker。
+**使用前提：** `liballoc_hook.so` 已经加载到当前进程，初始化已安装
+对应的信号处理函数，且报告 worker 已就绪。不要向未加载 Hook 的进程
+盲目发送该信号：默认信号动作可能终止进程。只观测模式不支持分配栈
+checkpoint；如果希望报告中包含调用栈，而不只是无栈的跟踪数据，
+需要在进程启动前选择启用抓栈的报告模式（见上面的
+`DUMP_PEAK_VALUE_MB` / `DUMP_PEAK_STEP_MB`）。
+Android 信号定义参见 [Bionic reserved_signals.h](https://android.googlesource.com/platform/bionic/+/refs/heads/main/libc/platform/bionic/reserved_signals.h)。
+
+这是主动生成诊断报告，**不是杀掉进程**。不要用 `SIGKILL` 期待它刷新 worker。
 
 ## Perfetto 时间线与离线工具
 
