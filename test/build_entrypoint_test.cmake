@@ -10,37 +10,37 @@ set(SCRIPTS
     scripts/build/ohos.sh)
 foreach(script IN LISTS SCRIPTS)
   execute_process(
-    COMMAND "\${BASH_EXECUTABLE}" -n "\${REPO_ROOT}/\${script}"
+    COMMAND "${BASH_EXECUTABLE}" -n "${REPO_ROOT}/${script}"
     RESULT_VARIABLE syntax_result
     OUTPUT_VARIABLE syntax_out
     ERROR_VARIABLE syntax_err)
   if(NOT syntax_result EQUAL 0)
-    message(FATAL_ERROR "bash -n failed for \${script}:\n\${syntax_out}\${syntax_err}")
+    message(FATAL_ERROR "bash -n failed for ${script}:\n${syntax_out}${syntax_err}")
   endif()
 endforeach()
 
 execute_process(
-  COMMAND "\${BASH_EXECUTABLE}" "\${REPO_ROOT}/build.sh"
+  COMMAND "${BASH_EXECUTABLE}" "${REPO_ROOT}/build.sh"
   RESULT_VARIABLE no_os_result
   OUTPUT_VARIABLE no_os_out
   ERROR_VARIABLE no_os_err)
 if(NOT no_os_result EQUAL 2 OR
-   NOT "\${no_os_out}\${no_os_err}" MATCHES "target OS is required")
+   NOT "${no_os_out}${no_os_err}" MATCHES "target OS is required")
   message(FATAL_ERROR "build.sh must reject a missing OS with status 2")
 endif()
 
 execute_process(
-  COMMAND "\${BASH_EXECUTABLE}" "\${REPO_ROOT}/build.sh" unsupported
+  COMMAND "${BASH_EXECUTABLE}" "${REPO_ROOT}/build.sh" unsupported
   RESULT_VARIABLE unknown_result
   OUTPUT_VARIABLE unknown_out
   ERROR_VARIABLE unknown_err)
 if(NOT unknown_result EQUAL 2 OR
-   NOT "\${unknown_out}\${unknown_err}" MATCHES "Unsupported OS")
+   NOT "${unknown_out}${unknown_err}" MATCHES "Unsupported OS")
   message(FATAL_ERROR "build.sh must reject an unknown OS with status 2")
 endif()
 
 execute_process(
-  COMMAND "\${BASH_EXECUTABLE}" "\${REPO_ROOT}/build.sh" --help
+  COMMAND "${BASH_EXECUTABLE}" "${REPO_ROOT}/build.sh" --help
   RESULT_VARIABLE help_result
   OUTPUT_VARIABLE help_out
   ERROR_VARIABLE help_err)
