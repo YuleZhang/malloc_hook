@@ -165,9 +165,9 @@ foreach(COMPILER IN LISTS COMPILERS)
   # Android and Linux share a *raw* manifest; CMake strips the Android-only
   # fdsan symbol for Linux in the effective linker policy. Both raw fixture
   # links must supply that symbol to avoid undefined-global-link failures.
-  verify_policy("${COMPILER}" android version_script.ld FALSE TRUE TRUE)
-  verify_policy("${COMPILER}" linux version_script.ld FALSE TRUE TRUE)
-  verify_policy("${COMPILER}" ohos version_script_ohos.ld TRUE TRUE FALSE)
+  verify_policy("${COMPILER}" android cmake/exports/android-linux.ld FALSE TRUE TRUE)
+  verify_policy("${COMPILER}" linux cmake/exports/android-linux.ld FALSE TRUE TRUE)
+  verify_policy("${COMPILER}" ohos cmake/exports/ohos.ld TRUE TRUE FALSE)
 endforeach()
 
 message(STATUS "Verified platform export policies with: ${COMPILERS}")

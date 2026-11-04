@@ -3,11 +3,11 @@
 set -euo pipefail
 
 BUILD_ARCH="${1:-arm64}"
-SRC_DIR=$(cd "$(dirname "$0")" && pwd)
+SRC_DIR=$(cd "$(dirname "$0")/../.." && pwd)
 
 usage() {
     cat >&2 <<'EOF'
-usage: ./build_linux.sh [arm64|host]
+usage: ./build.sh linux [arm64|host]
 
   arm64   cross-compile for aarch64 glibc Linux (default); requires
           ARM_GNU_TOOLCHAIN_PATH.

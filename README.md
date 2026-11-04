@@ -86,6 +86,30 @@ Chinese entry points:
 [`docs/EXAMPLE.zh-CN.md`](docs/EXAMPLE.zh-CN.md), and
 [`docs/GPU_MEMORY_ACCOUNTING.zh-CN.md`](docs/GPU_MEMORY_ACCOUNTING.zh-CN.md).
 
+## Build
+
+The target OS is mandatory; the dispatcher intentionally refuses to infer it
+from the host machine. Platform-specific toolchain logic lives under
+`scripts/build/`, with separate build directories per target.
+
+```sh
+# Android (NDK_ROOT or ANDROID_NDK_ROOT is required)
+NDK_ROOT=/path/to/android-ndk ./build.sh android arm64-v8a
+
+# glibc Linux host build + complete CTest
+./build.sh linux host
+
+# glibc Linux/aarch64 cross build
+ARM_GNU_TOOLCHAIN_PATH=/path/to/aarch64-none-linux-gnu ./build.sh linux arm64
+
+# OpenHarmony
+OHOS_NDK_ROOT=/path/to/ohos-sdk/native ./build.sh ohos arm64-v8a
+```
+
+Run `./build.sh <os> --help` for platform-specific options. The dispatcher
+does not deploy to a device or run a workload; build, deployment, and runtime
+debugging remain separate operations.
+
 ## Configuration
 
 Everything is configured through the two tables below. There are no other
@@ -104,8 +128,10 @@ switches: if a behaviour is not listed here, it is not tunable.
 copy of the UAPI is used, so a cross toolchain missing that header still gets
 DMA capture. Nothing needs to be set for this.
 
-`build_android.sh`, `build_linux.sh`, and `build_ohos.sh` print the effective
-options and derived export policy after a successful build. For a manual CMake
+The unified `build.sh` requires an explicit target OS (`android`, `linux`, or
+`ohos`) and dispatches to isolated platform backends under `scripts/build/`.
+It never guesses the target from the build host. Each backend prints the
+effective options and derived export policy after a successful build. For a manual CMake
 build, run `cmake --build <build-dir> --target print_build_options`.
 
 ### Runtime options (environment)
@@ -148,6 +174,60 @@ Which mode a run is in is decided entirely by which variables above are set:
 
 Full command lines, output, and how to read every report field are in
 [`docs/get_hook_report.md`](docs/get_hook_report.md).
+
+### Trigger a checkpoint from C/C++ business code
+
+Copy the helper below into a C++ source file. Call
+`DumpAllocHookCheckpoint();` **at the exact point in your workload** where
+you want a live memory snapshot (for example, after model warmup, or before
+and after a pipeline stage). The target is **the current process**: no
+external shell command or PID lookup is needed.
+
+```cpp
+#include <cerrno>
+#include <cstdio>
+#include <cstring>
+#include <signal.h>
+#include <unistd.h>
+
+// Android / Bionic: trigger a checkpoint at this exact point in your code.
+static void DumpAllocHookCheckpoint() {
+    if (kill(getpid(), 33) == -1) {
+        std::fprintf(stderr, "malloc_hook checkpoint failed: %s\n",
+                     std::strerror(errno));
+    }
+}
+```
+
+Call `DumpAllocHookCheckpoint();` from your existing function at the chosen
+checkpoint location. The signal in the example matches `backtrace/src/Config.cpp` on Android:
+`BIONIC_SIGNAL_BACKTRACE = 33`. For other supported platforms, replace
+**only the second argument** to `kill`:
+
+| Target | In-process expression |
+| --- | --- |
+| Android/Bionic | `kill(getpid(), 33)` |
+| OpenHarmony/OHOS | `kill(getpid(), 46)` |
+| glibc Linux | `kill(getpid(), SIGRTMIN + 6)` |
+
+The call is asynchronous: `kill()` returning `0` means the signal was sent,
+**not** that the checkpoint file was written. After the handler queues the
+request, the library's worker writes
+`<prefix>.signal.pid_<pid>.time_<t>.txt` (default prefix:
+`/data/local/tmp/trace/backtrace_heap`; configurable through
+`ALLOC_HOOK_DUMP_PREFIX`). The process continues running.
+
+**Prerequisites:** `liballoc_hook.so` must already be loaded into this
+process, initialization must have installed its signal handler, and the
+checkpoint worker must be ready. Do not send this signal to an uninstrumented
+process: its default action may terminate the process. An observe-only run
+does not produce allocation-stack checkpoints. To capture call stacks rather
+than only tracked totals, enable a reporting mode that records stacks at
+startup (see `DUMP_PEAK_VALUE_MB` / `DUMP_PEAK_STEP_MB` above).
+See the [Android Bionic reserved-signal definitions](https://android.googlesource.com/platform/bionic/+/refs/heads/main/libc/platform/bionic/reserved_signals.h).
+
+This is **not** `SIGKILL` or a request to exit. `SIGKILL` cannot flush
+the reporting worker.
 
 ## Perfetto timeline & offline tooling
 

@@ -19,7 +19,7 @@ explicit toolchain identity and is not inferred from a generic musl build.
 ### Host Linux
 
 ```sh
-./build_linux.sh host
+./build.sh linux host
 ```
 
 The script builds natively, runs the tests, installs the library under
@@ -37,31 +37,30 @@ cmake --install build-host --prefix "$PWD"
 The resulting library is `out/lib/liballoc_hook.so`.
 
 For a glibc Linux/aarch64 cross-build, set `ARM_GNU_TOOLCHAIN_PATH` to an
-`aarch64-none-linux-gnu` toolchain root and run `./build_linux.sh arm64`.
+`aarch64-none-linux-gnu` toolchain root and run `./build.sh linux arm64`.
 
 ### Android
 
 ```sh
 export NDK_ROOT=/path/to/android-ndk
-./build_android.sh arm64-v8a
+./build.sh android arm64-v8a
 ```
 
-The script uses API level 21 for the arm64 and armeabi-v7a targets, installs the
-library under `out/lib`, and then runs the bundled smoke workload through
-`adb`. Keep a matching device connected and make `adb` available on `PATH`, or
-invoke the CMake build directly when only the library artifact is needed.
-After a successful build it prints the effective CMake options and derived
-export policy.
+The script defaults to API level 21 and isolates build trees by ABI under
+`build/android/<abi>`. Artifacts are installed under
+`out/android-<abi>/out/lib` and `out/android-<abi>/out/bin`. Build does not
+implicitly connect to a device, deploy, or execute a workload. On success, the
+script prints the effective CMake options and export policy.
 
 ### OHOS
 
 ```sh
 export OHOS_NDK_ROOT=/path/to/ohos-sdk/native
-./build_ohos.sh arm64-v8a
+./build.sh ohos arm64-v8a
 ```
 
 The default OHOS build leaves mmap interposition disabled. For a controlled
-reproduction, set `ENABLE_MMAP_HOOK_EXPORT=ON`; `build_ohos.sh` forwards it to
+reproduction, set `ENABLE_MMAP_HOOK_EXPORT=ON`; `./build.sh ohos` forwards it to
 the `ENABLE_MMAP_HOOK_EXPORT` CMake option. After a successful build the script
 prints the effective CMake options and derived export policy.
 
@@ -106,14 +105,35 @@ capture failures.
 
 ## 5. Checkpoints and output
 
-The exported C function `checkpoint(const char*)` writes a live-allocation
-report to the requested path. The platform's backtrace signal queues the same
-work onto a dedicated worker (Bionic's reserved backtrace signal on Android,
-`46` on OHOS, `SIGRTMIN+6` elsewhere):
+The exported C function `checkpoint(const char*)` writes a report to a
+requested path. Alternatively, you can request a live checkpoint **at a chosen
+point in your C++ workload** by calling `DumpAllocHookCheckpoint()` and sending the project's dump signal to the
+current process (Android example; requires the hook to be initialized):
 
-```sh
-kill -46 <pid>   # OHOS; use the platform's backtrace signal
+```cpp
+#include <cerrno>
+#include <cstdio>
+#include <cstring>
+#include <signal.h>
+#include <unistd.h>
+
+// Android / Bionic: trigger a checkpoint at this exact point in your code.
+static void DumpAllocHookCheckpoint() {
+    if (kill(getpid(), 33) == -1) {
+        std::fprintf(stderr, "malloc_hook checkpoint failed: %s\n",
+                     std::strerror(errno));
+    }
+}
 ```
+
+Call `DumpAllocHookCheckpoint();` inside your existing workload at the desired
+checkpoint location. For OHOS use `kill(getpid(), 46)`; for glibc Linux use
+`kill(getpid(), SIGRTMIN + 6)`. The signal queues an asynchronous worker
+report; `kill()` success does not mean the file is ready. The process is
+**not** terminated by a properly installed hook handler. Reports are named
+`<prefix>.signal.pid_<pid>.time_<t>.txt` using `ALLOC_HOOK_DUMP_PREFIX`.
+Do not send this signal before the hook's handler is installed or into an
+uninstrumented process.
 
 The report contains host/resource totals, allocation sizes and types, timestamps,
 capture state/error, resolution state, and symbolized frames when the module

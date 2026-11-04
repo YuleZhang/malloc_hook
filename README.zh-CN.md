@@ -68,6 +68,28 @@ flowchart LR
 [`docs/EXAMPLE.md`](docs/EXAMPLE.md) 和
 [`docs/GPU_MEMORY_ACCOUNTING.md`](docs/GPU_MEMORY_ACCOUNTING.md)。
 
+## 构建
+
+统一构建入口为 `build.sh`，**必须显式指定目标 OS**，不会根据当前主机
+擅自猜测目标平台。各平台工具链逻辑放在 `scripts/build/`，并使用独立构建目录。
+
+```sh
+# Android：需要 NDK_ROOT 或 ANDROID_NDK_ROOT
+NDK_ROOT=/path/to/android-ndk ./build.sh android arm64-v8a
+
+# glibc Linux 本机构建并运行完整 CTest
+./build.sh linux host
+
+# glibc Linux / aarch64 交叉编译
+ARM_GNU_TOOLCHAIN_PATH=/path/to/aarch64-none-linux-gnu ./build.sh linux arm64
+
+# OpenHarmony
+OHOS_NDK_ROOT=/path/to/ohos-sdk/native ./build.sh ohos arm64-v8a
+```
+
+查看平台参数和环境变量：`./build.sh <os> --help`。构建入口不会自动 adb/hdc 部署
+或运行业务 workload；构建、部署和运行时调试分开执行。
+
 ## 配置项
 
 所有配置都在下面两张表里。除此之外没有其他开关：没有列在这里的行为就是不可调的。
@@ -84,9 +106,10 @@ flowchart LR
 `linux/dma-heap.h` 优先使用 sysroot 中的版本；没有时使用仓库内自带的一份 UAPI，因此缺少
 该头文件的交叉工具链依然可以抓取 DMA。这一步不需要任何配置。
 
-`build_android.sh`、`build_linux.sh` 和 `build_ohos.sh` 会在成功编译后打印实际生效的选项
-和派生出的导出策略。手工使用 CMake 构建时，可运行
-`cmake --build <build-dir> --target print_build_options` 查看同一份摘要。
+统一入口 `build.sh` 要求显式指定目标 OS（`android`、`linux` 或 `ohos`），并分发到
+`scripts/build/` 下各平台独立的构建后端。它不会根据构建主机猜测目标平台。每个后端在
+成功构建后打印实际生效的选项和导出策略。手工使用 CMake 时仍可运行
+`cmake --build <build-dir> --target print_build_options` 查看摘要。
 
 ### 运行选项（环境变量）
 
@@ -123,6 +146,55 @@ backtrace 信号，OHOS 为 `46`，其他平台为 `SIGRTMIN+6`）。
 
 完整命令行、输出和每个报告字段的读法见
 [`docs/get_hook_report.zh-CN.md`](docs/get_hook_report.zh-CN.md)。
+
+### 在业务 C/C++ 代码指定时机触发 checkpoint
+
+把以下辅助函数复制进 C++ 源文件，并在**需要观察内存状态的业务位置**
+调用 `DumpAllocHookCheckpoint();`，例如 warmup 完成后、HDR Merge 前后
+或某次 execute 结束时。这里通过 `getpid()` 给**当前进程**发送信号，
+不需要终端命令、adb/hdc 或手动查找 PID。
+
+```cpp
+#include <cerrno>
+#include <cstdio>
+#include <cstring>
+#include <signal.h>
+#include <unistd.h>
+
+// Android / Bionic：在业务代码需要观察内存的准确时机插入
+static void DumpAllocHookCheckpoint() {
+    if (kill(getpid(), 33) == -1) {
+        std::fprintf(stderr, "malloc_hook checkpoint failed: %s\n",
+                     std::strerror(errno));
+    }
+}
+```
+
+上例的 `33` 对应 Android/Bionic 的 `BIONIC_SIGNAL_BACKTRACE`，
+与本仓库 `backtrace/src/Config.cpp` 的信号选择一致。其他平台只需
+**替换 `kill` 的第二个参数**：
+
+| 目标平台 | 业务代码中的调用 |
+| --- | --- |
+| Android / Bionic | `kill(getpid(), 33)` |
+| OpenHarmony / OHOS | `kill(getpid(), 46)` |
+| glibc Linux | `kill(getpid(), SIGRTMIN + 6)` |
+
+`kill()` 返回 `0` 仅表示信号发送成功，**不代表报告已经写完**。
+信号处理函数把任务提交给 Hook 的 worker，报告异步写成
+`<prefix>.signal.pid_<pid>.time_<t>.txt`，默认前缀为
+`/data/local/tmp/trace/backtrace_heap`，可以通过 `ALLOC_HOOK_DUMP_PREFIX`
+修改。目标进程继续执行，不会因为 checkpoint 而退出。
+
+**使用前提：** `liballoc_hook.so` 已经加载到当前进程，初始化已安装
+对应的信号处理函数，且报告 worker 已就绪。不要向未加载 Hook 的进程
+盲目发送该信号：默认信号动作可能终止进程。只观测模式不支持分配栈
+checkpoint；如果希望报告中包含调用栈，而不只是无栈的跟踪数据，
+需要在进程启动前选择启用抓栈的报告模式（见上面的
+`DUMP_PEAK_VALUE_MB` / `DUMP_PEAK_STEP_MB`）。
+Android 信号定义参见 [Bionic reserved_signals.h](https://android.googlesource.com/platform/bionic/+/refs/heads/main/libc/platform/bionic/reserved_signals.h)。
+
+这是主动生成诊断报告，**不是杀掉进程**。不要用 `SIGKILL` 期待它刷新 worker。
 
 ## Perfetto 时间线与离线工具
 
@@ -165,7 +237,7 @@ step 写一份 `<prefix>.step.<MB>MB.txt`，文件名即该段峰值大小——
 版本号以仓库根 `VERSION` 为准（打 tag `v<VERSION>`）。平台构建后 `(cd <build> && cpack)`
 产出 `malloc_hook-<版本>-<abi>.tar.gz`，布局为 `lib/liballoc_hook.so` + `scripts/*.py` +
 `scripts/maps.example.json` + `README.md` + `VERSION`。`dist` 组件为 `EXCLUDE_FROM_ALL`，
-不影响各平台 `build_*.sh` 自身的 `ninja install`。
+不影响统一 `build.sh <os>` 入口的 install 步骤。
 
 ## 支持的平台
 

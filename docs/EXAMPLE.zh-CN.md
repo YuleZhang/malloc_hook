@@ -19,7 +19,7 @@
 ### 主机 Linux
 
 ```sh
-./build_linux.sh host
+./build.sh linux host
 ```
 
 该脚本执行本机构建、运行测试、把库安装到 `out/linux-host/lib`，并打印实际生效的
@@ -36,29 +36,29 @@ cmake --install build-host --prefix "$PWD"
 生成的库为 `out/lib/liballoc_hook.so`。
 
 要交叉编译 glibc Linux/aarch64，请将 `ARM_GNU_TOOLCHAIN_PATH` 指向
-`aarch64-none-linux-gnu` 工具链根目录，然后运行 `./build_linux.sh arm64`。
+`aarch64-none-linux-gnu` 工具链根目录，然后运行 `./build.sh linux arm64`。
 
 ### Android
 
 ```sh
 export NDK_ROOT=/path/to/android-ndk
-./build_android.sh arm64-v8a
+./build.sh android arm64-v8a
 ```
 
-脚本对 arm64 和 armeabi-v7a 使用 API level 21，将库安装到 `out/lib`，
-然后通过 `adb` 运行内置 smoke workload。请连接匹配的设备并确保
-`adb` 在 `PATH` 中；如果只需要库文件，可直接使用 CMake 构建。
-成功编译后，脚本会打印实际生效的 CMake 选项和派生出的导出策略。
+脚本默认使用 API level 21，构建目录按 ABI 隔离在 `build/android/<abi>`，
+产物安装到 `out/android-<abi>/out/lib` 和 `out/android-<abi>/out/bin`。
+构建不会自动连接设备、部署或执行 workload。成功编译后会打印实际生效的
+CMake 选项和派生出的导出策略。
 
 ### OHOS
 
 ```sh
 export OHOS_NDK_ROOT=/path/to/ohos-sdk/native
-./build_ohos.sh arm64-v8a
+./build.sh ohos arm64-v8a
 ```
 
 默认 OHOS 构建关闭 mmap 拦截。受控复现时可设置 `ENABLE_MMAP_HOOK_EXPORT=ON`；
-`build_ohos.sh` 会把它转发给 `ENABLE_MMAP_HOOK_EXPORT` CMake 选项。成功编译后，
+`./build.sh ohos` 会把它转发给 `ENABLE_MMAP_HOOK_EXPORT` CMake 选项。成功编译后，
 脚本会打印实际生效的 CMake 选项和派生出的导出策略。
 
 ## 3. 选择抓栈模式
@@ -97,13 +97,33 @@ mmap 和资源 hook 受目标平台导出策略控制。直接系统调用和未
 
 ## 5. 检查点和输出
 
-导出的 C 函数 `checkpoint(const char*)` 会将存活分配报告写入指定路径。平台的
-backtrace 信号会将同一工作排入专用 worker（Android 为 Bionic 保留的 backtrace 信号，
-OHOS 为 `46`，其他平台为 `SIGRTMIN+6`）：
+导出的 C 函数 `checkpoint(const char*)` 可以将报告写到指定路径。
+更常见的用法是**在业务 C++ 代码的准确时机触发**（下面是 Android 示例，
+复制辅助函数后，在需要观察的位置调用 `DumpAllocHookCheckpoint();`。
+要求当前进程已加载并初始化 Hook）：
 
-```sh
-kill -46 <pid>   # OHOS；请使用对应平台的 backtrace 信号
+```cpp
+#include <cerrno>
+#include <cstdio>
+#include <cstring>
+#include <signal.h>
+#include <unistd.h>
+
+// Android / Bionic：在业务代码需要观察内存的准确时机插入
+static void DumpAllocHookCheckpoint() {
+    if (kill(getpid(), 33) == -1) {
+        std::fprintf(stderr, "malloc_hook checkpoint failed: %s\n",
+                     std::strerror(errno));
+    }
+}
 ```
+
+OHOS 将调用改为 `kill(getpid(), 46)`；glibc Linux 使用
+`kill(getpid(), SIGRTMIN + 6)`。信号只投递异步报告任务，
+`kill()` 返回成功不代表文件已经生成，正确安装 Hook handler 后不会终止进程。
+报告保存为 `<prefix>.signal.pid_<pid>.time_<t>.txt`，前缀由
+`ALLOC_HOOK_DUMP_PREFIX` 配置。**不要在 Hook 信号处理器安装前，
+或未加载 Hook 的进程中直接发送该信号**。
 
 报告包含 host/资源总量、分配大小和类型、时间戳、抓栈状态/错误、解析状态，以及
 模块快照和符号器可用时的符号化栈。正常退出会在报告前刷新尚未处理的唯一栈。
