@@ -16,6 +16,12 @@ if(MALLOC_HOOK_TARGET_OS STREQUAL "android")
 endif()
 target_compile_definitions(helper PRIVATE
                             "MALLOC_HOOK_ENABLE_DMA_CAPTURE=$<BOOL:${MALLOC_HOOK_ENABLE_DMA_CAPTURE}>")
+# Internal-only seam for unit tests: production builds with tests disabled do
+# not compile it, and version scripts hide the symbol even in test builds.
+if(MALLOC_HOOK_BUILD_TESTS AND MALLOC_HOOK_ENABLE_DMA_CAPTURE
+   AND MALLOC_HOOK_TARGET_OS STREQUAL "linux")
+    target_compile_definitions(helper PRIVATE MALLOC_HOOK_DMA_ACCOUNTING_TEST=1)
+endif()
 if (CMAKE_CXX_COMPILER_ID STREQUAL Clang)
     target_compile_options(helper PRIVATE -fno-c++-static-destructors)
 endif ()

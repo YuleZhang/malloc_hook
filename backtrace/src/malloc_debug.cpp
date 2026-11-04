@@ -765,6 +765,9 @@ struct DmaFdInfo {
 };
 
 static std::mutex state_mutex;
+// Only observed DMA-fd births, mappings and closes take this lock. Unrelated
+// vendor ioctls do not. It protects fd-number reuse against tracked producers.
+static std::mutex fd_transaction_mutex;
 static std::unordered_map<uint64_t, PendingIonAllocation> pending_ion_allocations;
 static std::unordered_map<int, DmaFdInfo> dma_fds;
 
@@ -792,6 +795,13 @@ static bool IsIonFdRequest(unsigned long request, unsigned int nr) {
 
 static bool IsIonFree(unsigned long request) {
     return IsIonRequest(request, 1, sizeof(struct ion_handle_data));
+}
+static bool CreatesDmaFd(unsigned int request) {
+    return request == DMA_HEAP_IOCTL_ALLOC || IsIonNewAlloc(request) ||
+           IsIonFdRequest(request, 2) || IsIonFdRequest(request, 4);
+}
+static bool CanRegisterDmaFd(unsigned int request) {
+    return CreatesDmaFd(request) || request == CAM_MEM_ION_MAP_PA;
 }
 
 static void ForgetDmaFd(int fd) {
@@ -1100,71 +1110,116 @@ static void* CallMmap64(void* addr, size_t size, int prot, int flags, int fd, of
 
 int debug_ioctl(int fd, unsigned long request, void* arg) {
 #if !MALLOC_HOOK_ENABLE_DMA_CAPTURE
-    return (int)syscall(SYS_ioctl, fd, request, arg);
+    return static_cast<int>(syscall(SYS_ioctl, fd, request, arg));
 #else
     if (DebugCallsDisabledOrAsyncWorker()) {
-        return (int)syscall(SYS_ioctl, fd, request, arg);
+        return static_cast<int>(syscall(SYS_ioctl, fd, request, arg));
     }
-
     ScopedDisableDebugCalls disable;
+    // Android's signed ioctl request must be normalized to the 32-bit UAPI.
+    const unsigned int cmd = static_cast<unsigned int>(request);
+    const bool registers_fd = g_debug->TrackPointers() && DMA_BUF::CanRegisterDmaFd(cmd);
 
-    // Avoid holding the global hook lock while the ioctl blocks in vendor code.
-    int ret = (int)syscall(SYS_ioctl, fd, request, arg);
-
-    int node_fd = -1;
-    size_t node_sz = 0;
-    if (hook_source::SyscallSucceeded(ret) && g_debug->TrackPointers()) {
-        // ioctl request numbers are 32-bit values even when the backend API
-        // stores them in unsigned long.  Keep the low 32 bits so Android's
-        // signed-int libc prototype cannot sign-extend _IOWR requests and
-        // defeat the command match.
-        const unsigned int normalized_request =
-                static_cast<unsigned int>(request);
-        const bool recognized =
-                DMA_BUF::HandleIonIoctl(
-                        fd, normalized_request, arg, &node_fd, &node_sz) ||
-                DMA_BUF::handle_dma_node(
-                        normalized_request, arg, &node_fd, &node_sz);
-        if (recognized) {
-            bool should_track = false;
-            if (DMA_BUF::RegisterDmaFd(node_fd, node_sz, &should_track) &&
-                should_track) {
-                ScopedConcurrentLock lock;
-                void* ptr = reinterpret_cast<void*>(node_fd);
-                g_debug->pointer->Add(ptr, node_sz, node_sz, DMA);
-                DMA_BUF::MarkDmaFdTracked(node_fd);
+    const auto perform = [&]() -> int {
+        const int result = static_cast<int>(syscall(SYS_ioctl, fd, request, arg));
+        const int saved_errno = errno;
+        if (hook_source::SyscallSucceeded(result) && g_debug->TrackPointers()) {
+            int node_fd = -1;
+            size_t node_size = 0;
+            const bool recognized =
+                    DMA_BUF::HandleIonIoctl(fd, cmd, arg, &node_fd, &node_size) ||
+                    DMA_BUF::handle_dma_node(cmd, arg, &node_fd, &node_size);
+            if (recognized && registers_fd) {
+                // A new fd from a successful allocation/export must replace an
+                // old generation's stale fd-key entry, not inherit tracked=true.
+                if (DMA_BUF::CreatesDmaFd(cmd)) {
+                    size_t old_size = 0;
+                    bool old_tracked = false;
+                    if (DMA_BUF::TakeDmaFd(node_fd, &old_size, &old_tracked) &&
+                        old_tracked) {
+                        g_debug->pointer->Remove(reinterpret_cast<void*>(node_fd));
+                    }
+                }
+                bool should_track = false;
+                if (DMA_BUF::RegisterDmaFd(node_fd, node_size, &should_track) &&
+                    should_track) {
+                    g_debug->pointer->Add(
+                            reinterpret_cast<void*>(node_fd), node_size, node_size, DMA);
+                    DMA_BUF::MarkDmaFdTracked(node_fd);
+                }
             }
         }
+        errno = saved_errno;
+        return result;
+    };
+    if (registers_fd) {
+        // Order: fork barrier read-lock -> fd transaction lock -> state lock.
+        // Never serialize arbitrary vendor ioctls here.
+        ScopedConcurrentLock lock;
+        std::lock_guard<std::mutex> fd_lock(DMA_BUF::fd_transaction_mutex);
+        return perform();
     }
+    return perform();
+#endif
+}
 
-    return ret;
+namespace {
+int RawCloseOperation(int fd, void*) {
+    return static_cast<int>(syscall(SYS_close, fd));
+}
+}
+
+int debug_close_with(int fd, DebugCloseOperation operation, void* context) {
+#if !MALLOC_HOOK_ENABLE_DMA_CAPTURE
+    return operation(fd, context);
+#else
+    if (DebugCallsDisabledOrAsyncWorker() || g_debug == nullptr ||
+        !g_debug->TrackPointers()) {
+        return operation(fd, context);
+    }
+    ScopedConcurrentLock lock;
+    ScopedDisableDebugCalls disable;
+    std::lock_guard<std::mutex> fd_lock(DMA_BUF::fd_transaction_mutex);
+
+    // Bionic's original fdsan function performs the tag check and its own close.
+    const int result = operation(fd, context);
+    const int saved_errno = errno;
+    // Linux may close the fd even on an EINTR/EIO return; only EBADF proves
+    // there was no close. Do not retry a failed close.
+    if (result == 0 || saved_errno != EBADF) {
+        size_t size = 0;
+        bool tracked = false;
+        if (DMA_BUF::TakeDmaFd(fd, &size, &tracked) && tracked) {
+            g_debug->pointer->Remove(reinterpret_cast<void*>(fd));
+        }
+        DMA_BUF::DropIonAllocationsForFd(fd);
+    }
+    errno = saved_errno;
+    return result;
 #endif
 }
 
 int debug_close(int fd) {
-#if !MALLOC_HOOK_ENABLE_DMA_CAPTURE
-    return (int)syscall(SYS_close, fd);
-#else
-    if (DebugCallsDisabledOrAsyncWorker()) {
-        return (int)syscall(SYS_close, fd);
-    }
-
-    ScopedDisableDebugCalls disable;
-
-    int ret = (int)syscall(SYS_close, fd);
-    if (hook_source::SyscallSucceeded(ret) && g_debug->TrackPointers()) {
-        size_t size = 0;
-        bool tracked = false;
-        if (DMA_BUF::TakeDmaFd(fd, &size, &tracked) && tracked) {
-            ScopedConcurrentLock lock;
-            void* ptr = reinterpret_cast<void*>(fd);
-            g_debug->pointer->Remove(ptr);
-        }
-        DMA_BUF::DropIonAllocationsForFd(fd);
-    }
-    return ret;
-#endif
+    return debug_close_with(fd, RawCloseOperation, nullptr);
 }
+
+#if defined(MALLOC_HOOK_DMA_ACCOUNTING_TEST) && MALLOC_HOOK_ENABLE_DMA_CAPTURE
+void debug_seed_dma_fd_for_test(int fd, size_t size) {
+    // Exercise the same fd registry and PointerData path used after an observed
+    // DMA allocation ioctl; use a plain pipe descriptor in CI without a DMA heap.
+    if (g_debug == nullptr || !g_debug->TrackPointers()) {
+        return;
+    }
+    ScopedConcurrentLock hook_lock;
+    ScopedDisableDebugCalls disable;
+    std::lock_guard<std::mutex> lock(DMA_BUF::fd_transaction_mutex);
+    bool should_track = false;
+    if (DMA_BUF::RegisterDmaFd(fd, size, &should_track) && should_track) {
+        g_debug->pointer->Add(reinterpret_cast<void*>(fd), size, size, DMA);
+        DMA_BUF::MarkDmaFdTracked(fd);
+    }
+}
+#endif
 
 static void TrackMmapResult(
         void* result, size_t size, int flags, int fd, bool pending_ioctl) {
@@ -1203,6 +1258,13 @@ void* debug_mmap64(void* addr, size_t size, int prot, int flags, int fd, off_t o
 
     ScopedConcurrentLock lock;
     ScopedDisableDebugCalls disable;
+#if MALLOC_HOOK_ENABLE_DMA_CAPTURE
+    std::unique_lock<std::mutex> fd_lock(
+            DMA_BUF::fd_transaction_mutex, std::defer_lock);
+    if (fd >= 0 && (flags & MAP_SHARED)) {
+        fd_lock.lock();
+    }
+#endif
 
 #if MALLOC_HOOK_ENABLE_DMA_CAPTURE
     const bool pending_ioctl = DMA_BUF::pending_gpu_allocation.Take() != 0;
@@ -1233,6 +1295,13 @@ void* debug_mmap(void* addr, size_t size, int prot, int flags, int fd, off_t off
 
     ScopedConcurrentLock lock;
     ScopedDisableDebugCalls disable;
+#if MALLOC_HOOK_ENABLE_DMA_CAPTURE
+    std::unique_lock<std::mutex> fd_lock(
+            DMA_BUF::fd_transaction_mutex, std::defer_lock);
+    if (fd >= 0 && (flags & MAP_SHARED)) {
+        fd_lock.lock();
+    }
+#endif
 
 #if MALLOC_HOOK_ENABLE_DMA_CAPTURE
     const bool pending_ioctl = DMA_BUF::pending_gpu_allocation.Take() != 0;

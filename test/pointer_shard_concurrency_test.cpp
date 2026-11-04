@@ -149,6 +149,14 @@ int main() {
             threads.emplace_back(HammerTracker, i);
         }
     }
+    // A series of small, independently scheduled worker allocations is NOT
+    // guaranteed to overlap beyond the 1 MiB first-crossing threshold. Make
+    // the crossing deterministic while workers are active, so this test
+    // actually exercises peak snapshot creation instead of asserting a timing
+    // field for a snapshot that never had to exist.
+    void* trigger = debug_malloc(2 * 1024 * 1024);
+    assert(trigger != nullptr);
+    debug_free(trigger);
     for (std::thread& thread : threads) {
         thread.join();
     }

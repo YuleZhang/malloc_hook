@@ -16,6 +16,7 @@ global:
     mremap;
     ioctl;
     close;
+    android_fdsan_close_with_tag;
     mmap64;
     checkpoint;
 

@@ -198,7 +198,10 @@ endif()
 # export is off (OHOS default, or an explicit opt-out on any platform).
 set(_malloc_hook_strip_symbols "")
 if(NOT MALLOC_HOOK_EXPORT_RESOURCE_HOOKS)
-  list(APPEND _malloc_hook_strip_symbols "ioctl" "close")
+  list(APPEND _malloc_hook_strip_symbols "ioctl" "close"
+       "android_fdsan_close_with_tag")
+elseif(NOT MALLOC_HOOK_TARGET_OS STREQUAL "android")
+  list(APPEND _malloc_hook_strip_symbols "android_fdsan_close_with_tag")
 endif()
 if(NOT MALLOC_HOOK_EXPORT_MMAP_HOOK)
   list(APPEND _malloc_hook_strip_symbols "mmap" "mmap64" "munmap" "mremap")
@@ -362,6 +365,12 @@ endif()
 # 安装到 out/lib 目录
 install(TARGETS alloc_hook DESTINATION out/lib)
 
+if(MALLOC_HOOK_TARGET_OS STREQUAL "android" AND MALLOC_HOOK_EXPORT_RESOURCE_HOOKS)
+  set(_malloc_hook_expect_fdsan 1)
+else()
+  set(_malloc_hook_expect_fdsan 0)
+endif()
+
 if(BUILD_TESTING)
   add_test(
     NAME platform_export_policy
@@ -376,6 +385,7 @@ if(BUILD_TESTING)
       "-DEXPECT_MMAP=${MALLOC_HOOK_EXPORT_MMAP_HOOK}"
       "-DEXPECT_RESOURCE=${MALLOC_HOOK_EXPORT_RESOURCE_HOOKS}"
       "-DEXPECT_CPP=${MALLOC_HOOK_EXPORT_CPP_NEW_HOOK}"
+      "-DEXPECT_FDSAN=${_malloc_hook_expect_fdsan}"
       -P ${CMAKE_SOURCE_DIR}/test/built_export_policy_test.cmake)
   add_test(
     NAME fast_capture_boundary_compile
