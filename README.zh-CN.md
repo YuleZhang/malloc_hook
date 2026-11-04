@@ -68,6 +68,28 @@ flowchart LR
 [`docs/EXAMPLE.md`](docs/EXAMPLE.md) 和
 [`docs/GPU_MEMORY_ACCOUNTING.md`](docs/GPU_MEMORY_ACCOUNTING.md)。
 
+## 构建
+
+统一构建入口为 `build.sh`，**必须显式指定目标 OS**，不会根据当前主机
+擅自猜测目标平台。各平台工具链逻辑放在 `scripts/build/`，并使用独立构建目录。
+
+```sh
+# Android：需要 NDK_ROOT 或 ANDROID_NDK_ROOT
+NDK_ROOT=/path/to/android-ndk ./build.sh android arm64-v8a
+
+# glibc Linux 本机构建并运行完整 CTest
+./build.sh linux host
+
+# glibc Linux / aarch64 交叉编译
+ARM_GNU_TOOLCHAIN_PATH=/path/to/aarch64-none-linux-gnu ./build.sh linux arm64
+
+# OpenHarmony
+OHOS_NDK_ROOT=/path/to/ohos-sdk/native ./build.sh ohos arm64-v8a
+```
+
+查看平台参数和环境变量：`./build.sh <os> --help`。构建入口不会自动 adb/hdc 部署
+或运行业务 workload；构建、部署和运行时调试分开执行。
+
 ## 配置项
 
 所有配置都在下面两张表里。除此之外没有其他开关：没有列在这里的行为就是不可调的。
@@ -84,9 +106,10 @@ flowchart LR
 `linux/dma-heap.h` 优先使用 sysroot 中的版本；没有时使用仓库内自带的一份 UAPI，因此缺少
 该头文件的交叉工具链依然可以抓取 DMA。这一步不需要任何配置。
 
-`build_android.sh`、`build_linux.sh` 和 `build_ohos.sh` 会在成功编译后打印实际生效的选项
-和派生出的导出策略。手工使用 CMake 构建时，可运行
-`cmake --build <build-dir> --target print_build_options` 查看同一份摘要。
+统一入口 `build.sh` 要求显式指定目标 OS（`android`、`linux` 或 `ohos`），并分发到
+`scripts/build/` 下各平台独立的构建后端。它不会根据构建主机猜测目标平台。每个后端在
+成功构建后打印实际生效的选项和导出策略。手工使用 CMake 时仍可运行
+`cmake --build <build-dir> --target print_build_options` 查看摘要。
 
 ### 运行选项（环境变量）
 
@@ -123,6 +146,38 @@ backtrace 信号，OHOS 为 `46`，其他平台为 `SIGRTMIN+6`）。
 
 完整命令行、输出和每个报告字段的读法见
 [`docs/get_hook_report.zh-CN.md`](docs/get_hook_report.zh-CN.md)。
+
+### 对运行中的进程主动触发 checkpoint（重点）
+
+checkpoint 信号让**目标进程输出当前存活分配报告，不会杀死目标进程**。
+给目标 PID 发送与平台匹配的信号：
+
+```sh
+# Android / Bionic：BIONIC_SIGNAL_BACKTRACE = SIGRTMIN + 1，即 signal 33
+adb shell kill -33 <pid>
+
+# OpenHarmony
+hdc shell kill -46 <pid>
+
+# glibc Linux：SIGRTMIN + 6
+kill -s RTMIN+6 <pid>
+```
+
+例如 Android 设备上目标进程 PID 为 1234：
+
+```sh
+adb shell kill -33 1234
+```
+
+信号处理函数只负责将请求放入队列，随后由专用 worker 写报告。
+到目标进程 stderr/log 输出以及 `ALLOC_HOOK_DUMP_PREFIX` 指定目录查找
+`*.signal.pid_<pid>.time_<t>.txt`（默认前缀为
+`/data/local/tmp/trace/backtrace_heap`）。
+
+**注意：** Android 的 33 是 Bionic 保留的 backtrace 信号，不要误用
+`SIGKILL`、`SIGTERM` 或 ART/heapprofd 的信号。Linux 的信号编号不要照搬到
+Android/OHOS。信号只触发 checkpoint；终止进程应使用正常退出流程，
+不要用 `SIGKILL` 期待它刷新 worker。
 
 ## Perfetto 时间线与离线工具
 

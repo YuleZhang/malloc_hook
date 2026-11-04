@@ -86,6 +86,30 @@ Chinese entry points:
 [`docs/EXAMPLE.zh-CN.md`](docs/EXAMPLE.zh-CN.md), and
 [`docs/GPU_MEMORY_ACCOUNTING.zh-CN.md`](docs/GPU_MEMORY_ACCOUNTING.zh-CN.md).
 
+## Build
+
+The target OS is mandatory; the dispatcher intentionally refuses to infer it
+from the host machine. Platform-specific toolchain logic lives under
+`scripts/build/`, with separate build directories per target.
+
+```sh
+# Android (NDK_ROOT or ANDROID_NDK_ROOT is required)
+NDK_ROOT=/path/to/android-ndk ./build.sh android arm64-v8a
+
+# glibc Linux host build + complete CTest
+./build.sh linux host
+
+# glibc Linux/aarch64 cross build
+ARM_GNU_TOOLCHAIN_PATH=/path/to/aarch64-none-linux-gnu ./build.sh linux arm64
+
+# OpenHarmony
+OHOS_NDK_ROOT=/path/to/ohos-sdk/native ./build.sh ohos arm64-v8a
+```
+
+Run `./build.sh <os> --help` for platform-specific options. The dispatcher
+does not deploy to a device or run a workload; build, deployment, and runtime
+debugging remain separate operations.
+
 ## Configuration
 
 Everything is configured through the two tables below. There are no other
@@ -104,8 +128,10 @@ switches: if a behaviour is not listed here, it is not tunable.
 copy of the UAPI is used, so a cross toolchain missing that header still gets
 DMA capture. Nothing needs to be set for this.
 
-`build_android.sh`, `build_linux.sh`, and `build_ohos.sh` print the effective
-options and derived export policy after a successful build. For a manual CMake
+The unified `build.sh` requires an explicit target OS (`android`, `linux`, or
+`ohos`) and dispatches to isolated platform backends under `scripts/build/`.
+It never guesses the target from the build host. Each backend prints the
+effective options and derived export policy after a successful build. For a manual CMake
 build, run `cmake --build <build-dir> --target print_build_options`.
 
 ### Runtime options (environment)
@@ -148,6 +174,38 @@ Which mode a run is in is decided entirely by which variables above are set:
 
 Full command lines, output, and how to read every report field are in
 [`docs/get_hook_report.md`](docs/get_hook_report.md).
+
+### Trigger a checkpoint in a running process
+
+A checkpoint signal asks the target process to write its current report; **it
+does not terminate the process**. Send the platform-specific signal to its PID:
+
+```sh
+# Android / Bionic: BIONIC_SIGNAL_BACKTRACE = SIGRTMIN + 1 (signal 33)
+adb shell kill -33 <pid>
+
+# OpenHarmony
+hdc shell kill -46 <pid>
+
+# glibc Linux: SIGRTMIN + 6
+kill -s RTMIN+6 <pid>
+```
+
+The signal handler only queues the request; a dedicated worker writes the
+report. Look for `*.signal.pid_<pid>.time_<t>.txt` under
+`ALLOC_HOOK_DUMP_PREFIX` (default `/data/local/tmp/trace/backtrace_heap`).
+On Android, signal 33 is Bionic's reserved backtrace signal; do not substitute
+`SIGKILL`, `SIGTERM`, or the ART/heapprofd profiling signal. See the
+[Bionic reserved signal definitions](https://android.googlesource.com/platform/bionic/+/refs/heads/main/libc/platform/bionic/reserved_signals.h).
+
+For example, on an Android device with target PID 1234:
+
+```sh
+adb shell kill -33 1234
+```
+
+To stop the process, use its normal shutdown path or a separate termination
+signal after collecting the checkpoint. `SIGKILL` cannot flush the worker.
 
 ## Perfetto timeline & offline tooling
 

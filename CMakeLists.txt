@@ -173,17 +173,17 @@ if(MALLOC_HOOK_TARGET_OS STREQUAL "android")
   set(MALLOC_HOOK_EXPORT_POLICY android)
   set(MALLOC_HOOK_EXPORT_RESOURCE_HOOKS 1)
   set(MALLOC_HOOK_EXPORT_CPP_NEW_HOOK 0)
-  set(VERSION_SCRIPT ${CMAKE_SOURCE_DIR}/version_script.ld)
+  set(VERSION_SCRIPT ${CMAKE_SOURCE_DIR}/cmake/exports/android-linux.ld)
 elseif(MALLOC_HOOK_TARGET_OS STREQUAL "linux")
   set(MALLOC_HOOK_EXPORT_POLICY linux)
   set(MALLOC_HOOK_EXPORT_RESOURCE_HOOKS 1)
   set(MALLOC_HOOK_EXPORT_CPP_NEW_HOOK 0)
-  set(VERSION_SCRIPT ${CMAKE_SOURCE_DIR}/version_script.ld)
+  set(VERSION_SCRIPT ${CMAKE_SOURCE_DIR}/cmake/exports/android-linux.ld)
 elseif(MALLOC_HOOK_TARGET_OS STREQUAL "ohos")
   set(MALLOC_HOOK_EXPORT_POLICY ohos)
   set(MALLOC_HOOK_EXPORT_RESOURCE_HOOKS 1)
   set(MALLOC_HOOK_EXPORT_CPP_NEW_HOOK 1)
-  set(VERSION_SCRIPT ${CMAKE_SOURCE_DIR}/version_script_ohos.ld)
+  set(VERSION_SCRIPT ${CMAKE_SOURCE_DIR}/cmake/exports/ohos.ld)
 else()
   message(FATAL_ERROR
     "No hook export policy for target OS '${MALLOC_HOOK_TARGET_OS}'")
@@ -487,6 +487,14 @@ if(ANDROID AND MALLOC_HOOK_BUILD_FDSAN_DEVICE_GATE)
     ${CMAKE_CURRENT_SOURCE_DIR}/backtrace/driver/dma_heap)
   target_link_libraries(android_fdsan_device_gate PRIVATE ${CMAKE_DL_LIBS})
   install(TARGETS android_fdsan_device_gate DESTINATION out/bin)
+endif()
+
+if(BUILD_TESTING)
+  add_test(
+    NAME build_entrypoint_contract
+    COMMAND ${CMAKE_COMMAND}
+      "-DREPO_ROOT=${CMAKE_SOURCE_DIR}"
+      -P ${CMAKE_SOURCE_DIR}/test/build_entrypoint_test.cmake)
 endif()
 
 if (MALLOC_HOOK_BUILD_TESTS)

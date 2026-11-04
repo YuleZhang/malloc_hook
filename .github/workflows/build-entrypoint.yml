@@ -1,0 +1,22 @@
+name: Build entrypoint and export manifest
+
+on:
+  pull_request:
+    paths:
+      - 'build.sh'
+      - 'scripts/build/**'
+      - 'cmake/exports/**'
+      - 'CMakeLists.txt'
+      - 'test/build_entrypoint_test.cmake'
+      - 'test/platform_export_policy_test.cmake'
+      - '.github/workflows/build-entrypoint.yml'
+
+jobs:
+  shell-and-export-contract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate dispatcher syntax and mandatory OS selection
+        run: cmake -DREPO_ROOT="$GITHUB_WORKSPACE" -P test/build_entrypoint_test.cmake
+      - name: Validate Android/Linux/OHOS export manifests
+        run: cmake -DREPO_ROOT="$GITHUB_WORKSPACE" -DTEST_BINARY_DIR="$RUNNER_TEMP/export-policy" -P test/platform_export_policy_test.cmake
