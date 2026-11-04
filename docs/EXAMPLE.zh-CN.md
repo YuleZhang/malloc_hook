@@ -19,7 +19,7 @@
 ### 主机 Linux
 
 ```sh
-./build_linux.sh host
+./build.sh linux host
 ```
 
 该脚本执行本机构建、运行测试、把库安装到 `out/linux-host/lib`，并打印实际生效的
@@ -36,29 +36,29 @@ cmake --install build-host --prefix "$PWD"
 生成的库为 `out/lib/liballoc_hook.so`。
 
 要交叉编译 glibc Linux/aarch64，请将 `ARM_GNU_TOOLCHAIN_PATH` 指向
-`aarch64-none-linux-gnu` 工具链根目录，然后运行 `./build_linux.sh arm64`。
+`aarch64-none-linux-gnu` 工具链根目录，然后运行 `./build.sh linux arm64`。
 
 ### Android
 
 ```sh
 export NDK_ROOT=/path/to/android-ndk
-./build_android.sh arm64-v8a
+./build.sh android arm64-v8a
 ```
 
-脚本对 arm64 和 armeabi-v7a 使用 API level 21，将库安装到 `out/lib`，
-然后通过 `adb` 运行内置 smoke workload。请连接匹配的设备并确保
-`adb` 在 `PATH` 中；如果只需要库文件，可直接使用 CMake 构建。
-成功编译后，脚本会打印实际生效的 CMake 选项和派生出的导出策略。
+脚本默认使用 API level 21，构建目录按 ABI 隔离在 `build/android/<abi>`，
+产物安装到 `out/android-<abi>/out/lib` 和 `out/android-<abi>/out/bin`。
+构建不会自动连接设备、部署或执行 workload。成功编译后会打印实际生效的
+CMake 选项和派生出的导出策略。
 
 ### OHOS
 
 ```sh
 export OHOS_NDK_ROOT=/path/to/ohos-sdk/native
-./build_ohos.sh arm64-v8a
+./build.sh ohos arm64-v8a
 ```
 
 默认 OHOS 构建关闭 mmap 拦截。受控复现时可设置 `ENABLE_MMAP_HOOK_EXPORT=ON`；
-`build_ohos.sh` 会把它转发给 `ENABLE_MMAP_HOOK_EXPORT` CMake 选项。成功编译后，
+`./build.sh ohos` 会把它转发给 `ENABLE_MMAP_HOOK_EXPORT` CMake 选项。成功编译后，
 脚本会打印实际生效的 CMake 选项和派生出的导出策略。
 
 ## 3. 选择抓栈模式

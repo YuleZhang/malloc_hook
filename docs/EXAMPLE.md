@@ -19,7 +19,7 @@ explicit toolchain identity and is not inferred from a generic musl build.
 ### Host Linux
 
 ```sh
-./build_linux.sh host
+./build.sh linux host
 ```
 
 The script builds natively, runs the tests, installs the library under
@@ -37,31 +37,30 @@ cmake --install build-host --prefix "$PWD"
 The resulting library is `out/lib/liballoc_hook.so`.
 
 For a glibc Linux/aarch64 cross-build, set `ARM_GNU_TOOLCHAIN_PATH` to an
-`aarch64-none-linux-gnu` toolchain root and run `./build_linux.sh arm64`.
+`aarch64-none-linux-gnu` toolchain root and run `./build.sh linux arm64`.
 
 ### Android
 
 ```sh
 export NDK_ROOT=/path/to/android-ndk
-./build_android.sh arm64-v8a
+./build.sh android arm64-v8a
 ```
 
-The script uses API level 21 for the arm64 and armeabi-v7a targets, installs the
-library under `out/lib`, and then runs the bundled smoke workload through
-`adb`. Keep a matching device connected and make `adb` available on `PATH`, or
-invoke the CMake build directly when only the library artifact is needed.
-After a successful build it prints the effective CMake options and derived
-export policy.
+The script defaults to API level 21 and isolates build trees by ABI under
+`build/android/<abi>`. Artifacts are installed under
+`out/android-<abi>/out/lib` and `out/android-<abi>/out/bin`. Build does not
+implicitly connect to a device, deploy, or execute a workload. On success, the
+script prints the effective CMake options and export policy.
 
 ### OHOS
 
 ```sh
 export OHOS_NDK_ROOT=/path/to/ohos-sdk/native
-./build_ohos.sh arm64-v8a
+./build.sh ohos arm64-v8a
 ```
 
 The default OHOS build leaves mmap interposition disabled. For a controlled
-reproduction, set `ENABLE_MMAP_HOOK_EXPORT=ON`; `build_ohos.sh` forwards it to
+reproduction, set `ENABLE_MMAP_HOOK_EXPORT=ON`; `./build.sh ohos` forwards it to
 the `ENABLE_MMAP_HOOK_EXPORT` CMake option. After a successful build the script
 prints the effective CMake options and derived export policy.
 
