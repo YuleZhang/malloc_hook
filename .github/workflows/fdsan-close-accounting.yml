@@ -58,3 +58,12 @@ jobs:
           cmake -DLIBRARY="$GITHUB_WORKSPACE/build-android/liballoc_hook.so" \
             -DEXPECT_MMAP=1 -DEXPECT_RESOURCE=1 -DEXPECT_CPP=0 \
             -DEXPECT_FDSAN=1 -P test/built_export_policy_test.cmake
+      - name: Publish device gate and matching hook library
+        uses: actions/upload-artifact@v4
+        with:
+          name: fdsan-device-gate-android-arm64
+          path: |
+            build-android/liballoc_hook.so
+            build-android/android_fdsan_device_gate
+          if-no-files-found: error
+          retention-days: 14
