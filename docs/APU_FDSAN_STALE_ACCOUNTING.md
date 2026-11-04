@@ -60,3 +60,26 @@ and EINTR late-close behavior. Android must independently verify:
    regression; kernel residency is independently judged by probe/kprobe.
 
 Source: user-provided X6765 A/B and release-marker/kernel trace evidence.
+## Android 真机验收工具（#35）
+
+新增可选构建目标 `android_fdsan_device_gate`，独立于 Host CTest，不需要 APU 专有业务库。
+
+```bash
+cmake -S . -B build-fdsan-android -G Ninja \
+  -DCMAKE_TOOLCHAIN_FILE="$NDK_ROOT/build/cmake/android.toolchain.cmake" \
+  -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-29 \
+  -DCMAKE_BUILD_TYPE=Release -DMALLOC_HOOK_BUILD_TESTS=OFF \
+  -DMALLOC_HOOK_BUILD_FDSAN_DEVICE_GATE=ON
+cmake --build build-fdsan-android --target alloc_hook android_fdsan_device_gate
+adb push build-fdsan-android/liballoc_hook.so /data/local/tmp/
+adb push build-fdsan-android/android_fdsan_device_gate /data/local/tmp/
+adb shell 'cd /data/local/tmp && chmod 755 android_fdsan_device_gate && LD_PRELOAD=./liballoc_hook.so ./android_fdsan_device_gate valid'
+adb shell 'cd /data/local/tmp && LD_PRELOAD=./liballoc_hook.so ./android_fdsan_device_gate invalid'
+adb shell 'cd /data/local/tmp && LD_PRELOAD=./liballoc_hook.so ./android_fdsan_device_gate dma /dev/dma_heap/mtk_mm-uncached'
+```
+
+`valid` 强制检查动态符号实际解析到预加载的 `liballoc_hook.so`，并验证合法 tag 关闭 fd。
+`invalid` 使用 `fork + exec` 隔离错误 tag 场景，子进程显式开启 fatal，父进程验证子进程因 `SIGABRT` 终止；这样不会把 parent 当成测试失败而退出。
+`dma` 直接走真实 DMA-HEAP ioctl，使用三次 `checkpoint` 比较逻辑 DMA live bytes：基线、+4 MiB、回到基线。该测试需要设备允许访问指定 `/dev/dma_heap/...`；不支持时退出码为 77（SKIP），**绝不把 SKIP 当 PASS**。
+
+NDK CI 仅覆盖此测试程序的 Android 交叉编译，不具备 X6765 设备，不能宣称已经完成上述三项设备运行验证。真实业务的 10 轮 APU regression 和 kernel oracle 仍独立验收。
