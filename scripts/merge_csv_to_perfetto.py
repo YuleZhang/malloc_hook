@@ -74,6 +74,7 @@ class OverlayLayout:
     mapped_min_ns: int
     mapped_max_ns: int
     timestamps: tuple[int, ...]
+    time_domain: str
 
 
 @dataclass(frozen=True)
@@ -93,6 +94,7 @@ class OverlaySummary:
     overlay_range_ns: tuple[int, int]
     descriptor_count: int
     counter_event_count: int
+    time_domain: str
 
 
 def encode_varint(value: int) -> bytes:
@@ -314,7 +316,7 @@ def load_csv_rows(csv_path: Path) -> tuple[list[str], str, list[dict[str, str]]]
         field_map = {name.strip().lower(): name for name in fieldnames}
         time_column = field_map.get("time")
         if not time_column:
-            raise ValueError("CSV must include a 'time' column containing epoch milliseconds")
+            raise ValueError("CSV must include a 'time' column containing milliseconds")
         rows = list(reader)
     return fieldnames, time_column, rows
 
@@ -381,8 +383,32 @@ def load_csv_samples(csv_path: Path, selected_columns: list[str] | None):
     return numeric_columns, samples
 
 
-def map_sample_timestamps(samples: list[tuple[int, list[float]]], offset_ns: int) -> list[int]:
-    return [timestamp_ms * 1_000_000 - offset_ns for timestamp_ms, _ in samples]
+def _ranges_overlap(start: int, end: int, trace_start: int, trace_end: int) -> bool:
+    return end >= trace_start and start <= trace_end
+
+
+def map_sample_timestamps(
+    samples: list[tuple[int, list[float]]], metadata: TraceMetadata, time_domain: str
+) -> tuple[list[int], str]:
+    """Map CSV milliseconds onto the trace primary clock.
+
+    HAIO CSV uses monotonic milliseconds, while external CSVs may use realtime/epoch
+    milliseconds. Auto prefers direct monotonic mapping whenever it overlaps the trace;
+    realtime conversion is used only when direct timestamps cannot overlap.
+    """
+    direct = [timestamp_ms * 1_000_000 for timestamp_ms, _ in samples]
+    realtime = [timestamp_ns - metadata.offset_ns for timestamp_ns in direct]
+    if time_domain == "monotonic":
+        return direct, "monotonic"
+    if time_domain == "realtime":
+        return realtime, "realtime"
+    direct_overlap = _ranges_overlap(min(direct), max(direct), metadata.trace_min_ns, metadata.trace_max_ns)
+    realtime_overlap = _ranges_overlap(min(realtime), max(realtime), metadata.trace_min_ns, metadata.trace_max_ns)
+    if direct_overlap:
+        return direct, "monotonic"
+    if realtime_overlap:
+        return realtime, "realtime"
+    return direct, "monotonic"
 
 
 def parse_ftrace_timestamp_us(timestamp: str) -> int:
@@ -554,10 +580,12 @@ def build_overlay(
     group_name: str,
     track_prefix: str | None,
     unit_name: str,
+    time_domain: str,
 ) -> tuple[list[OverlayPacketEntry], OverlayLayout]:
     parent_uuid = metadata.next_uuid
     track_uuids = {column: parent_uuid + index + 1 for index, column in enumerate(columns)}
-    timestamps = tuple(map_sample_timestamps(samples, metadata.offset_ns))
+    mapped_timestamps, resolved_time_domain = map_sample_timestamps(samples, metadata, time_domain)
+    timestamps = tuple(mapped_timestamps)
     validate_overlay_range(metadata, min(timestamps), max(timestamps))
     overlay_start_ns = min(timestamps)
     packets = [
@@ -612,6 +640,7 @@ def build_overlay(
         min(timestamps),
         max(timestamps),
         timestamps,
+        resolved_time_domain,
     )
     return packets, layout
 
@@ -834,6 +863,7 @@ def create_html_overlay(
         (overlay_range_us[0] * 1_000, overlay_range_us[1] * 1_000),
         descriptor_count,
         counter_event_count,
+        "html",
     )
 
 
@@ -845,6 +875,7 @@ def create_overlay(
     group_name: str,
     track_prefix: str | None,
     unit_name: str,
+    time_domain: str = "auto",
     html_pid: int | None = None,
 ) -> OverlaySummary:
     if is_html_trace_path(trace_path):
@@ -861,7 +892,8 @@ def create_overlay(
     columns, samples = load_csv_samples(csv_path, selected_columns)
     trace_bytes = trace_path.read_bytes()
     metadata = analyze_trace(trace_bytes)
-    overlay_packets, layout = build_overlay(columns, samples, metadata, group_name, track_prefix, unit_name)
+    overlay_packets, layout = build_overlay(
+        columns, samples, metadata, group_name, track_prefix, unit_name, time_domain)
     final_path = output_path or default_output_path(trace_path)
     final_bytes = merge_overlay_packets(trace_bytes, overlay_packets)
     descriptor_count, counter_event_count = verify_overlay(final_bytes, layout, metadata.primary_clock_id)
@@ -875,6 +907,7 @@ def create_overlay(
         (layout.mapped_min_ns, layout.mapped_max_ns),
         descriptor_count,
         counter_event_count,
+        layout.time_domain,
     )
 
 
@@ -883,7 +916,11 @@ def build_parser() -> argparse.ArgumentParser:
         description="Map CSV memory samples into an existing Perfetto or Android systrace HTML trace without third-party dependencies."
     )
     parser.add_argument("--trace", type=Path, help="Input .perfetto or .html trace file.")
-    parser.add_argument("--csv", type=Path, required=True, help="Input CSV file with a 'time' epoch-ms column.")
+    parser.add_argument("--csv", type=Path, required=True, help="Input CSV file with a 'time' millisecond column.")
+    parser.add_argument(
+        "--time-domain", choices=("auto", "monotonic", "realtime"), default="auto",
+        help="Clock domain of CSV time values. HAIO CSV is monotonic; auto prefers direct monotonic mapping when it overlaps the trace.",
+    )
     parser.add_argument("--output", type=Path, help="Output path. Defaults to <trace>.memory-overlay.<suffix>.")
     parser.add_argument("--column", action="append", help="Selected CSV value columns. Repeat or pass a comma-separated list. Defaults to all numeric columns.")
     parser.add_argument("--group-name", default=DEFAULT_GROUP_NAME, help="Name of the parent track group.")
@@ -917,11 +954,12 @@ def main(argv: list[str] | None = None) -> int:
         args.group_name,
         args.track_prefix,
         args.unit_name,
+        args.time_domain,
         args.html_pid,
     )
     clock_label = "html" if is_html_trace_path(args.trace) else str(summary.primary_clock_id)
     print(f"wrote {summary.output_path}")
-    print(f"columns={','.join(summary.columns)} rows={summary.row_count} clock_id={clock_label}")
+    print(f"columns={','.join(summary.columns)} rows={summary.row_count} clock_id={clock_label} time_domain={summary.time_domain}")
     print(f"trace_range_ns={summary.trace_range_ns[0]}..{summary.trace_range_ns[1]}")
     print(f"overlay_range_ns={summary.overlay_range_ns[0]}..{summary.overlay_range_ns[1]}")
     print(f"verified descriptors={summary.descriptor_count} counter_events={summary.counter_event_count}")
