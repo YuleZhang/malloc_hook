@@ -337,13 +337,11 @@ def _make_slice_packet(seq, track_uuid, ts, clock_id, etype, name=None):
     return P.make_packet(fields, seq, P.SEQ_NEEDS_INCREMENTAL_STATE)
 
 
-def _slice_name(info: dict, hi: int, size_bytes: int | None = None) -> str:
-    """Build a readable, info-first slice label.
-
-    以 "Top N: " 前缀开头(N 为该分配在所有分配里按大小的排名),便于在 UI 上
-    直接看出这是第几大的内存分配。
-    """
-    top = info.get("top_index")
+def _slice_name(
+    info: dict, hi: int, size_bytes: int | None = None, allocation_rank: int | None = None
+) -> str:
+    """Build a readable label ranked by this concrete allocation's size."""
+    top = allocation_rank if allocation_rank is not None else info.get("top_index")
     mem = (f"{size_bytes / (1024.0 * 1024.0):.2f} MB"
            if size_bytes is not None else info.get("memory") or "")
     var = info.get("variable") or ""
@@ -370,7 +368,7 @@ def _sub_track_name(info: dict, hi: int, allocation_rank: int | None = None) -> 
     的第几大分配。N 为该分配在所有分配里按大小的排名。
     """
     if allocation_rank is not None:
-        return f"[memory hook] Allocation {allocation_rank}"
+        return f"[memory hook] Top {allocation_rank:06d}"
     return f"[memory hook] h{hi}"
 
 def build_tracks(
@@ -479,7 +477,8 @@ def build_tracks(
         for allocation_rank, timing in enumerate(usable, 1):
             hi = timing["hash_index"]
             child_uuid = child_uuids[allocation_rank - 1]
-            child_name = _slice_name(hash_map[hi], hi, timing["size_bytes"])
+            child_name = _slice_name(
+                hash_map[hi], hi, timing["size_bytes"], allocation_rank)
             sub_track_name = _sub_track_name(hash_map[hi], hi, allocation_rank)
             # 子 track 按 top_index 作为排序权重(越小=内存越大=越靠前),
             # 缺失 top_index 时排到最后(用一个大值兜底)。
@@ -497,7 +496,7 @@ def build_tracks(
             order += 1
 
             bts, dur = timing["ts"], timing["dur"]
-            end_ts = bts + (dur if dur > 0 else 1_000_000)
+            end_ts = bts + dur
             packets.append(
                 P.OverlayPacketEntry(
                     _make_slice_packet(seq, child_uuid, bts, clk, TYPE_SLICE_BEGIN, child_name),
@@ -548,12 +547,64 @@ def _normalize_map(raw: dict) -> dict:
     return out
 
 
+REPORT_SECTION_START = "<!-- perfetto-concrete-allocations:start -->"
+REPORT_SECTION_END = "<!-- perfetto-concrete-allocations:end -->"
+
+
+def _ranked_allocations(trace_bytes: bytes, hash_map: dict) -> list[dict]:
+    ranked = [item for item in extract_allocation_timings(trace_bytes)
+              if item["hash_index"] in hash_map]
+    ranked.sort(
+        key=lambda item: item["size_bytes"] if item["size_bytes"] is not None else 0,
+        reverse=True,
+    )
+    return ranked
+
+
+def update_report(report_path: Path, trace_bytes: bytes, hash_map: dict) -> None:
+    """Append a replaceable concrete-allocation table matching Perfetto Top ranks."""
+    ranked = _ranked_allocations(trace_bytes, hash_map)
+    lines = [
+        REPORT_SECTION_START,
+        "## Perfetto Concrete Allocation Lifetimes",
+        "",
+        "One row per concrete alloc→free lifetime, strictly ranked by allocation size.",
+        "",
+        "| Top | Memory | Duration | Variable | Function | Call Site | Owner | Hash |",
+        "| --- | ---: | ---: | --- | --- | --- | --- | ---: |",
+    ]
+    for rank, timing in enumerate(ranked, 1):
+        info = hash_map[timing["hash_index"]]
+        size = timing["size_bytes"]
+        memory = f"{size / (1024.0 * 1024.0):.2f} MB" if size is not None else info.get("memory", "")
+        duration = f"{timing['dur'] / 1_000_000.0:.3f} ms"
+        cells = [
+            str(rank), memory, duration, info.get("variable") or "<unknown>",
+            info.get("code_func") or "<unknown>", info.get("call_site") or "",
+            info.get("owner_library") or "", str(timing["hash_index"]),
+        ]
+        lines.append("| " + " | ".join(cell.replace("|", "\\|") for cell in cells) + " |")
+    lines.extend([REPORT_SECTION_END, ""])
+    section = "\n".join(lines)
+    original = report_path.read_text(encoding="utf-8") if report_path.exists() else ""
+    pattern = re.compile(
+        re.escape(REPORT_SECTION_START) + r".*?" + re.escape(REPORT_SECTION_END) + r"\n?",
+        re.DOTALL,
+    )
+    if pattern.search(original):
+        updated = pattern.sub(section, original)
+    else:
+        updated = original.rstrip() + "\n\n" + section
+    report_path.write_text(updated, encoding="utf-8")
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         description="Add a dedicated 'Memory Top Allocations' track (native TrackEvent) to a Perfetto trace."
     )
     p.add_argument("--trace", type=Path, required=True, help="Input .perfetto trace.")
     p.add_argument("--map", type=Path, default=None, help="hash_index -> info JSON (from process_memory_stack.py --export-hash-map). Defaults to <hook_root>/hash_index_map.json when omitted.")
+    p.add_argument("--report", type=Path, help="Markdown report to update with the same unique concrete Top ranking.")
     p.add_argument("--output", type=Path, help="Output path. Default <trace>.toptrack.<suffix>.")
     p.add_argument("--track-name", default="Memory Top Allocations", help="Name of the new track.")
     p.add_argument(
@@ -598,7 +649,11 @@ def main(argv=None) -> int:
         strip_markers=not args.keep_alloc_markers)
     out = args.output or default_output_path(args.trace)
     out.write_bytes(new_bytes)
+    if args.report:
+        update_report(args.report, trace_bytes, hash_map)
     print(f"wrote {out}")
+    if args.report:
+        print(f"  report updated   : {args.report}")
     print(f"  track            : {args.track_name!r}")
     print(f"  slices added     : {n}")
     print(f"  skipped (no ts)  : {skipped}")
