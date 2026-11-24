@@ -43,7 +43,7 @@ const char* mtype[3] = {"host", "mmap", "dma"};
 // turns them into a "Memory Top Allocations" track. No-op where tracefs is absent
 // or not writable.
 // --------------------------------------------------------------------------- #
-#if defined(__MUSL__) || defined(__ANDROID__)
+#if defined(__linux__) || defined(__MUSL__) || defined(__ANDROID__)
 #define MALLOC_HOOK_HAS_TRACE_MARKER 1
 #else
 #define MALLOC_HOOK_HAS_TRACE_MARKER 0
